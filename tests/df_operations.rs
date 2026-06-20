@@ -534,6 +534,60 @@ fn filter_expenses_by_name_category_and_amount() {
     assert_eq!(r.height(), 3);
 }
 
+/// Regression: `filter_expenses_indexed` must carry each row's TRUE position in
+/// the unfiltered df via `_idx`, even with a non-contiguous filtered subset and
+/// duplicate name+day+amount rows. The old UI used fuzzy positional matching,
+/// which would target the wrong underlying row here.
+#[test]
+#[serial_test::serial]
+fn filter_expenses_indexed_carries_true_row_index() {
+    let _env = TestEnv::new();
+    let mut de = DetailedExpenses::new(2026, 1).unwrap();
+    // idx 0: distinct
+    de.add_row("Rent", 3, 800.0, Some("housing"), "E", Some("rent"))
+        .unwrap();
+    // idx 1 and idx 3: identical name+day+amount duplicates
+    de.add_row("Netflix", 1, 10.0, Some("leisure"), "E", Some("streaming"))
+        .unwrap();
+    // idx 2: distinct, also matches the "net" name filter via secondary? no.
+    de.add_row("Spotify", 2, 5.0, Some("leisure"), "E", Some("music"))
+        .unwrap();
+    de.add_row("Netflix", 1, 10.0, Some("leisure"), "E", Some("streaming"))
+        .unwrap();
+
+    // Filter selects a NON-CONTIGUOUS subset: the two "Netflix" duplicates at
+    // underlying indices 1 and 3 (skipping 0 and 2).
+    let filtered = de
+        .filter_expenses_indexed(Some("netflix"), None, None, None)
+        .unwrap();
+    assert_eq!(filtered.height(), 2);
+
+    let idx = filtered
+        .column("_idx")
+        .unwrap()
+        .cast(&polars::prelude::DataType::UInt32)
+        .unwrap();
+    let idx = idx.u32().unwrap();
+    let got: Vec<u32> = idx.iter().map(|o| o.unwrap()).collect();
+    // The TRUE original indices, not 0 and 1 (which fuzzy positional matching
+    // would have produced).
+    assert_eq!(got, vec![1, 3]);
+
+    // Deleting via the second filtered row's `_idx` (3) must remove the LAST
+    // Netflix, leaving Rent, the first Netflix, and Spotify.
+    de.delete_row(got[1]).unwrap();
+    let names: Vec<String> = de
+        .expense_df
+        .column("expense_name")
+        .unwrap()
+        .str()
+        .unwrap()
+        .iter()
+        .map(|o| o.unwrap_or("").to_string())
+        .collect();
+    assert_eq!(names, vec!["Rent", "Netflix", "Spotify"]);
+}
+
 // ------------------------------------------------------------------
 // Cashflow
 // ------------------------------------------------------------------

@@ -638,8 +638,53 @@ impl DetailedExpenses {
         amount_min: Option<f64>,
         amount_max: Option<f64>,
     ) -> Result<DataFrame> {
-        let mut lf = self.expense_df.clone().lazy();
+        let lf = Self::apply_expense_filters(
+            self.expense_df.clone().lazy(),
+            name_substr,
+            category_substr,
+            amount_min,
+            amount_max,
+        );
+        Ok(lf.collect()?)
+    }
 
+    /// Like [`filter_expenses`](Self::filter_expenses) but each returned row
+    /// carries an extra `_idx` (UInt32) column holding its position in the
+    /// *unfiltered* `expense_df`.
+    ///
+    /// The row index is attached with `with_row_index` *before* filtering, so the
+    /// `_idx` values survive any filter and are the true underlying indices
+    /// expected by [`edit_row`](Self::edit_row) / [`delete_row`](Self::delete_row).
+    /// This mirrors the Python `with_row_index("id")`-before-filter approach and
+    /// avoids fuzzy positional matching in the UI. Filter predicates are
+    /// identical to [`filter_expenses`](Self::filter_expenses).
+    pub fn filter_expenses_indexed(
+        &self,
+        name_substr: Option<&str>,
+        category_substr: Option<&str>,
+        amount_min: Option<f64>,
+        amount_max: Option<f64>,
+    ) -> Result<DataFrame> {
+        let lf = Self::apply_expense_filters(
+            self.expense_df.clone().lazy().with_row_index("_idx", None),
+            name_substr,
+            category_substr,
+            amount_min,
+            amount_max,
+        );
+        Ok(lf.collect()?)
+    }
+
+    /// Apply the shared expense filter predicates to a lazy frame. Empty / `None`
+    /// filters are ignored. Used by both [`filter_expenses`](Self::filter_expenses)
+    /// and [`filter_expenses_indexed`](Self::filter_expenses_indexed).
+    fn apply_expense_filters(
+        mut lf: LazyFrame,
+        name_substr: Option<&str>,
+        category_substr: Option<&str>,
+        amount_min: Option<f64>,
+        amount_max: Option<f64>,
+    ) -> LazyFrame {
         if let Some(name) = name_substr.filter(|s| !s.is_empty()) {
             let pat = format!("(?i){}", regex_escape(name));
             lf = lf.filter(col("expense_name").str().contains(lit(pat), false));
@@ -659,8 +704,7 @@ impl DetailedExpenses {
         if let Some(max) = amount_max {
             lf = lf.filter(col("expense_amount").lt_eq(lit(max)));
         }
-
-        Ok(lf.collect()?)
+        lf
     }
 
     /// Return a summary grouped by `category_col` (`"primary_category"` or

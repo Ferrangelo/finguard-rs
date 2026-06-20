@@ -8,6 +8,7 @@
 pub mod config;
 pub mod df_operations;
 pub mod error;
+pub mod expr;
 pub mod paths;
 pub mod plots;
 
