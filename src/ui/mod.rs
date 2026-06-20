@@ -323,20 +323,38 @@ fn header(state: &App) -> Element<'_, Message> {
 
 /// The tab bar: one button per [`Tab`], the active one highlighted.
 fn tab_bar(state: &App) -> Element<'_, Message> {
+    use iced::font::Weight;
+    use iced::Font;
+
+    let bold_font = Font {
+        weight: Weight::Bold,
+        ..Font::DEFAULT
+    };
+
     let mut bar = row![].spacing(SPACING_COMPACT);
     for tab in Tab::ALL {
-        let style = if tab == state.active_tab {
-            button::primary
+        let (is_active, font, padding) = if tab == state.active_tab {
+            (true, Some(bold_font), 6)
         } else {
-            button::secondary
+            (false, None, 4)
         };
-        bar = bar.push(
-            button(text(tab.label()))
-                .style(style)
-                .on_press(Message::TabSelected(tab)),
-        );
+
+        let tab_text = if let Some(font) = font {
+            text(tab.label()).font(font)
+        } else {
+            text(tab.label())
+        };
+
+        let btn = button(tab_text).padding(padding).on_press(Message::TabSelected(tab));
+        let btn = if is_active {
+            btn.style(tab_active_style)
+        } else {
+            btn.style(tab_inactive_style)
+        };
+
+        bar = bar.push(btn);
     }
-    container(bar).width(Length::Fill).into()
+    container(bar).center_x(Length::Fill).width(Length::Fill).into()
 }
 
 /// Discover the years that have a data directory, always including the current
@@ -363,6 +381,22 @@ pub fn discover_years() -> Vec<i32> {
     }
 
     years.into_iter().collect()
+}
+
+/// Custom button style for active tab (yellow background).
+fn tab_active_style(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::primary(theme, status);
+    style.background = Some(iced::Background::Color(iced::Color::from_rgb(1.0, 0.85, 0.0))); // Yellow
+    style.text_color = iced::Color::BLACK; // Black text for contrast
+    style
+}
+
+/// Custom button style for inactive tab (blue background).
+fn tab_inactive_style(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::secondary(theme, status);
+    style.background = Some(iced::Background::Color(iced::Color::from_rgb(0.2, 0.5, 0.9))); // Blue
+    style.text_color = iced::Color::WHITE; // White text for contrast
+    style
 }
 
 #[cfg(test)]

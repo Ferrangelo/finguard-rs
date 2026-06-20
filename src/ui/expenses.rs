@@ -12,7 +12,7 @@
 //! [`finguard_rs::expr::eval`] on submit (matching the Python `_safe_eval_expr`).
 
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
-use iced::{Element, Length};
+use iced::{Element, Length, Theme};
 
 use finguard_rs::config::{
     self, add_mapping, get_all_mappings, get_known_categories, get_mapping, remove_mapping,
@@ -1107,10 +1107,10 @@ fn toggle<T: PartialEq>(list: &mut Vec<T>, value: T) {
 pub fn view<'a>(state: &'a State, ctx: Ctx) -> Element<'a, AppMessage> {
     let mut selector = row![].spacing(8);
     for sub in SubTab::ALL {
-        let style = if sub == state.active_sub {
-            button::primary
+        let style: fn(&Theme, button::Status) -> button::Style = if sub == state.active_sub {
+            subtab_active_style
         } else {
-            button::secondary
+            subtab_inactive_style
         };
         selector = selector.push(
             button(text(sub.label()))
@@ -1118,6 +1118,7 @@ pub fn view<'a>(state: &'a State, ctx: Ctx) -> Element<'a, AppMessage> {
                 .on_press(wrap(Message::SubTabSelected(sub))),
         );
     }
+    let selector = container(selector).center_x(Length::Fill).width(Length::Fill);
 
     let body = match state.active_sub {
         SubTab::Detailed => view_detailed(state, ctx),
@@ -1652,6 +1653,22 @@ fn parse_opt_f64(s: &str) -> Option<f64> {
         // Allow expressions in filter fields too; fall back to plain parse.
         eval(t).ok().or_else(|| t.parse().ok())
     }
+}
+
+/// Custom button style for active subtab (yellow background, black text).
+fn subtab_active_style(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::primary(theme, status);
+    style.background = Some(iced::Background::Color(iced::Color::from_rgb(1.0, 0.85, 0.0)));
+    style.text_color = iced::Color::BLACK;
+    style
+}
+
+/// Custom button style for inactive subtab (blue background, white text).
+fn subtab_inactive_style(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::secondary(theme, status);
+    style.background = Some(iced::Background::Color(iced::Color::from_rgb(0.2, 0.5, 0.9)));
+    style.text_color = iced::Color::WHITE;
+    style
 }
 
 // Silence the unused-import lint for re-exported helpers used only in some
