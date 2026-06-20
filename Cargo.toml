@@ -1,0 +1,37 @@
+[package]
+name = "finguard_rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "finguard_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "finguard_rs"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+indexmap = { version = "2.7", features = ["serde"] }
+dirs = "6.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+polars = { version = "0.54", default-features = false, features = [
+    "parquet",
+    "fmt",
+    "lazy",
+    "dtype-date",
+    "round_series",
+    "is_in",
+    "strings",
+    "regex",
+    "concat_str",
+    "diagonal_concat",
+    "temporal",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
