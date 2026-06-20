@@ -48,9 +48,15 @@
 //! [`Cashflow::set_income`]: finguard_rs::df_operations
 //! [`finguard_rs::expr::eval`]: finguard_rs::expr::eval
 
+/// Standard spacing values used throughout the UI.
+pub const SPACING_COMPACT: u32 = 8;
+pub const SPACING_NORMAL: u32 = 12;
+pub const SPACING_LARGE: u32 = 16;
+pub const PADDING_NORMAL: u32 = 12;
+
 use iced::alignment::Horizontal;
 use iced::font::Weight;
-use iced::widget::{container, text, text_input};
+use iced::widget::{column, container, text, text_input};
 use iced::{Element, Font, Length};
 
 /// Three-letter English month abbreviations, indexed by `month - 1`
@@ -201,6 +207,29 @@ const BOLD: Font = Font {
 /// A bold, larger section title, e.g. `"Holdings — 2026"` or `"Cashflow — 2026"`.
 pub fn section_title<'a, M: 'a>(t: &str) -> Element<'a, M> {
     text(t.to_string()).size(20).font(BOLD).into()
+}
+
+/// A centered empty-state message with an icon and text.
+///
+/// Used when a tab has no data to display. The icon is typically an emoji or
+/// Unicode symbol (e.g., `'📊'`, `'💰'`, `'📋'`), displayed large above the message.
+///
+/// # Example
+/// ```ignore
+/// empty_state('💰', "No expenses yet. Click 'Add Expense' to begin.")
+/// ```
+pub fn empty_state<'a, M: 'a>(icon: char, message: &'a str) -> Element<'a, M> {
+    container(
+        column![
+            text(icon.to_string()).size(48),
+            text(message).size(14),
+        ]
+        .spacing(SPACING_NORMAL as f32)
+        .align_x(iced::Alignment::Center)
+    )
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .into()
 }
 
 /// A fixed-width, centered, bold column-header cell (e.g. a month abbreviation).

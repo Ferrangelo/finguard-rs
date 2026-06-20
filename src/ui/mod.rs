@@ -46,6 +46,7 @@ pub mod widgets;
 use chrono::{Datelike, Local};
 use iced::widget::{button, column, container, pick_list, row, text};
 use iced::{Element, Length, Task, Theme};
+use crate::ui::widgets::{SPACING_COMPACT, SPACING_NORMAL, SPACING_LARGE};
 
 use finguard_rs::df_operations::DetailedExpenses;
 use finguard_rs::paths;
@@ -286,7 +287,7 @@ pub fn view(state: &App) -> Element<'_, Message> {
     };
 
     column![header(state), tab_bar(state), body]
-        .spacing(12)
+        .spacing(SPACING_NORMAL)
         .padding(16)
         .into()
 }
@@ -307,14 +308,14 @@ fn header(state: &App) -> Element<'_, Message> {
     .width(Length::Fixed(160.0));
 
     row![title, year_select, month_select]
-        .spacing(16)
+        .spacing(SPACING_LARGE)
         .align_y(iced::Alignment::Center)
         .into()
 }
 
 /// The tab bar: one button per [`Tab`], the active one highlighted.
 fn tab_bar(state: &App) -> Element<'_, Message> {
-    let mut bar = row![].spacing(8);
+    let mut bar = row![].spacing(SPACING_COMPACT);
     for tab in Tab::ALL {
         let style = if tab == state.active_tab {
             button::primary
