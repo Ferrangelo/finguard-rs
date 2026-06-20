@@ -45,7 +45,7 @@ pub mod widgets;
 
 use chrono::{Datelike, Local};
 use iced::widget::{button, column, container, pick_list, row, text};
-use iced::{Element, Length, Task, Theme};
+use iced::{Color, Element, Length, Task, Theme};
 use crate::ui::widgets::{SPACING_COMPACT, SPACING_NORMAL, SPACING_LARGE};
 
 use finguard_rs::df_operations::DetailedExpenses;
@@ -286,7 +286,15 @@ pub fn view(state: &App) -> Element<'_, Message> {
         Tab::Categories => categories::view(&state.categories, ctx),
     };
 
-    column![header(state), tab_bar(state), body]
+    let separator = container(row![])
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(|_theme| {
+            iced::widget::container::Style::default()
+                .background(Color::from_rgb(0.3, 0.3, 0.3))
+        });
+
+    column![header(state), separator, tab_bar(state), body]
         .spacing(SPACING_NORMAL)
         .padding(16)
         .into()
