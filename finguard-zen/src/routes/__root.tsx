@@ -80,13 +80,13 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Finguard — Personal Finance OS" },
+      { title: "Finguard — Personal Finance Tracker" },
       {
         name: "description",
         content: "Premium personal finance dashboard for expenses, cashflow and net worth.",
       },
       { name: "author", content: "Finguard" },
-      { property: "og:title", content: "Finguard — Personal Finance OS" },
+      { property: "og:title", content: "Finguard — Personal Finance Tracker" },
       {
         property: "og:description",
         content: "Premium personal finance dashboard for expenses, cashflow and net worth.",

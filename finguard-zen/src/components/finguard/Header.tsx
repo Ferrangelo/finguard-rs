@@ -1,5 +1,14 @@
 import { Link, useLocation } from "@tanstack/react-router";
-import { Shield, Wallet, LineChart, PieChart, Layers } from "lucide-react";
+import {
+  Shield,
+  Wallet,
+  TrendingUp,
+  DollarSign,
+  PiggyBank,
+  LineChart,
+  PieChart,
+  Layers,
+} from "lucide-react";
 import { useApp } from "@/context/AppContext";
 import { MONTHS } from "@/services/api";
 import { StatusPill } from "./StatusPill";
@@ -25,12 +34,12 @@ export function Header() {
             className="relative grid h-9 w-9 place-items-center rounded-xl bg-gradient-brand"
             style={{ boxShadow: "var(--shadow-glow)" }}
           >
-            <Shield className="h-5 w-5 text-background" strokeWidth={2.5} />
+            <Wallet className="h-5 w-5 text-background" strokeWidth={2.5} />
           </div>
           <div className="flex flex-col leading-none">
             <span className="text-lg font-bold tracking-tight text-gradient">Finguard</span>
             <span className="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-              Personal Finance OS
+              Personal Finance Tracker
             </span>
           </div>
         </div>

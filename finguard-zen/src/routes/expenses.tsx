@@ -33,6 +33,7 @@ import type {
   MappingRule,
   RecurringTemplate,
 } from "@/services/types";
+import { useTheme } from "@/context/ThemeContext";
 
 export const Route = createFileRoute("/expenses")({
   head: () => ({ meta: [{ title: "Expenses · Finguard" }] }),
@@ -55,7 +56,7 @@ function ExpensesPage() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Expenses</h1>
           <p className="text-sm text-muted-foreground">
-            Track, categorize and analyze every euro that leaves.
+            Track, categorize and analyze every expense.
           </p>
         </div>
         <SubTabs value={sub} onChange={setSub} options={SUB_OPTIONS} />
@@ -427,6 +428,8 @@ function SummaryTab() {
   const [yearExpenses, setYearExpenses] = useState<Expense[]>([]);
   const [selMonths, setSelMonths] = useState<number[]>([Math.max(1, month - 1), month]);
   const [selCats, setSelCats] = useState<string[]>([]);
+  const { theme } = useTheme();
+  const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
 
   useEffect(() => {
     api.getExpenses(year).then(setYearExpenses);
@@ -470,6 +473,14 @@ function SummaryTab() {
   );
 
   const allCats = useMemo(() => yearTable.map((r) => r.category), [yearTable]);
+
+  const yearBarData = useMemo(() => {
+    if (kind !== "secondary") return [];
+    const TOP = 12;
+    if (yearPie.length <= TOP) return yearPie;
+    const othersValue = yearPie.slice(TOP).reduce((s, r) => s + r.value, 0);
+    return [...yearPie.slice(0, TOP), { name: "Others", value: othersValue }];
+  }, [yearPie, kind]);
 
   // default-select top 3 categories on first load
   useEffect(() => {
@@ -590,28 +601,64 @@ function SummaryTab() {
           </div>
         </GlassCard>
 
-        <GlassCard title={`Year ${year} pie`}>
-          <div className="h-72">
-            <ResponsiveContainer>
-              <PieChart>
-                <Pie
-                  data={yearPie}
-                  dataKey="value"
-                  nameKey="name"
-                  innerRadius={55}
-                  outerRadius={100}
-                  paddingAngle={2}
+        {kind === "secondary" ? (
+          <GlassCard title={`Year ${year} — top secondary categories`}>
+            <div style={{ height: Math.max(288, yearBarData.length * 36) }}>
+              <ResponsiveContainer>
+                <BarChart
+                  data={yearBarData}
+                  layout="vertical"
+                  margin={{ left: 8, right: 32, top: 4, bottom: 4 }}
                 >
-                  {yearPie.map((_, i) => (
-                    <Cell key={i} fill={colorAt(i)} stroke="oklch(0.16 0.02 265)" />
-                  ))}
-                </Pie>
-                <Tooltip content={<DarkTooltip />} />
-                <Legend verticalAlign="bottom" wrapperStyle={LEGEND_STYLE} />
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-        </GlassCard>
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    stroke="oklch(1 0 0 / 6%)"
+                    horizontal={false}
+                  />
+                  <XAxis type="number" tick={{ fontSize: 14, fill: tickColor }} />
+                  <YAxis
+                    type="category"
+                    dataKey="name"
+                    width={120}
+                    tick={{ fontSize: 14, fill: tickColor }}
+                  />
+                  <Tooltip content={<DarkTooltip />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
+                  <Bar dataKey="value" radius={[0, 4, 4, 0]}>
+                    {yearBarData.map((entry, i) => (
+                      <Cell
+                        key={i}
+                        fill={entry.name === "Others" ? "var(--muted-foreground)" : colorAt(i)}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </GlassCard>
+        ) : (
+          <GlassCard title={`Year ${year} — by primary category`}>
+            <div className="h-72">
+              <ResponsiveContainer>
+                <PieChart>
+                  <Pie
+                    data={yearPie}
+                    dataKey="value"
+                    nameKey="name"
+                    innerRadius={55}
+                    outerRadius={100}
+                    paddingAngle={2}
+                  >
+                    {yearPie.map((_, i) => (
+                      <Cell key={i} fill={colorAt(i)} />
+                    ))}
+                  </Pie>
+                  <Tooltip content={<DarkTooltip />} />
+                  <Legend verticalAlign="bottom" wrapperStyle={LEGEND_STYLE} />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </GlassCard>
+        )}
       </div>
 
       <GlassCard title={`Year ${year} by ${kind} category`}>
@@ -680,13 +727,13 @@ function SummaryTab() {
                 <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
                 <XAxis
                   dataKey="category"
-                  tick={{ fontSize: 10, fill: "oklch(0.68 0.02 260)" }}
+                  tick={{ fontSize: 13, fill: tickColor }}
                   interval={0}
                   angle={-25}
                   textAnchor="end"
                   height={60}
                 />
-                <YAxis tick={{ fontSize: 10, fill: "oklch(0.68 0.02 260)" }} />
+                <YAxis tick={{ fontSize: 14, fill: tickColor }} />
                 <Tooltip content={<DarkTooltip total />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 {selMonths.map((m, i) => (
@@ -728,8 +775,8 @@ function SummaryTab() {
             <ResponsiveContainer>
               <LineChart data={trendData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
-                <XAxis dataKey="month" tick={{ fontSize: 10, fill: "oklch(0.68 0.02 260)" }} />
-                <YAxis tick={{ fontSize: 10, fill: "oklch(0.68 0.02 260)" }} />
+                <XAxis dataKey="month" tick={{ fontSize: 14, fill: tickColor }} />
+                <YAxis tick={{ fontSize: 14, fill: tickColor }} />
                 <Tooltip content={<DarkTooltip />} cursor={{ stroke: "oklch(1 0 0 / 10%)" }} />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 {selCats.map((c, i) => (
