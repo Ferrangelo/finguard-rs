@@ -116,6 +116,13 @@ dbs/
     └── credits_debts.parquet          # Credits/debts
 ```
 
+## Limitations
+
+- **No currency exchange**: all amounts are assumed to be in a single currency.
+- **No automatic price updates**: investment prices must be entered manually each month.
+- **No authentication or multi-user support**
+- **No data import/export**: no CSV, bank-statement, or spreadsheet import; no export functionality (however the parquet files are always saved to disk).
+- **Limited mobile experience**
 
 ## Technology Stack
 
@@ -136,28 +143,6 @@ dbs/
 - **TypeScript**: type-safe JavaScript
 - **Vite**: lightning-fast dev server
 
-## Limitations
-
-- **No currency exchange**: all amounts are assumed to be in a single currency.
-- **No automatic price updates**: investment prices must be entered manually each month.
-- **No authentication or multi-user support**
-- **No data import/export**: no CSV, bank-statement, or spreadsheet import; no export functionality (however the parquet files are always saved to disk).
-- **Limited mobile experience**
-
-## API
-
-The backend exposes a REST API on `http://localhost:3111/api` with 40+ endpoints covering:
-
-- **Expenses**: CRUD operations, filtering, category totals
-- **Recurring Payments**: template management and application
-- **Categories**: primary and secondary category management
-- **Auto-Categorization Rules**: name-to-category mappings
-- **Income**: monthly cashflow tracking
-- **Investments**: asset portfolios with price history
-- **Liquidity**: bank accounts and cash balances
-- **Credits & Debts**: loan and credit card tracking
-
-The frontend dev server (`localhost:5173`) automatically proxies `/api/*` requests to the backend.
 
 ## Project Structure
 
