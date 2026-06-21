@@ -1,1 +1,34 @@
 /target
+
+# Logs
+finguard-zen/logs
+finguard-zen/*.log
+finguard-zen/npm-debug.log*
+finguard-zen/yarn-debug.log*
+finguard-zen/yarn-error.log*
+finguard-zen/pnpm-debug.log*
+finguard-zen/lerna-debug.log*
+
+finguard-zen/node_modules
+finguard-zen/dist
+finguard-zen/dist-ssr
+finguard-zen/.output
+finguard-zen/.vinxi
+finguard-zen/.tanstack/**
+finguard-zen/.nitro
+finguard-zen/*.local
+
+# Wrangler / Cloudflare
+finguard-zen/.wrangler/
+finguard-zen/.dev.vars
+
+# Editor directories and files
+finguard-zen/.vscode/*
+finguard-zen/!.vscode/extensions.json
+finguard-zen/.idea
+finguard-zen/.DS_Store
+finguard-zen/*.suo
+finguard-zen/*.ntvs*
+finguard-zen/*.njsproj
+finguard-zen/*.sln
+finguard-zen/*.sw?
