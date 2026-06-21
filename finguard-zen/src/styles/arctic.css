@@ -95,7 +95,8 @@
   --sidebar-border: oklch(0 0 0 / 9%);
   --sidebar-ring: oklch(0.56 0.2 230 / 50%);
 
-  --legend-bg: oklch(0.8 0.014 220);
+  /*--legend-bg: oklch(0.9 0.014 220);*/
+  --legend-bg: oklch(0.9 0.014 220);
   --legend-fg: oklch(0.18 0.022 240);
   --legend-border: oklch(0 0 0 / 18%);
 

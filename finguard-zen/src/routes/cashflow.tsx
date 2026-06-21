@@ -21,6 +21,7 @@ import { GlassCard } from "@/components/finguard/GlassCard";
 import { MathInput } from "@/components/finguard/MathInput";
 import { DarkTooltip, useChartColors, LEGEND_STYLE } from "@/components/finguard/DarkTooltip";
 import { INCOME_CATEGORIES } from "@/services/types";
+import { useTheme } from "@/context/ThemeContext";
 
 export const Route = createFileRoute("/cashflow")({
   head: () => ({ meta: [{ title: "Cashflow · Finguard" }] }),
@@ -32,6 +33,8 @@ function CashflowPage() {
   const { year, notify, refresh, refreshTick } = useApp();
   const [income, setIncome] = useState<Record<number, Record<string, number>>>({});
   const [spending, setSpending] = useState<Record<number, Record<string, number>>>({});
+  const { theme } = useTheme();
+  const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
 
   useEffect(() => {
     api.getIncome(year).then(setIncome);
@@ -126,8 +129,8 @@ function CashflowPage() {
             <ResponsiveContainer>
               <BarChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
-                <XAxis dataKey="month" tick={{ fontSize: 11, fill: "oklch(0.68 0.02 260)" }} />
-                <YAxis tick={{ fontSize: 11, fill: "oklch(0.68 0.02 260)" }} />
+                <XAxis dataKey="month" tick={{ fontSize: 14, fill: tickColor }} />
+                <YAxis tick={{ fontSize: 14, fill: tickColor }} />
                 <Tooltip content={<DarkTooltip />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 <Bar dataKey="Income" fill={colorAt(0)} radius={[4, 4, 0, 0]} />

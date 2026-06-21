@@ -32,6 +32,7 @@ import type {
   InvestmentCategory,
   LiquidityRow,
 } from "@/services/types";
+import { useTheme } from "@/context/ThemeContext";
 
 export const Route = createFileRoute("/networth")({
   head: () => ({ meta: [{ title: "Net Worth · Finguard" }] }),
@@ -698,6 +699,9 @@ function TotalTab() {
   const [assets, setAssets] = useState<InvestmentAsset[]>([]);
   const [liq, setLiq] = useState<LiquidityRow[]>([]);
   const [cd, setCd] = useState<CreditDebtRow[]>([]);
+  const { theme } = useTheme();
+  const totalStroke = theme === "arctic" ? "oklch(0.30 0.10 260)" : "oklch(0.95 0.02 260)";
+  const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
 
   useEffect(() => {
     api.ensureYear(year).then(() => {
@@ -909,8 +913,8 @@ function TotalTab() {
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
-                <XAxis dataKey="month" tick={{ fontSize: 11, fill: "oklch(0.68 0.02 260)" }} />
-                <YAxis tick={{ fontSize: 11, fill: "oklch(0.68 0.02 260)" }} />
+                <XAxis dataKey="month" tick={{ fontSize: 18, fill: tickColor }} />
+                <YAxis tick={{ fontSize: 18, fill: tickColor }} />
                 <Tooltip content={<DarkTooltip total />} />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 <Area
@@ -937,7 +941,7 @@ function TotalTab() {
                 <Line
                   type="monotone"
                   dataKey="Total"
-                  stroke="oklch(0.95 0.02 260)"
+                  stroke={totalStroke}
                   strokeWidth={3}
                   dot={{ r: 4 }}
                   activeDot={{ r: 6 }}

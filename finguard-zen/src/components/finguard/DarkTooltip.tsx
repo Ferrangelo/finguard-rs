@@ -56,17 +56,30 @@ const DARK_COLORS = [
 ];
 
 // Palette for arctic (light) theme — lower lightness + higher chroma, visible on white/light-grey
+// const ARCTIC_COLORS = [
+//   "oklch(0.42 0.22 230)", // deep blue
+//   "oklch(0.45 0.22 295)", // deep purple
+//   "oklch(0.42 0.20 155)", // deep green
+//   "oklch(0.52 0.18 75)", // deep amber
+//   "oklch(0.48 0.24 20)", // deep red
+//   "oklch(0.44 0.20 185)", // deep teal
+//   "oklch(0.46 0.18 130)", // deep olive
+//   "oklch(0.46 0.22 340)", // deep pink
+//   "oklch(0.50 0.20 50)", // deep orange
+//   "oklch(0.43 0.18 260)", // deep indigo
+// ];
+
 const ARCTIC_COLORS = [
-  "oklch(0.42 0.22 230)", // deep blue
-  "oklch(0.45 0.22 295)", // deep purple
-  "oklch(0.42 0.20 155)", // deep green
-  "oklch(0.52 0.18 75)", // deep amber
-  "oklch(0.48 0.24 20)", // deep red
-  "oklch(0.44 0.20 185)", // deep teal
-  "oklch(0.46 0.18 130)", // deep olive
-  "oklch(0.46 0.22 340)", // deep pink
-  "oklch(0.50 0.20 50)", // deep orange
-  "oklch(0.43 0.18 260)", // deep indigo
+  "oklch(0.52 0.11 215)", // shifted from 200 → 215
+  "oklch(0.45 0.15 295)",
+  "oklch(0.49 0.13 160)",
+  "oklch(0.53 0.13 75)",
+  "oklch(0.44 0.17 20)",
+  "oklch(0.47 0.10 240)",
+  "oklch(0.50 0.11 130)",
+  "oklch(0.49 0.15 340)",
+  "oklch(0.45 0.10 50)",
+  "oklch(0.42 0.08 260)",
 ];
 
 const LIGHT_THEMES = new Set(["arctic"]);
@@ -80,7 +93,7 @@ export function useChartColors() {
 
 /** wrapperStyle for every Recharts <Legend> — uses arctic-specific CSS vars with fallbacks. */
 export const LEGEND_STYLE: React.CSSProperties = {
-  fontSize: 11,
+  fontSize: 19,
   backgroundColor: "var(--legend-bg, var(--muted))",
   color: "var(--legend-fg, var(--muted-foreground))",
   border: "1px solid var(--legend-border, transparent)",
