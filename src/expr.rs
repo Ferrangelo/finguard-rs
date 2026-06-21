@@ -96,7 +96,7 @@ fn tokenize(expr: &str) -> Result<Vec<Token>> {
 /// Recursive-descent parser/evaluator over the token stream.
 ///
 /// Evaluation happens during the parse: there is no separate AST, mirroring the
-/// fact that the only thing we need from these expressions is a single `f64`.
+/// fact that the only thing I need from these expressions is a single `f64`.
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -152,7 +152,7 @@ impl Parser {
                 Token::Slash => {
                     self.pos += 1;
                     let rhs = self.parse_unary()?;
-                    // Python's truediv raises ZeroDivisionError; we refuse to
+                    // Python's truediv raises ZeroDivisionError; refuse to
                     // produce inf/NaN and report the error instead.
                     if rhs == 0.0 {
                         return Err(Error::InvalidArgument("division by zero".to_string()));

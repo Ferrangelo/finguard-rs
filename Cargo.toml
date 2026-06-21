@@ -31,7 +31,9 @@ polars = { version = "0.54", default-features = false, features = [
     "diagonal_concat",
     "temporal",
 ] }
-iced = { version = "0.14", features = ["canvas"] }
+axum = "0.7"
+tokio = { version = "1.37", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"

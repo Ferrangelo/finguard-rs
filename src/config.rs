@@ -74,7 +74,7 @@ fn get_config_path() -> Result<PathBuf> {
 /// Serialize `value` to pretty JSON, matching Python's
 /// `json.dump(..., indent=4, ensure_ascii=False)` byte-for-byte.
 ///
-/// `serde_json`'s default pretty printer uses a *2-space* indent, so we install
+/// `serde_json`'s default pretty printer uses a *2-space* indent, so I install
 /// a [`PrettyFormatter`] with a 4-space indent. serde_json never escapes
 /// non-ASCII characters (it emits UTF-8 directly), matching `ensure_ascii=False`.
 /// Like Python's `json.dump`, no trailing newline is written.

@@ -82,7 +82,7 @@ fn round_half_even(value: f64) -> f64 {
 /// changes which side of a halfway point the binary float lands on, diverging
 /// from CPython's `round(x, 2)` (e.g. `2.675` → Rust `2.68` vs Python `2.67`,
 /// because `2.675` is really `2.67499…`). Rust's `{:.2}` formatting rounds the
-/// *true* double value to nearest with ties-to-even, matching CPython; we format
+/// *true* double value to nearest with ties-to-even, matching CPython; format
 /// then parse back. Formatting a finite `f64` with `{:.2}` always yields a string
 /// that parses back to an `f64`, so the parse is infallible.
 fn round2_half_even(value: f64) -> f64 {
