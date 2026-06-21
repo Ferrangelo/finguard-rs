@@ -12,6 +12,7 @@ import { useEffect, type ReactNode } from "react";
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
 import { AppProvider } from "@/context/AppContext";
+import { ThemeProvider } from "@/context/ThemeContext";
 import { Header } from "@/components/finguard/Header";
 
 function NotFoundComponent() {
@@ -80,10 +81,16 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "Finguard — Personal Finance OS" },
-      { name: "description", content: "Premium personal finance dashboard for expenses, cashflow and net worth." },
+      {
+        name: "description",
+        content: "Premium personal finance dashboard for expenses, cashflow and net worth.",
+      },
       { name: "author", content: "Finguard" },
       { property: "og:title", content: "Finguard — Personal Finance OS" },
-      { property: "og:description", content: "Premium personal finance dashboard for expenses, cashflow and net worth." },
+      {
+        property: "og:description",
+        content: "Premium personal finance dashboard for expenses, cashflow and net worth.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
       { name: "twitter:site", content: "@Lovable" },
@@ -91,7 +98,10 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     links: [
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
-      { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" },
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap",
+      },
       {
         rel: "stylesheet",
         href: appCss,
@@ -123,14 +133,16 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <AppProvider>
-        <div className="min-h-screen">
-          <Header />
-          <main className="mx-auto max-w-[1600px] px-4 py-6 md:px-6">
-            <Outlet />
-          </main>
-        </div>
-      </AppProvider>
+      <ThemeProvider>
+        <AppProvider>
+          <div className="min-h-screen">
+            <Header />
+            <main className="mx-auto max-w-[1600px] px-4 py-6 md:px-6">
+              <Outlet />
+            </main>
+          </div>
+        </AppProvider>
+      </ThemeProvider>
     </QueryClientProvider>
   );
 }

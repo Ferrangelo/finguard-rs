@@ -95,9 +95,9 @@
   --sidebar-border: oklch(1 0 0 / 8%);
   --sidebar-ring: oklch(0.78 0.14 200 / 60%);
 
-  --gradient-brand: linear-gradient(135deg, oklch(0.78 0.14 200), oklch(0.70 0.12 200));
+  --gradient-brand: linear-gradient(135deg, oklch(0.78 0.14 200), oklch(0.70 0.18 295));
   --gradient-surface: linear-gradient(180deg, oklch(0.22 0.024 265 / 80%), oklch(0.18 0.02 265 / 60%));
-  --shadow-glow: 0 16px 40px -16px oklch(0.78 0.14 200 / 20%);
+  --shadow-glow: 0 20px 60px -20px oklch(0.70 0.18 295 / 40%);
   --shadow-elegant: 0 10px 30px -10px oklch(0 0 0 / 50%);
 }
 
@@ -117,7 +117,8 @@
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
     -webkit-font-smoothing: antialiased;
     background-image:
-      radial-gradient(ellipse 70% 40% at 50% -5%, oklch(0.78 0.14 200 / 7%), transparent 70%);
+      radial-gradient(ellipse 80% 50% at 20% -10%, oklch(0.78 0.14 200 / 12%), transparent 60%),
+      radial-gradient(ellipse 60% 50% at 90% 10%, oklch(0.70 0.18 295 / 12%), transparent 60%);
     background-attachment: fixed;
   }
 }

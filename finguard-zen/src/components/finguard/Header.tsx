@@ -3,6 +3,7 @@ import { Shield, Wallet, LineChart, PieChart, Layers } from "lucide-react";
 import { useApp } from "@/context/AppContext";
 import { MONTHS } from "@/services/api";
 import { StatusPill } from "./StatusPill";
+import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { cn } from "@/lib/utils";
 
 const TABS = [
@@ -20,12 +21,17 @@ export function Header() {
     <header className="sticky top-0 z-40 border-b border-border/60 bg-background/60 backdrop-blur-xl">
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-4 px-6 py-3">
         <div className="flex items-center gap-3">
-          <div className="relative grid h-9 w-9 place-items-center rounded-xl bg-gradient-brand" style={{ boxShadow: "var(--shadow-glow)" }}>
+          <div
+            className="relative grid h-9 w-9 place-items-center rounded-xl bg-gradient-brand"
+            style={{ boxShadow: "var(--shadow-glow)" }}
+          >
             <Shield className="h-5 w-5 text-background" strokeWidth={2.5} />
           </div>
           <div className="flex flex-col leading-none">
             <span className="text-lg font-bold tracking-tight text-gradient">Finguard</span>
-            <span className="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Personal Finance OS</span>
+            <span className="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+              Personal Finance OS
+            </span>
           </div>
         </div>
 
@@ -58,7 +64,11 @@ export function Header() {
             onChange={(e) => setYear(Number(e.target.value))}
             className="rounded-lg border border-border bg-surface/70 px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-surface focus:outline-none focus:ring-2 focus:ring-ring"
           >
-            {years.map((y) => <option key={y} value={y}>{y}</option>)}
+            {years.map((y) => (
+              <option key={y} value={y}>
+                {y}
+              </option>
+            ))}
           </select>
           <select
             aria-label="Month"
@@ -66,8 +76,13 @@ export function Header() {
             onChange={(e) => setMonth(Number(e.target.value))}
             className="rounded-lg border border-border bg-surface/70 px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-surface focus:outline-none focus:ring-2 focus:ring-ring"
           >
-            {MONTHS.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
+            {MONTHS.map((m, i) => (
+              <option key={m} value={i + 1}>
+                {m}
+              </option>
+            ))}
           </select>
+          <ThemeSwitcher />
           <StatusPill />
         </div>
       </div>
@@ -77,11 +92,14 @@ export function Header() {
           {TABS.map((t) => {
             const active = loc.pathname.startsWith(t.to);
             return (
-              <Link key={t.to} to={t.to}
+              <Link
+                key={t.to}
+                to={t.to}
                 className={cn(
                   "rounded-md px-3 py-1.5 text-sm font-medium",
                   active ? "bg-gradient-brand text-background" : "text-muted-foreground",
-                )}>
+                )}
+              >
                 {t.label}
               </Link>
             );
