@@ -999,8 +999,22 @@ async fn main() {
         
         .layer(cors);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3111));
+    // let addr = SocketAddr::from(([127, 0, 0, 1], 3111));
+    // println!("Finguard server running on http://{}", addr);
+    // let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    // axum::serve(listener, app).await.unwrap();
+    
+    let host = std::env::var("FINGUARD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("FINGUARD_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3111);
+
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .expect("Invalid address");
+
     println!("Finguard server running on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await.unwrap()
 }
