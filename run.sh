@@ -7,7 +7,7 @@ echo ""
 
 # Start the Rust backend in the background
 echo "Starting Rust backend (cargo run)..."
-cargo run &
+cargo run --bin finguard_rs &
 RUST_PID=$!
 
 # Give the backend a moment to start
