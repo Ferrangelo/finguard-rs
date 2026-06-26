@@ -1,7 +1,4 @@
 #FROM rust:1.88-slim
-#FROM rust:stable-slim
-#FROM rust:nightly-slim
-#
 #FROM rust:nightly-trixie-slim
 FROM rust:trixie
 
@@ -18,7 +15,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
 RUN cargo build --release && \
-    cp target/release/finguard_rs /usr/local/bin/finguard-rs && \
+    cp target/release/finguard_rs_backend /usr/local/bin/finguard-rs && \
     rm -rf target
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
