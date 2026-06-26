@@ -45,5 +45,5 @@ jobs:
           context: ${{ matrix.context }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:latest
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ github.sha }}
+            ghcr.io/${{ env.OWNER_LC }}/${{ matrix.image }}:latest
+            ghcr.io/${{ env.OWNER_LC }}/${{ matrix.image }}:${{ github.sha }}
