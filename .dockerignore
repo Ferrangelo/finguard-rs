@@ -1,0 +1,5 @@
+# .dockerignore
+target/
+.git/
+.env
+*.db
