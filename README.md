@@ -5,12 +5,13 @@ Personal finance management tool with a modern web dashboard for tracking invest
 It follows a scheme similar to [Mr Rip spreadsheets](https://retireinprogress.com/how-i-track-my-finances-using-spreadsheets-part-1-why-and-what/). 
 
 **This is a rewrite in Rust of the original Python project [Finguard](https://github.com/Ferrangelo/finguard).** It features a modern React frontend and a performant Axum backend. All data processing uses [Polars](https://pola.rs/) for efficiency and Parquet for storage.
+I have rewritten the backend part in rust, while the frontend in typescript + React has been coded using [Lovable](https://lovable.dev/)
 
 ## Quick Start
 
 ```bash
 # Clone/navigate to project
-cd /home/anferrar/Projects/finguard_rs
+cd /home/anferrar/Projects/finguard-rs
 
 # Run both backend and frontend
 ./run.sh
@@ -24,7 +25,7 @@ Alternatively, run them separately:
 cargo run
 
 # Terminal 2: React frontend
-cd finguard-zen && npm run dev
+cd frontend && npm run dev
 ```
 
 ## Features
@@ -49,16 +50,16 @@ cd finguard-zen && npm run dev
 
 ```bash
 # Clone the repository
-git clone https://github.com/Ferrangelo/finguard_rs.git
-cd finguard_rs
+git clone https://github.com/Ferrangelo/finguard-rs.git
+cd finguard-rs
 
 # Install frontend dependencies
-cd finguard-zen
+cd frontend
 npm install
 cd ..
 ```
 
-No additional installation needed for the backend—`cargo run` handles everything.
+No additional installation needed for the backend, just run `cargo run` inside the backend folder an it handles everything.
 
 ## Usage
 
@@ -122,7 +123,6 @@ dbs/
 - **No automatic price updates**: investment prices must be entered manually each month.
 - **No authentication or multi-user support**
 - **No data import/export**: no CSV, bank-statement, or spreadsheet import; no export functionality (however the parquet files are always saved to disk).
-- **Limited mobile experience**
 
 ## Technology Stack
 
@@ -147,17 +147,21 @@ dbs/
 ## Project Structure
 
 ```
-finguard_rs/
-├── src/
-│   ├── main.rs          # Axum web server & API handlers
-│   └── (library modules)
-├── finguard-zen/        # React frontend (TanStack Start)
+finguard-rs/
+├── backend/        # Rust backend
+|   ├── src/
+│   │   ├── main.rs  # Axum web server & API handlers
+│   │   └── (library modules)
+│   ├── Dockerfile
+│   └── Cargo.toml   # Rust dependencies
+│              
+├── frontend/        # React frontend (TanStack Start)
 │   ├── src/
 │   │   ├── components/  # UI components
 │   │   ├── routes/      # Page routes
 │   │   └── services/    # API client
+│   ├── Dockerfile
 │   └── package.json
-├── Cargo.toml           # Rust dependencies
 ├── run.sh               # Unified startup script
 └── README.md            # This file
 ```

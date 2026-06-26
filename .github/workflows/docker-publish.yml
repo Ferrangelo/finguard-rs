@@ -18,11 +18,11 @@ jobs:
         include:
           - name: backend
             context: ./backend
-            image: finguard-backend
+            image: finguard-rs-backend
 
           - name: frontend
             context: ./frontend
-            image: finguard-frontend
+            image: finguard-rs-frontend
 
     steps:
       - uses: actions/checkout@v4
