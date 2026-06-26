@@ -1,22 +1,24 @@
 #FROM rust:1.88-slim
 #FROM rust:nightly-trixie-slim
-FROM rust:trixie
+FROM rust:trixie as chef
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV RUSTFLAGS="-C target-cpu=native"
 
 WORKDIR /app
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl gosu apt-utils && \
     rm -rf /var/lib/apt/lists/*
+    
+RUN cargo install cargo-chef --locked
 
+FROM chef as PLANNER
 COPY Cargo.toml Cargo.lock ./
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Cache dependencies
-RUN mkdir -p src/ \
-    && echo "fn main(){}" > src/main.rs
-RUN cargo build --release
+FROM chef as BUILDER
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY src/ src/
 
@@ -35,5 +37,4 @@ ENV XDG_DATA_HOME=/data \
 EXPOSE 3111
 
 ENTRYPOINT ["sh", "/usr/local/bin/entrypoint.sh"]
-#CMD ["finguard-rs"]
 CMD ["finguard-rs", "--host", "0.0.0.0", "--port", "3111"]
