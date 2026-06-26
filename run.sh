@@ -15,7 +15,7 @@ sleep 2
 
 # Start the Node.js frontend
 echo "Starting Node.js frontend (npm run dev)..."
-cd finguard-zen && npm run dev &
+cd frontend && npm run dev &
 FRONTEND_PID=$!
 
 echo ""
