@@ -21,7 +21,7 @@ jobs:
             image: finguard-backend
 
           - name: frontend
-            context: ./finguard-zen
+            context: ./frontend
             image: finguard-frontend
 
     steps:
@@ -39,7 +39,8 @@ jobs:
         env: 
           OWNER: ${{ github.repository_owner }}
 
-      - uses: docker/build-push-action@v6
+      - name: Build and push
+        uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           push: true
