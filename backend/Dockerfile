@@ -24,9 +24,6 @@ COPY src/ src/
 
 RUN cargo build --release
 RUN install -Dm755 target/release/finguard_rs_backend /usr/local/bin/finguard-rs
-# RUN cargo build --release && \
-    # cp target/release/finguard_rs_backend /usr/local/bin/finguard-rs && \
-    # rm -rf target
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
