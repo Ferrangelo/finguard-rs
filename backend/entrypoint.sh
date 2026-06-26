@@ -3,7 +3,7 @@ set -eu
 
 : "${PUID:=1000}"
 : "${PGID:=1000}"
-: "${USER_NAME:=finguard_rs_basckend}"
+: "${USER_NAME:=finguard_rs_backend}"
 : "${XDG_DATA_HOME:=/data}"
 : "${XDG_CONFIG_HOME:=/config}"
 
