@@ -12,6 +12,12 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
+
+# Cache dependencies
+RUN mkdir -p src/ \
+    && echo "fn main(){}" > src/main.rs
+RUN cargo build --release
+
 COPY src/ src/
 
 RUN cargo build --release && \
