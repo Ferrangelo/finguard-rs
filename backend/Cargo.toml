@@ -1,14 +1,14 @@
 [package]
-name = "finguard_rs"
+name = "finguard_rs_backend"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "finguard_rs"
+name = "finguard_rs_backend"
 path = "src/lib.rs"
 
 [[bin]]
-name = "finguard_rs"
+name = "finguard_rs_backend"
 path = "src/main.rs"
 
 [[bin]]

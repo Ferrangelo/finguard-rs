@@ -12,11 +12,11 @@ use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 use serde::{Deserialize, Serialize};
 
-use finguard_rs::df_operations::{
+use finguard_rs_backend::df_operations::{
     DetailedExpenses, RecurringExpenses, Cashflow, InvestmentHoldings, Liquidity, CreditsDebts,
 };
-use finguard_rs::config;
-use finguard_rs::paths::{get_year_summary_path, PRIMARIES_FILENAME};
+use finguard_rs_backend::config;
+use finguard_rs_backend::paths::{get_year_summary_path, PRIMARIES_FILENAME};
 use polars::prelude::SerReader;
 
 // ======================================================================
@@ -277,7 +277,7 @@ fn set_df_str_where(
 // ======================================================================
 
 fn discover_years() -> Vec<i32> {
-    let Ok(root) = finguard_rs::paths::get_dbs_root() else { return vec![]; };
+    let Ok(root) = finguard_rs_backend::paths::get_dbs_root() else { return vec![]; };
     let Ok(entries) = std::fs::read_dir(&root) else { return vec![]; };
     let mut years: Vec<i32> = entries
         .filter_map(|e| e.ok())
@@ -523,7 +523,7 @@ async fn add_category_handler(
 async fn delete_category_handler(
     Path((kind, name)): Path<(String, String)>,
 ) -> Result<Json<CategoriesJson>, String> {
-    let totals = finguard_rs::df_operations::get_category_totals_across_all_years(&kind)
+    let totals = finguard_rs_backend::df_operations::get_category_totals_across_all_years(&kind)
         .map_err(|e| e.to_string())?;
     let total = totals.get(&name).copied().unwrap_or(0.0);
     if total.abs() >= 1e-9 {
@@ -534,7 +534,7 @@ async fn delete_category_handler(
     }
 
     config::remove_known_category(&name, &kind).map_err(|e| e.to_string())?;
-    finguard_rs::df_operations::remove_category_from_all_summaries(&name, &kind)
+    finguard_rs_backend::df_operations::remove_category_from_all_summaries(&name, &kind)
         .map_err(|e| e.to_string())?;
 
     let known = config::get_known_categories().map_err(|e| e.to_string())?;
@@ -547,7 +547,7 @@ async fn delete_category_handler(
 async fn get_category_totals_handler(
     Query(q): Query<KindQuery>,
 ) -> Result<Json<std::collections::HashMap<String, f64>>, String> {
-    let totals = finguard_rs::df_operations::get_category_totals_across_all_years(&q.kind)
+    let totals = finguard_rs_backend::df_operations::get_category_totals_across_all_years(&q.kind)
         .map_err(|e| e.to_string())?;
     let mut hm = std::collections::HashMap::new();
     for (k, v) in totals {
