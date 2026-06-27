@@ -1,0 +1,39 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: finguard_rs-backend:test
+    container_name: finguard_rs-backend_test
+    ports:
+      - "${FINGUARD_PORT:-3111}:${FINGUARD_PORT:-3111}"
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      FINGUARD_PORT: "${FINGUARD_PORT:-3111}"
+      # OVERRIDE the Dockerfile XDG defaults here:
+      XDG_DATA_HOME: "/data"
+      XDG_CONFIG_HOME: "/config" 
+    volumes:
+      - "${HOME}/.local/share/finguard:/data/finguard"
+      - "${HOME}/.config/finguard:/config/finguard"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: finguard_rs-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      # Use the service name, not localhost. Docker's internal DNS resolves this
+      - VITE_API_URL=http://backend:3111
+    restart: unless-stopped
+
+volumes:
+  finguard_data:
+  finguard_config:
