@@ -2,31 +2,13 @@
 
 Personal finance management tool with a modern web dashboard for tracking investments, expenses, cashflow, liquidity, and net worth. Everything is stored locally as Parquet files with zero cloud dependencies.
 
-It follows a scheme similar to [Mr Rip spreadsheets](https://retireinprogress.com/how-i-track-my-finances-using-spreadsheets-part-1-why-and-what/). 
+Tool for my personal finance management with a modern web dashboard.
+It monitors investments, expenses, cashflow, liquidity, and net worth. Everything is stored locally as Parquet files with zero cloud dependencies.
+
+It follows a scheme similar to [Mr Rip spreadsheets](https://retireinprogress.com/how-i-track-my-finances-using-spreadsheets-part-1-why-and-what/).
 
 **This is a rewrite in Rust of the original Python project [Finguard](https://github.com/Ferrangelo/finguard).** It features a modern React frontend and a performant Axum backend. All data processing uses [Polars](https://pola.rs/) for efficiency and Parquet for storage.
-I have rewritten the backend part in rust, while the frontend in typescript + React has been coded using [Lovable](https://lovable.dev/)
-
-## Quick Start
-
-```bash
-# Clone/navigate to project
-cd /home/anferrar/Projects/finguard-rs
-
-# Run both backend and frontend
-./run.sh
-```
-
-The application will be available at `http://localhost:5173` (Vite dev server).
-
-Alternatively, run them separately:
-```bash
-# Terminal 1: Rust backend (runs on :3111)
-cargo run
-
-# Terminal 2: React frontend
-cd frontend && npm run dev
-```
+Backend rewritten in rust, while the typescript + React frontend has been coded using [Lovable](https://lovable.dev/)
 
 ## Features
 
@@ -40,43 +22,79 @@ cd frontend && npm run dev
 - **Modern UI**: Built with React, Tailwind CSS, and interactive charts (Recharts).
 - **Themes**: Seven predefined themes with persistent user preference.
 
-## Installation
+![Demo Animation](sshots/sshots_animation.gif)
 
-### Prerequisites
+## Installation and usage
+
+### Option A: Install and run with docker
+
+Download the `docker-compose.yml` file and cd into the directory where this file is stored.
+
+Before starting the service the user should set `PUID` and `PGID` so files created by the container are owned by the host user. Do one of the following:
+
+- Export in your current shell (temporary for this session):
+
+```
+export PUID=$(id -u)
+export PGID=$(id -g)
+docker compose up -d
+```
+
+- Or create a persistent `.env` file next to `docker-compose.yml`. To auto-create it with the current UID/GID:
+
+```
+printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env
+```
+
+Finally install with (this will pull the latest image if it doesn't already exist locally):
+
+```
+docker compose up -d
+```
+
+Notes:
+
+- `${HOME}` is expanded on the machine where `docker compose` is run. If it is run as `root`, then `${HOME}` may expand to `/root` and bind mounts may point to `/root/.local/share` and `/root/.config`.
+
+#### Update docker image
+
+To update, pull the latest image:
+
+```bash
+# Pull images for services defined in docker-compose.yml
+docker compose pull
+```
+
+Then run it
+
+```bash
+# Start using the pulled image and recreate the container
+docker compose up -d --no-build --force-recreate
+```
+
+The UI is available at `http://localhost:5173` as soon as the container starts.
+
+```bash
+# stop and remove
+docker compose down
+```
+
+### Option B: Build and run from source
+
+#### Prerequisites
+
 - **Rust** 1.70+ (install from [rustup.rs](https://rustup.rs/))
 - **Node.js** 18+ and **npm** (or **Bun**)
-
-### Setup
 
 ```bash
 # Clone the repository
 git clone https://github.com/Ferrangelo/finguard-rs.git
 cd finguard-rs
-
-# Install frontend dependencies
-cd frontend
-npm install
-cd ..
 ```
 
-No additional installation needed for the backend, just run `cargo run` inside the backend folder an it handles everything.
-
-## Usage
-
-### Start the Application
-
-Option 1: Run both at once (recommended for development)
 ```bash
+# Run both backend and frontend
 ./run.sh
-```
-
-Option 2: Run separately (two terminals)
-```bash
-# Terminal 1: Backend
-cargo run
-
-# Terminal 2: Frontend
-cd finguard-zen && npm run dev
 ```
 
 The UI will be available at `http://localhost:5173`.
@@ -85,11 +103,11 @@ The UI will be available at `http://localhost:5173`.
 
 The interface has three main tabs:
 
-| Tab | What it does |
-|-----|-------------|
-| **Expenses** | View, add, edit, delete, and filter detailed monthly expenses. Switch to the *Summary* sub-tab for category breakdowns and charts. The *Mappings* sub-tab lets you define automatic expense-name-to-category rules. |
-| **Cashflow** | Enter monthly income by category (salary, interest, dividends, other). Spending and savings are auto-calculated from expense data. |
-| **Net Worth** | Track investment holdings and prices, bank/broker liquidity, and credits/debts. View allocation pie charts and evolution over time. |
+| Tab           | What it does                                                                                                                                                                                                        |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Expenses**  | View, add, edit, delete, and filter detailed monthly expenses. Switch to the _Summary_ sub-tab for category breakdowns and charts. The _Mappings_ sub-tab lets you define automatic expense-name-to-category rules. |
+| **Cashflow**  | Enter monthly income by category (salary, interest, dividends, other). Spending and savings are auto-calculated from expense data.                                                                                  |
+| **Net Worth** | Track investment holdings and prices, bank/broker liquidity, and credits/debts. View allocation pie charts and evolution over time.                                                                                 |
 
 Use the **year** and **month** selectors at the top to switch between periods. All data refreshes automatically.
 
@@ -127,6 +145,7 @@ dbs/
 ## Technology Stack
 
 ### Backend (Rust)
+
 - **Axum**: async HTTP framework
 - **Tokio**: async runtime
 - **Polars**: fast DataFrame library
@@ -134,6 +153,7 @@ dbs/
 - **Parquet**: efficient columnar storage
 
 ### Frontend (React)
+
 - **TanStack Start**: React meta-framework
 - **TanStack Router**: client-side routing
 - **TanStack Query**: data fetching & caching
@@ -142,7 +162,6 @@ dbs/
 - **Recharts**: interactive charts
 - **TypeScript**: type-safe JavaScript
 - **Vite**: lightning-fast dev server
-
 
 ## Project Structure
 
@@ -154,7 +173,7 @@ finguard-rs/
 │   │   └── (library modules)
 │   ├── Dockerfile
 │   └── Cargo.toml   # Rust dependencies
-│              
+│
 ├── frontend/        # React frontend (TanStack Start)
 │   ├── src/
 │   │   ├── components/  # UI components
