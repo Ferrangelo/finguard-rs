@@ -1,13 +1,27 @@
 import type {
-  Categories, CreditDebtRow, Currency, Expense, InvestmentAsset,
-  InvestmentCategory, LiquidityRow, MappingRule, RecurringTemplate,
+  Categories,
+  CreditDebtRow,
+  Currency,
+  Expense,
+  InvestmentAsset,
+  InvestmentCategory,
+  LiquidityRow,
+  MappingRule,
+  RecurringTemplate,
 } from "./types";
 
 async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, options);
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || `HTTP ${res.status}`);
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { error?: string };
+      if (parsed && typeof parsed.error === "string") message = parsed.error;
+    } catch {
+      // Not JSON (or empty body) - fall back to the raw text below.
+    }
+    throw new Error(message || `HTTP ${res.status}`);
   }
   const ct = res.headers.get("content-type") ?? "";
   if (ct.includes("application/json")) return res.json() as Promise<T>;
@@ -22,10 +36,17 @@ export async function listYears(): Promise<number[]> {
 export async function ensureYear(_year: number): Promise<void> {}
 
 export interface ExpenseFilter {
-  name?: string; category?: string; min?: number; max?: number;
+  name?: string;
+  category?: string;
+  min?: number;
+  max?: number;
 }
 
-export async function getExpenses(year: number, month?: number, filter?: ExpenseFilter): Promise<Expense[]> {
+export async function getExpenses(
+  year: number,
+  month?: number,
+  filter?: ExpenseFilter,
+): Promise<Expense[]> {
   const p = new URLSearchParams({ year: String(year) });
   if (month != null) p.set("month", String(month));
   if (filter?.name) p.set("name", filter.name);
@@ -39,7 +60,9 @@ export async function getAllExpenses(): Promise<Expense[]> {
   return getExpenses(new Date().getFullYear());
 }
 
-export async function upsertExpense(input: Omit<Expense, "id"> & { id?: string }): Promise<Expense> {
+export async function upsertExpense(
+  input: Omit<Expense, "id"> & { id?: string },
+): Promise<Expense> {
   return apiFetch("/api/expenses", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -83,14 +106,24 @@ type BackendMapping = { id: string; match_str: string; primary: string; secondar
 
 export async function getMappings(): Promise<MappingRule[]> {
   const data: BackendMapping[] = await apiFetch("/api/mappings");
-  return data.map((m) => ({ id: m.id, match: m.match_str, primary: m.primary, secondary: m.secondary }));
+  return data.map((m) => ({
+    id: m.id,
+    match: m.match_str,
+    primary: m.primary,
+    secondary: m.secondary,
+  }));
 }
 
 export async function addMapping(m: Omit<MappingRule, "id">): Promise<MappingRule> {
   const data: BackendMapping = await apiFetch("/api/mappings", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: "", match_str: m.match, primary: m.primary, secondary: m.secondary }),
+    body: JSON.stringify({
+      id: "",
+      match_str: m.match,
+      primary: m.primary,
+      secondary: m.secondary,
+    }),
   });
   return { id: data.id, match: data.match_str, primary: data.primary, secondary: data.secondary };
 }
@@ -108,7 +141,10 @@ export async function getCategories(): Promise<Categories> {
   return apiFetch("/api/categories");
 }
 
-export async function addCategory(kind: "primary" | "secondary", name: string): Promise<Categories> {
+export async function addCategory(
+  kind: "primary" | "secondary",
+  name: string,
+): Promise<Categories> {
   return apiFetch(`/api/categories/${kind}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -116,11 +152,16 @@ export async function addCategory(kind: "primary" | "secondary", name: string): 
   });
 }
 
-export async function deleteCategory(kind: "primary" | "secondary", name: string): Promise<Categories> {
+export async function deleteCategory(
+  kind: "primary" | "secondary",
+  name: string,
+): Promise<Categories> {
   return apiFetch(`/api/categories/${kind}/${encodeURIComponent(name)}`, { method: "DELETE" });
 }
 
-export async function getCategoryTotals(kind: "primary" | "secondary"): Promise<Record<string, number>> {
+export async function getCategoryTotals(
+  kind: "primary" | "secondary",
+): Promise<Record<string, number>> {
   return apiFetch(`/api/categories/totals?kind=${kind}`);
 }
 
@@ -128,7 +169,12 @@ export async function getIncome(year: number): Promise<Record<number, Record<str
   return apiFetch(`/api/cashflow/income?year=${year}`);
 }
 
-export async function setIncomeCell(year: number, month: number, category: string, amount: number): Promise<void> {
+export async function setIncomeCell(
+  year: number,
+  month: number,
+  category: string,
+  amount: number,
+): Promise<void> {
   await apiFetch("/api/cashflow/income", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -136,7 +182,9 @@ export async function setIncomeCell(year: number, month: number, category: strin
   });
 }
 
-export async function getMonthlySpendingByPrimary(year: number): Promise<Record<number, Record<string, number>>> {
+export async function getMonthlySpendingByPrimary(
+  year: number,
+): Promise<Record<number, Record<string, number>>> {
   return apiFetch(`/api/cashflow/spending?year=${year}`);
 }
 
@@ -145,7 +193,10 @@ export async function getInvestments(year: number): Promise<InvestmentAsset[]> {
 }
 
 export async function addInvestment(
-  name: string, category: InvestmentCategory, link?: string, year?: number,
+  name: string,
+  category: InvestmentCategory,
+  link?: string,
+  year?: number,
 ): Promise<InvestmentAsset> {
   return apiFetch("/api/investments", {
     method: "POST",
@@ -171,7 +222,11 @@ export async function deleteInvestment(id: string, year: number): Promise<void> 
 }
 
 export async function setInvestmentCell(
-  id: string, year: number, month: number, field: "qty" | "price", value: number,
+  id: string,
+  year: number,
+  month: number,
+  field: "qty" | "price",
+  value: number,
 ): Promise<void> {
   await apiFetch("/api/investments/cell", {
     method: "POST",
@@ -185,7 +240,10 @@ export async function getLiquidity(year: number): Promise<LiquidityRow[]> {
 }
 
 export async function addLiquidity(
-  name: string, category: LiquidityRow["category"], currency: Currency, year: number,
+  name: string,
+  category: LiquidityRow["category"],
+  currency: Currency,
+  year: number,
 ): Promise<LiquidityRow> {
   return apiFetch("/api/liquidity", {
     method: "POST",
@@ -210,7 +268,12 @@ export async function deleteLiquidity(id: string, year: number): Promise<void> {
   await apiFetch(`/api/liquidity/${encodeURIComponent(id)}?year=${year}`, { method: "DELETE" });
 }
 
-export async function setLiquidityCell(id: string, year: number, month: number, value: number): Promise<void> {
+export async function setLiquidityCell(
+  id: string,
+  year: number,
+  month: number,
+  value: number,
+): Promise<void> {
   await apiFetch("/api/liquidity/cell", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -222,7 +285,11 @@ export async function getCreditsDebts(year: number): Promise<CreditDebtRow[]> {
   return apiFetch(`/api/credits_debts?year=${year}`);
 }
 
-export async function addCreditDebt(name: string, currency: Currency, year: number): Promise<CreditDebtRow> {
+export async function addCreditDebt(
+  name: string,
+  currency: Currency,
+  year: number,
+): Promise<CreditDebtRow> {
   return apiFetch("/api/credits_debts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -246,7 +313,12 @@ export async function deleteCreditDebt(id: string, year: number): Promise<void> 
   await apiFetch(`/api/credits_debts/${encodeURIComponent(id)}?year=${year}`, { method: "DELETE" });
 }
 
-export async function setCreditDebtCell(id: string, year: number, month: number, value: number): Promise<void> {
+export async function setCreditDebtCell(
+  id: string,
+  year: number,
+  month: number,
+  value: number,
+): Promise<void> {
   await apiFetch("/api/credits_debts/cell", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -255,7 +327,30 @@ export async function setCreditDebtCell(id: string, year: number, month: number,
 }
 
 export const MONTHS = [
-  "January","February","March","April","May","June",
-  "July","August","September","October","November","December",
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
 ] as const;
-export const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] as const;
+export const MONTHS_SHORT = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
