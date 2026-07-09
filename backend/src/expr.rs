@@ -216,7 +216,7 @@ impl Parser {
 /// # Examples
 ///
 /// ```
-/// use finguard_rs::expr::eval;
+/// use finguard_rs_backend::expr::eval;
 ///
 /// assert_eq!(eval("2 + 3 * 4").unwrap(), 14.0);
 /// assert_eq!(eval("(10 + 5) / 3").unwrap(), 5.0);
