@@ -15,7 +15,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { Plus, Play, Pencil, X } from "lucide-react";
+import { Plus, Play, Pencil, X, ArrowUp, ArrowDown } from "lucide-react";
 import { useApp } from "@/context/AppContext";
 import * as api from "@/services/api";
 import { MONTHS, MONTHS_SHORT } from "@/services/api";
@@ -88,6 +88,7 @@ function DetailedTab() {
   });
   const [editing, setEditing] = useState<Expense | null>(null);
   const [adding, setAdding] = useState(false);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
   useEffect(() => {
     api.getCategories().then(setCats);
@@ -104,6 +105,15 @@ function DetailedTab() {
       })
       .then(setRows);
   }, [year, month, filter, refreshTick]);
+
+  const sortedRows = useMemo(() => {
+    const sorted = [...rows];
+    sorted.sort((a, b) => {
+      const cmp = a.year - b.year || a.month - b.month || a.day - b.day;
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return sorted;
+  }, [rows, sortDir]);
 
   const totalRef = useMemo(() => rows.reduce((s, e) => s + toRef(e.amount, e.currency), 0), [rows]);
 
@@ -151,7 +161,19 @@ function DetailedTab() {
           <table className="w-full min-w-[760px] text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
-                <th className="px-3 py-2 font-medium">Date</th>
+                <th
+                  className="cursor-pointer select-none px-3 py-2 font-medium transition-colors hover:text-foreground"
+                  onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+                >
+                  <div className="flex items-center gap-1">
+                    Date
+                    {sortDir === "asc" ? (
+                      <ArrowUp className="h-3 w-3" />
+                    ) : (
+                      <ArrowDown className="h-3 w-3" />
+                    )}
+                  </div>
+                </th>
                 <th className="px-3 py-2 font-medium">Name</th>
                 <th className="px-3 py-2 text-right font-medium">Amount</th>
                 <th className="px-3 py-2 font-medium">Curr</th>
@@ -162,14 +184,14 @@ function DetailedTab() {
               </tr>
             </thead>
             <tbody className="divide-y divide-border/40">
-              {rows.length === 0 && (
+              {sortedRows.length === 0 && (
                 <tr>
                   <td colSpan={8} className="px-3 py-8 text-center text-muted-foreground">
                     No expenses match.
                   </td>
                 </tr>
               )}
-              {rows.map((e) => {
+              {sortedRows.map((e) => {
                 const dateStr = `${e.year}-${String(e.month).padStart(2, "0")}-${String(e.day).padStart(2, "0")}`;
                 return (
                   <tr key={e.id} className="transition-colors hover:bg-muted/30">
