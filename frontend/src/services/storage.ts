@@ -1,3 +1,8 @@
+// A self-contained, localStorage-backed mock database (seeded with sample
+// expenses, recurring templates, mappings, cashflow, investments,
+// liquidity, and credits/debts). Nothing else in src/ currently imports
+// this module: the app reads and writes real data through services/api.ts
+// against the Rust backend instead.
 import type {
   Categories,
   CreditDebtRow,
@@ -10,6 +15,7 @@ import type {
 
 const KEY = "finguard.v1";
 
+/** Shape of the mock in-browser database this module reads and writes. */
 export interface DBShape {
   expenses: Expense[];
   recurring: RecurringTemplate[];
@@ -24,6 +30,7 @@ export interface DBShape {
 const isBrowser = typeof window !== "undefined";
 let memoryDB: DBShape | null = null;
 
+/** Builds a fresh, randomized sample dataset spanning the previous year and the current year through the current month. */
 function seed(): DBShape {
   const year = new Date().getFullYear();
   const prevYear = year - 1;
@@ -136,6 +143,13 @@ function seed(): DBShape {
     cashflowIncome, investments, liquidity, creditsDebts };
 }
 
+/**
+ * Returns the current mock database: an in-memory cache first, then
+ * localStorage, then a freshly seeded and persisted dataset if neither
+ * exists yet (e.g. on a server render, where `isBrowser` is false and the
+ * seed is not persisted). Errors reading or parsing localStorage are
+ * swallowed and treated as "no stored data".
+ */
 export function readDB(): DBShape {
   if (memoryDB) return memoryDB;
   if (isBrowser) {
@@ -149,6 +163,7 @@ export function readDB(): DBShape {
   return memoryDB;
 }
 
+/** Replaces the mock database, updating both the in-memory cache and localStorage (when available). */
 export function writeDB(db: DBShape): void {
   memoryDB = db;
   if (isBrowser) {
@@ -156,6 +171,7 @@ export function writeDB(db: DBShape): void {
   }
 }
 
+/** Clears the in-memory cache and the persisted localStorage entry, so the next `readDB` call reseeds. */
 export function resetDB(): void {
   memoryDB = null;
   if (isBrowser) window.localStorage.removeItem(KEY);

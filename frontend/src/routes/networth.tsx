@@ -34,6 +34,34 @@ import type {
 } from "@/services/types";
 import { useTheme } from "@/context/ThemeContext";
 
+// Net Worth page: investment holdings, liquidity and credits/debts, and
+// their combined evolution, split across three sub-tabs (see
+// `SUB_OPTIONS`) that share the page's selected year (and, for the total
+// view, month) from `AppContext`.
+//
+// Data flow: like expenses.tsx, this file does not use TanStack Query.
+// Each tab fetches its own data with `useEffect` into `services/api.ts`
+// and keeps it in local `useState`, refetching whenever `year` or
+// `AppContext`'s `refreshTick` changes. Every fetch is preceded by
+// `api.ensureYear(year)`, a no-op kept for readability at each call site,
+// since the backend auto-creates a year's data files on first access.
+//
+// Optimistic cell edits: `InvestmentsTab.setCell`, `LiquidityTab.setLiqCell`,
+// and `LiquidityTab.setCdCell` update local state immediately (so the input
+// reflects the typed value with no round trip latency), then call the
+// matching `api.set*Cell` function. None of the three roll the local state
+// back if that call rejects; a failed save leaves the optimistic value
+// displayed until the next full refetch corrects it.
+//
+// Sub-tabs:
+// - InvestmentsTab: per-asset monthly quantity, price, or computed value
+//   (qty * price), viewed one metric at a time via the holdings/prices/value
+//   toggle.
+// - LiquidityTab: cash/bank rows and credit/debt rows, each rendered by the
+//   shared `LiquiditySection` table component.
+// - TotalTab: combines investments, liquidity, and credits/debts into one
+//   net worth grid, an allocation pie for the selected month, and a
+//   stacked-area evolution chart across the year.
 export const Route = createFileRoute("/networth")({
   head: () => ({ meta: [{ title: "Net Worth · Finguard" }] }),
   component: NetWorthPage,
@@ -82,6 +110,7 @@ function InvestmentsTab() {
     api.ensureYear(year).then(() => api.getInvestments(year).then(setAssets));
   }, [year, refreshTick]);
 
+  // Optimistic update: see the file-level comment on cell edits above.
   const setCell = async (id: string, m: number, field: "qty" | "price", v: number) => {
     setAssets((prev) =>
       prev.map((a) => {
@@ -340,6 +369,7 @@ function LiquidityTab() {
     });
   }, [year, refreshTick]);
 
+  // Optimistic updates: see the file-level comment on cell edits above.
   const setLiqCell = async (id: string, m: number, v: number) => {
     setLiq((prev) =>
       prev.map((r) =>
@@ -511,6 +541,16 @@ interface BaseRow {
   data: Record<number, Record<number, number>>;
 }
 
+/**
+ * Generic monthly editable table shared by the Liquidity and Credits/Debts
+ * sections. `R` is the row type (`LiquidityRow` or `CreditDebtRow`); the
+ * caller supplies `valueFor` to read a cell (already converted to the
+ * reference currency via `toRef`) and the `render*` props to customize the
+ * name cell, per-row metadata columns, and row actions without this
+ * component needing to know about categories or currencies directly. Set
+ * `signed` to color negative and positive values (used for Credits/Debts,
+ * where a row can be a debt or a credit).
+ */
 function LiquiditySection<R extends BaseRow>({
   title,
   rows,
@@ -713,6 +753,10 @@ function TotalTab() {
 
   const months = Array.from({ length: 12 }, (_, i) => i + 1);
 
+  // Sums each investment category's value (qty * price) into a 12-slot
+  // array per category. Unlike liquidity and credits/debts below,
+  // `InvestmentAsset` has no `currency` field, so this total is not passed
+  // through `toRef`.
   const invByCatMonthly = useMemo(() => {
     const out: Record<string, number[]> = {};
     for (const c of INV_CATS) out[c] = Array(12).fill(0);
@@ -735,7 +779,11 @@ function TotalTab() {
   const invTotal = months.map((_, i) => INV_CATS.reduce((s, c) => s + invByCatMonthly[c][i], 0));
   const total = months.map((_, i) => invTotal[i] + liqTotal[i] + cdTotal[i]);
 
-  // Previous year december fallback for January delta
+  // January's month-over-month delta needs a "previous month" total, but
+  // there is no month 0 in the current year, so decPrev recomputes
+  // December of the prior year as that baseline. It re-derives the total
+  // from `assets`/`liq`/`cd` rather than reusing `invTotal`/`liqTotal`,
+  // since those arrays only hold `year`'s 12 months.
   const prevYear = year - 1;
   const decPrev = useMemo(() => {
     const inv = INV_CATS.reduce((s, c) => {
@@ -753,6 +801,8 @@ function TotalTab() {
     return inv + l + c;
   }, [assets, liq, cd, prevYear]);
 
+  // Each month's delta is against the prior month's total, except January,
+  // which is measured against decPrev (December of the prior year).
   const delta = total.map((t, i) => t - (i === 0 ? decPrev : total[i - 1]));
   const deltaPct = total.map((t, i) => {
     const base = i === 0 ? decPrev : total[i - 1];

@@ -1,6 +1,7 @@
 import { useApp } from "@/context/AppContext";
 import { CheckCircle2, CircleAlert, Loader2, Circle } from "lucide-react";
 
+/** Renders `AppContext`'s current `status` (idle, loading, success, or error) as a small icon-and-text pill, shown in the header. */
 export function StatusPill() {
   const { status } = useApp();
   const Icon =

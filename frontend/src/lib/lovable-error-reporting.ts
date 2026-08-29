@@ -1,3 +1,7 @@
+// Bridges runtime errors to the Lovable editor's error overlay. Lovable
+// injects `window.__lovableEvents` when the app runs inside its editor
+// preview; outside that environment this is undefined, so calls here are
+// a no-op everywhere else (production, local dev outside Lovable, tests).
 type LovableErrorOptions = {
   mechanism?: "manual" | "onerror" | "unhandledrejection" | "react_error_boundary";
   handled?: boolean;
@@ -18,6 +22,12 @@ declare global {
   }
 }
 
+/**
+ * Reports `error` to Lovable's injected error hook, if present, tagging it
+ * as an unhandled React error boundary catch with the current pathname.
+ * `context` is merged into the reported payload; on the server (no
+ * `window`) this is a no-op.
+ */
 export function reportLovableError(error: unknown, context: Record<string, unknown> = {}) {
   if (typeof window === "undefined") return;
   window.__lovableEvents?.captureException?.(

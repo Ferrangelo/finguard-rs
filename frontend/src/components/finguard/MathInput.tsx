@@ -2,6 +2,17 @@ import { useEffect, useState } from "react";
 import { evalMath } from "@/services/mathEval";
 import { cn } from "@/lib/utils";
 
+/**
+ * A text input for a numeric cell that accepts arithmetic expressions
+ * (evaluated with `evalMath`, e.g. typing "10+5.5" and committing resolves
+ * to 15.5). Keeps its own draft string while focused so partial input like
+ * "10+" is not clobbered by the numeric `value` prop; on blur or Enter it
+ * evaluates the draft and calls `onCommit` only if the result is a finite
+ * number, otherwise it reverts the draft to the last committed `value`.
+ * Escape restores the draft to the last committed `value` and then blurs, so
+ * the blur handler still runs the commit path: `onCommit` fires again with
+ * that unchanged value. Cancelling an edit therefore still issues one save.
+ */
 export function MathInput({
   value, onCommit, placeholder, className,
 }: {

@@ -15,6 +15,11 @@
 //! rather than Rust's `f64::round` (which rounds half away from zero). This
 //! matters for values landing exactly on a `.5` boundary.
 //!
+//! This is a deliberate reproduction of `round(...)` calls in the original
+//! Python `plots.py` at `/home/anferrar/Projects/finguard`, not an
+//! independent design choice: charts rendered from this module must show the
+//! same numbers a user would see in the Python app for the same data.
+//!
 //! [iced]: https://github.com/iced-rs/iced
 
 use polars::prelude::*;
@@ -225,8 +230,8 @@ fn month_columns(df: &DataFrame) -> Vec<String> {
 /// Bar chart comparing per-category expenses across up to a few months.
 ///
 /// X-axis = the category column (the synthetic `"Total"` row dropped). One
-/// [`Series`] per `YYYY-MM` month — formed from `year` and each entry of
-/// `months` — that exists as a column, named by its abbreviated month name.
+/// [`Series`] per `YYYY-MM` month (formed from `year` and each entry of
+/// `months`) that exists as a column, named by its abbreviated month name.
 /// Values use integer (round-half-even) rounding.
 ///
 /// Returns `Ok(None)` when the summary file is absent, has no non-`Total` rows,

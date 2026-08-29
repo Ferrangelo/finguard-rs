@@ -1,6 +1,12 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
+/**
+ * The app's standard panel container (frosted-glass background via the
+ * `glass` utility class), with an optional header row showing `title` on
+ * the left and `action` (e.g. a button or summary) on the right. The
+ * header is omitted entirely when neither `title` nor `action` is given.
+ */
 export function GlassCard({
   children, className, title, action,
 }: { children: ReactNode; className?: string; title?: ReactNode; action?: ReactNode }) {

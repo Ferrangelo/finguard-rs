@@ -1,3 +1,9 @@
+// TanStack Start server entry point. Wraps the framework-generated SSR
+// handler (`@tanstack/react-start/server-entry`) so a server-side render
+// failure always returns the static fallback page from lib/error-page.ts
+// instead of a bare JSON error body or an unhandled exception. See
+// start.ts for the request middleware that handles errors thrown before
+// this SSR handler runs.
 import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
@@ -19,7 +25,7 @@ async function getServerEntry(): Promise<ServerEntry> {
 }
 
 // h3 swallows in-handler throws into a normal 500 Response with body
-// {"unhandled":true,"message":"HTTPError"} — try/catch alone never fires for those.
+// {"unhandled":true,"message":"HTTPError"}: try/catch alone never fires for those.
 async function normalizeCatastrophicSsrResponse(response: Response): Promise<Response> {
   if (response.status < 500) return response;
   const contentType = response.headers.get("content-type") ?? "";
@@ -37,6 +43,9 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
   });
 }
 
+// The runtime's fetch-handler entry point. Always resolves to a Response:
+// SSR errors thrown before the handler returns, and 500 responses the
+// handler produces, are both converted to the static error page.
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     try {

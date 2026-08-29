@@ -1,5 +1,12 @@
 import { cn } from "@/lib/utils";
 
+/**
+ * A pill-style segmented control for selecting one of `options` (each an
+ * arbitrary string-literal `value` paired with a display `label`). Fully
+ * controlled: renders whichever option matches `value` as selected and
+ * calls `onChange` with the clicked option's value, without holding its
+ * own selection state.
+ */
 export function SubTabs<T extends string>({
   value, onChange, options,
 }: { value: T; onChange: (v: T) => void; options: ReadonlyArray<{ value: T; label: string }> }) {

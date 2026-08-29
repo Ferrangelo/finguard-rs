@@ -1,3 +1,9 @@
+// Standalone fallback HTML page (inline styles, no app CSS or script
+// dependency) shown when the server can't render the actual app shell, so
+// it renders correctly even if the failure is in the app's own build
+// output.
+
+/** Returns the full HTML document string for the generic server-error fallback page. */
 export function renderErrorPage(): string {
   return `<!doctype html>
 <html lang="en">

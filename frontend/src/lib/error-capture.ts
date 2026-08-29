@@ -15,6 +15,12 @@ if (typeof globalThis.addEventListener === "function") {
   );
 }
 
+/**
+ * Returns and clears the most recently captured `error` or
+ * `unhandledrejection` event, or `undefined` if none was captured within
+ * the last `TTL_MS` (5 seconds). The TTL keeps a stale error from an
+ * unrelated earlier request from being attributed to the current one.
+ */
 export function consumeLastCapturedError(): unknown {
   if (!lastCapturedError) return undefined;
   if (Date.now() - lastCapturedError.at > TTL_MS) {

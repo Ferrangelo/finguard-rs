@@ -137,7 +137,7 @@ fn main() -> Result<()> {
     recurring.add("Phone Plan", 20, 20.00, "E", "otherexpenses", "phone")?;
 
     // -----------------------------------------------------------------------
-    // 5. Detailed expenses — January through December.
+    // 5. Detailed expenses: January through December.
     //
     //    Each block: apply recurring templates first, then add variable costs,
     //    then update the cumulative primaries/secondaries summary tables so
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
         Ok(())
     }
 
-    // January — quiet winter month
+    // January, a quiet winter month
     {
         let mut de = DetailedExpenses::new(year, 1)?;
         recurring.apply_to_month(&mut de)?;
@@ -175,7 +175,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // February — Valentine's dinner splurge
+    // February: Valentine's dinner splurge
     {
         let mut de = DetailedExpenses::new(year, 2)?;
         recurring.apply_to_month(&mut de)?;
@@ -198,7 +198,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // March — ski trip drives spending up
+    // March: ski trip drives spending up
     {
         let mut de = DetailedExpenses::new(year, 3)?;
         recurring.apply_to_month(&mut de)?;
@@ -223,7 +223,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // April — spring wardrobe refresh
+    // April: spring wardrobe refresh
     {
         let mut de = DetailedExpenses::new(year, 4)?;
         recurring.apply_to_month(&mut de)?;
@@ -245,7 +245,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // May — concert night out
+    // May: concert night out
     {
         let mut de = DetailedExpenses::new(year, 5)?;
         recurring.apply_to_month(&mut de)?;
@@ -269,7 +269,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // June — summer prep (swimwear + headphones)
+    // June: summer prep (swimwear + headphones)
     {
         let mut de = DetailedExpenses::new(year, 6)?;
         recurring.apply_to_month(&mut de)?;
@@ -293,7 +293,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // July — summer vacation (biggest spending month)
+    // July: summer vacation (biggest spending month)
     {
         let mut de = DetailedExpenses::new(year, 7)?;
         recurring.apply_to_month(&mut de)?;
@@ -315,7 +315,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // August — calm recovery month
+    // August: calm recovery month
     {
         let mut de = DetailedExpenses::new(year, 8)?;
         recurring.apply_to_month(&mut de)?;
@@ -336,7 +336,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // September — back to routine, autumn clothes
+    // September: back to routine, autumn clothes
     {
         let mut de = DetailedExpenses::new(year, 9)?;
         recurring.apply_to_month(&mut de)?;
@@ -358,7 +358,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // October — Halloween + birthday gift
+    // October: Halloween + birthday gift
     {
         let mut de = DetailedExpenses::new(year, 10)?;
         recurring.apply_to_month(&mut de)?;
@@ -381,7 +381,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // November — Black Friday + winter jacket
+    // November: Black Friday + winter jacket
     {
         let mut de = DetailedExpenses::new(year, 11)?;
         recurring.apply_to_month(&mut de)?;
@@ -404,7 +404,7 @@ fn main() -> Result<()> {
         de.update_all_summary_tables()?;
     }
 
-    // December — Christmas (highest spending month)
+    // December: Christmas (highest spending month)
     {
         let mut de = DetailedExpenses::new(year, 12)?;
         recurring.apply_to_month(&mut de)?;
@@ -454,7 +454,7 @@ fn main() -> Result<()> {
     println!("  ✓ Cashflow seeded");
 
     // -----------------------------------------------------------------------
-    // 7. Investment holdings — four assets across the year.
+    // 7. Investment holdings: four assets across the year.
     // -----------------------------------------------------------------------
     let mut inv = InvestmentHoldings::new(year)?;
 
@@ -519,7 +519,7 @@ fn main() -> Result<()> {
     println!("  ✓ Investments seeded");
 
     // -----------------------------------------------------------------------
-    // 8. Liquidity — three accounts.
+    // 8. Liquidity: three accounts.
     // -----------------------------------------------------------------------
     let mut liq = Liquidity::new(year)?;
 
@@ -550,7 +550,7 @@ fn main() -> Result<()> {
     println!("  ✓ Liquidity seeded");
 
     // -----------------------------------------------------------------------
-    // 9. Credits / Debts — mortgage (debt) + loan to a friend (credit).
+    // 9. Credits / Debts: mortgage (debt) + loan to a friend (credit).
     // -----------------------------------------------------------------------
     let mut cd = CreditsDebts::new(year)?;
 

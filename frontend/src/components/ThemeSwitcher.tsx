@@ -22,6 +22,13 @@ const THEME_LABELS: Record<string, { label: string; icon: React.ReactNode }> = {
   original: { label: "Original", icon: <Palette className="h-4 w-4" /> },
 };
 
+/**
+ * Dropdown menu for picking one of `useTheme()`'s `availableThemes`. See
+ * frontend/THEME_SYSTEM.md: adding a theme requires a new CSS file under
+ * src/styles/, an entry in `ThemeContext.AVAILABLE_THEMES`, and a label and
+ * icon in `THEME_LABELS` here, or it renders with the generic `Palette`
+ * icon and its raw theme id as the label (see the fallbacks below).
+ */
 export function ThemeSwitcher() {
   const { theme, setTheme, availableThemes } = useTheme();
 

@@ -35,6 +35,28 @@ import type {
 } from "@/services/types";
 import { useTheme } from "@/context/ThemeContext";
 
+// Expenses page: transaction entry, category summaries, recurring
+// templates, and name-to-category mapping rules, split across four
+// sub-tabs (see `SUB_OPTIONS`) that share the page's year/month selection
+// from `AppContext`.
+//
+// Data flow: this file does not use TanStack Query. Each tab fetches its
+// own data with a plain `useEffect` call into `services/api.ts` and stores
+// the result in local `useState`. Mutations call the matching `api.*`
+// function directly, then call `refresh()` from `AppContext`, which bumps
+// `refreshTick`; every tab's fetch `useEffect` depends on `refreshTick`, so
+// one `refresh()` call re-runs every tab's fetch the next time it renders,
+// including tabs that are not currently visible.
+//
+// Sub-tabs:
+// - DetailedTab: the current month's expense list, with inline filtering,
+//   add/edit form, and delete.
+// - SummaryTab: year-wide charts and tables aggregated by primary or
+//   secondary category, derived client-side from the year's full expense
+//   list (`api.getExpenses(year)` with no month filter).
+// - RecurringTab: recurring expense templates and the "apply to this
+//   month" action.
+// - MappingsTab: name-substring-to-category mapping rules.
 export const Route = createFileRoute("/expenses")({
   head: () => ({ meta: [{ title: "Expenses · Finguard" }] }),
   component: ExpensesPage,
@@ -90,11 +112,17 @@ function DetailedTab() {
   const [adding, setAdding] = useState(false);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
+  // Reload categories and mappings whenever a mutation elsewhere bumps
+  // refreshTick (e.g. adding a category or mapping rule from another tab).
   useEffect(() => {
     api.getCategories().then(setCats);
     api.getMappings().then(setMappings);
   }, [refreshTick]);
 
+  // Refetch the row list on every change to year, month, the active
+  // filter, or refreshTick. Empty filter fields are sent as `undefined` so
+  // the backend does not apply that filter at all, rather than filtering
+  // on an empty string.
   useEffect(() => {
     api
       .getExpenses(year, month, {
@@ -106,6 +134,8 @@ function DetailedTab() {
       .then(setRows);
   }, [year, month, filter, refreshTick]);
 
+  // Sort is applied client-side to the already-filtered rows; the backend
+  // does not accept a sort order.
   const sortedRows = useMemo(() => {
     const sorted = [...rows];
     sorted.sort((a, b) => {
@@ -310,6 +340,10 @@ function ExpenseForm({
   const [primary, setPrimary] = useState(initial?.primary ?? "");
   const [secondary, setSecondary] = useState(initial?.secondary ?? "");
 
+  // Auto-fill category from a mapping rule while adding a new expense (not
+  // while editing, so an edit never silently overwrites a category the
+  // user chose deliberately). Only tries once the name is at least 2
+  // characters, to avoid matching on a near-empty string.
   const onNameChange = (v: string) => {
     setName(v);
     if (!initial && v.length >= 2) {
@@ -322,6 +356,8 @@ function ExpenseForm({
   };
 
   const submit = async () => {
+    // `amount` accepts arithmetic expressions (e.g. "10+5.5"); evalMath
+    // parses and evaluates it, returning NaN for invalid input.
     const amt = evalMath(amount);
     const dayNum = Math.max(1, Math.min(31, Math.floor(Number(day) || 1)));
     if (!name.trim() || !Number.isFinite(amt)) {
@@ -453,12 +489,17 @@ function SummaryTab() {
   const { theme } = useTheme();
   const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
 
+  // Loads every expense for the whole year once (not per-month); every
+  // derived table and chart below slices this same list client-side
+  // instead of making a separate request per view.
   useEffect(() => {
     api.getExpenses(year).then(setYearExpenses);
   }, [year, refreshTick]);
 
   const catOf = (e: Expense) => (kind === "primary" ? e.primary : e.secondary) || "Uncategorized";
 
+  // Per-category totals for the selected month only, sorted descending for
+  // the month pie chart and table.
   const monthTotals = useMemo(() => {
     const map = new Map<string, number>();
     for (const e of yearExpenses) {
@@ -471,6 +512,8 @@ function SummaryTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [yearExpenses, month, kind]);
 
+  // category -> 12-slot month array (index 0 = January) plus its yearly
+  // total, one row per category that appears anywhere in the year.
   const yearTable = useMemo(() => {
     const cats = new Set<string>();
     const grid: Record<string, number[]> = {};
@@ -496,6 +539,10 @@ function SummaryTab() {
 
   const allCats = useMemo(() => yearTable.map((r) => r.category), [yearTable]);
 
+  // Secondary-category bar chart caps the visible bars at the top 12 by
+  // yearly total and folds every category beyond that into one "Others"
+  // bar, so the chart height stays bounded regardless of how many distinct
+  // secondary categories exist.
   const yearBarData = useMemo(() => {
     if (kind !== "secondary") return [];
     const TOP = 12;
@@ -512,6 +559,9 @@ function SummaryTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allCats.join("|")]);
 
+  // Pivots the selected months (at most 3, see toggleMonth) into one row
+  // per category with one column per selected month, for the grouped bar
+  // chart comparing categories across months.
   const compareData = useMemo(() => {
     if (selMonths.length === 0) return [];
     const cats = new Set<string>();
@@ -530,6 +580,9 @@ function SummaryTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [yearExpenses, selMonths, kind]);
 
+  // One row per month (all 12, regardless of selection) with one column
+  // per selected category (at most 3, see toggleCat), for the category
+  // trend line chart.
   const trendData = useMemo(() => {
     return MONTHS_SHORT.map((m, i) => {
       const row: Record<string, number | string> = { month: m };
@@ -544,6 +597,8 @@ function SummaryTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [yearExpenses, selCats, kind]);
 
+  // Both toggles cap the selection at 3 entries; selecting a 4th evicts the
+  // oldest selection (FIFO) rather than rejecting the new pick.
   const toggleMonth = (m: number) =>
     setSelMonths((prev) =>
       prev.includes(m)
@@ -849,6 +904,8 @@ function RecurringTab() {
     await api.addRecurring({
       year,
       name: form.name.trim(),
+      // Clamped to 1-28 so the template's day exists in every month,
+      // including February.
       day: Math.max(1, Math.min(28, Number(form.day) || 1)),
       amount: amt,
       currency: form.currency,
@@ -860,6 +917,9 @@ function RecurringTab() {
     refresh();
   };
 
+  // Materializes every recurring template into the current month's expense
+  // list (the backend skips templates already applied that month, see
+  // api.applyRecurring), then refetches so DetailedTab shows the new rows.
   const apply = async () => {
     notify("loading", "Applying recurring…");
     const n = await api.applyRecurring(year, month);

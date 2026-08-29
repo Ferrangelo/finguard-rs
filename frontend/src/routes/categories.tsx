@@ -7,6 +7,11 @@ import { formatRef } from "@/services/fx";
 import { GlassCard } from "@/components/finguard/GlassCard";
 import type { Categories } from "@/services/types";
 
+// Categories page: two side-by-side registries (primary and secondary
+// category names) with their all-time expense totals, add and delete
+// actions. Fetches with `useEffect` into `services/api.ts` on mount and on
+// `AppContext`'s `refreshTick`, following the same pattern as the other
+// route files in this app (no TanStack Query).
 export const Route = createFileRoute("/categories")({
   head: () => ({ meta: [{ title: "Categories · Finguard" }] }),
   component: CategoriesPage,
@@ -91,6 +96,11 @@ function CategoryColumn({
           <tbody className="divide-y divide-border/40">
             {list.map((c) => {
               const t = totals[c] ?? 0;
+              // Only hides the delete button for a positive total. The
+              // backend rejects a delete whenever the total's absolute
+              // value is nonzero (see `deleteCategory` in services/api.ts),
+              // so a category whose all-time total is negative shows a
+              // delete button the backend will still reject.
               const hasExpenses = t > 0;
               return (
                 <tr key={c} className="hover:bg-muted/20">

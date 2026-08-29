@@ -3,7 +3,10 @@
 //!
 //! All tables are stored as parquet files under the standard XDG data path
 //! (see [`crate::paths`]). Schemas are kept byte-compatible with the Python
-//! application so the two can read each other's files.
+//! application at `/home/anferrar/Projects/finguard` so the two can read each
+//! other's parquet files: renaming, retyping, or reordering a column here is a
+//! cross-project data-contract change, not a local refactor, and must be
+//! checked against that project first.
 
 use std::collections::HashSet;
 
@@ -25,7 +28,12 @@ use crate::paths::{
 // ======================================================================
 
 /// Special-case category-name mappings (lower-cased key → canonical display
-/// value). Mirrors the Python `_SPECIAL_CASES` dict exactly.
+/// value). Mirrors the Python `_SPECIAL_CASES` dict in
+/// `/home/anferrar/Projects/finguard/src/finguard/df_operations.py` entry for
+/// entry, including its irregular internal capitalization (e.g. `"MrStuff"`,
+/// `"TechDonations"`). These spellings already exist in user data and in the
+/// Python UI, so this list must stay a literal copy rather than a
+/// "corrected" or alphabetized version.
 fn special_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("tv", "TV"),
@@ -209,7 +217,7 @@ pub fn get_category_totals_across_all_years(kind: &str) -> Result<IndexMap<Strin
 
 /// Delete the row for `name` from every year-summary parquet file of `kind`.
 ///
-/// This is a permanent write operation — call only after confirming the
+/// This is a permanent write operation. Call only after confirming the
 /// category total is `0.0`. Per-file errors are swallowed (mirroring Python).
 ///
 /// `kind` must be `"primary"` or `"secondary"`.

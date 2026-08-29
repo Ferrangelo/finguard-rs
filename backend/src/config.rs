@@ -4,9 +4,9 @@
 //! The config files live in `$XDG_CONFIG_HOME/finguard/` (defaulting to
 //! `$HOME/.config/finguard/` when `XDG_CONFIG_HOME` is not set):
 //!
-//! - `category_mappings.json` — object keyed by lower-cased expense name →
+//! - `category_mappings.json`: object keyed by lower-cased expense name →
 //!   `{ "primary_category": str, "secondary_category": str }`.
-//! - `known_categories.json` — `{ "primary": [...], "secondary": [...] }`.
+//! - `known_categories.json`: `{ "primary": [...], "secondary": [...] }`.
 //!
 //! Both files are written with `serde_json`'s pretty printer (4-space indent),
 //! matching Python's `json.dump(..., indent=4, ensure_ascii=False)`. Mapping

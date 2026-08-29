@@ -1,5 +1,11 @@
 "use client";
 
+// Multi-theme system: see frontend/THEME_SYSTEM.md for the full design.
+// Each theme is a standalone CSS file under src/styles/ (Tailwind `@theme`
+// variables); switching themes swaps which stylesheet `<link>` is present
+// in `<head>` rather than toggling a class, so unrelated component code
+// never needs to branch on the active theme. The chosen theme persists in
+// localStorage under `THEME_STORAGE_KEY` and is re-applied on every mount.
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 
 type Theme = "arctic" | "midnight" | "dusk" | "ember" | "forest" | "pitch" | "original";
@@ -24,6 +30,13 @@ const AVAILABLE_THEMES: Theme[] = [
 const DEFAULT_THEME: Theme = "midnight";
 const THEME_STORAGE_KEY = "finguard-theme";
 
+/**
+ * Provides the active theme and `setTheme` to descendants. Renders its
+ * provider unconditionally (including during SSR, before the client-only
+ * localStorage read in the effect below runs) so every consumer always has
+ * a context value, starting at `DEFAULT_THEME` until the effect applies
+ * the stored theme, if any.
+ */
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setThemeState] = useState<Theme>(DEFAULT_THEME);
 
@@ -54,6 +67,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   );
 }
 
+/** Reads the current theme, `setTheme`, and the list of available themes. Throws if called outside a `ThemeProvider`. */
 export function useTheme() {
   const context = useContext(ThemeContext);
   if (!context) {
@@ -62,6 +76,9 @@ export function useTheme() {
   return context;
 }
 
+// Swaps the injected theme <link> for `theme`'s stylesheet. Removing the
+// old link before appending the new one, rather than swapping `href` in
+// place, avoids a brief moment with both themes' rules active.
 function applyTheme(theme: Theme) {
   // Remove previous theme stylesheets
   const previousLink = document.querySelector("link[data-theme]");

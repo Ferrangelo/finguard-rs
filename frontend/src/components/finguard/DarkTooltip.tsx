@@ -10,6 +10,13 @@ interface Props {
   total?: boolean;
 }
 
+/**
+ * Custom Recharts tooltip content renderer (pass as `<Tooltip content={<DarkTooltip />} />`).
+ * Renders nothing while inactive or without a payload, matching Recharts'
+ * own tooltip contract. Each `payload` entry is shown as a colored dot,
+ * name, and formatted value; pass `total` to additionally show the sum of
+ * all entries, useful for stacked/grouped charts with more than one series.
+ */
 export function DarkTooltip({ active, payload, label, total }: Props) {
   if (!active || !payload || payload.length === 0) return null;
   const sum = payload.reduce((s, p) => s + (Number(p.value) || 0), 0);
@@ -41,7 +48,7 @@ export function DarkTooltip({ active, payload, label, total }: Props) {
   );
 }
 
-// Palette for dark themes — high lightness, visible on dark backgrounds
+// Palette for dark themes: high lightness, visible on dark backgrounds
 const DARK_COLORS = [
   "oklch(0.78 0.14 200)",
   "oklch(0.70 0.18 295)",
@@ -55,20 +62,7 @@ const DARK_COLORS = [
   "oklch(0.66 0.10 260)",
 ];
 
-// Palette for arctic (light) theme — lower lightness + higher chroma, visible on white/light-grey
-// const ARCTIC_COLORS = [
-//   "oklch(0.42 0.22 230)", // deep blue
-//   "oklch(0.45 0.22 295)", // deep purple
-//   "oklch(0.42 0.20 155)", // deep green
-//   "oklch(0.52 0.18 75)", // deep amber
-//   "oklch(0.48 0.24 20)", // deep red
-//   "oklch(0.44 0.20 185)", // deep teal
-//   "oklch(0.46 0.18 130)", // deep olive
-//   "oklch(0.46 0.22 340)", // deep pink
-//   "oklch(0.50 0.20 50)", // deep orange
-//   "oklch(0.43 0.18 260)", // deep indigo
-// ];
-
+// Palette for arctic (light) theme: lower lightness + higher chroma, visible on white/light-grey
 const ARCTIC_COLORS = [
   "oklch(0.52 0.11 215)", // shifted from 200 → 215
   "oklch(0.45 0.15 295)",
@@ -84,14 +78,14 @@ const ARCTIC_COLORS = [
 
 const LIGHT_THEMES = new Set(["arctic"]);
 
-/** React hook — returns a colorAt() bound to the active theme's palette. */
+/** React hook that returns a colorAt() bound to the active theme's palette. */
 export function useChartColors() {
   const { theme } = useTheme();
   const palette = LIGHT_THEMES.has(theme) ? ARCTIC_COLORS : DARK_COLORS;
   return (i: number) => palette[i % palette.length];
 }
 
-/** wrapperStyle for every Recharts <Legend> — uses arctic-specific CSS vars with fallbacks. */
+/** wrapperStyle for every Recharts <Legend>: uses arctic-specific CSS vars with fallbacks. */
 export const LEGEND_STYLE: React.CSSProperties = {
   fontSize: 19,
   backgroundColor: "var(--legend-bg, var(--muted))",

@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
+/**
+ * A free-text input with a filtered dropdown of up to 8 suggestions drawn
+ * from `options` (case-insensitive substring match against the current
+ * `value`). Unlike a plain `<select>`, the user can commit any typed value
+ * via `onChange`, not only one of the listed `options`; the dropdown is a
+ * suggestion aid, not a constraint. Closes when the user clicks outside
+ * the component.
+ */
 export function Combobox({
   value, onChange, options, placeholder, className,
 }: {

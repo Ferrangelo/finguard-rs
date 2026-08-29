@@ -22,6 +22,13 @@ const TABS = [
   { to: "/categories", label: "Categories", icon: Layers },
 ] as const;
 
+/**
+ * The app's persistent top bar: brand mark, primary navigation (desktop
+ * nav in the main row, a horizontally scrollable nav below it on mobile),
+ * and the shared year/month selectors, theme switcher, and status pill.
+ * The year/month selects write directly to `AppContext`, so changing them
+ * here immediately triggers a refetch in whichever route is mounted.
+ */
 export function Header() {
   const { year, month, years, setYear, setMonth } = useApp();
   const loc = useLocation();

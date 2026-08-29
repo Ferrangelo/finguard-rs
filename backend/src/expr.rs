@@ -208,7 +208,7 @@ impl Parser {
 /// arbitrarily nested parentheses. Whitespace anywhere is ignored. Everything
 /// is computed as `f64`, matching the Python original.
 ///
-/// Returns [`Error::InvalidArgument`] for any invalid input — empty or
+/// Returns [`Error::InvalidArgument`] for any invalid input. Empty or
 /// whitespace-only strings, unknown characters, identifiers/function calls,
 /// trailing garbage, mismatched parentheses, malformed numbers, and division
 /// by zero. This function never panics.

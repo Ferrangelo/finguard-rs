@@ -23,6 +23,14 @@ import { DarkTooltip, useChartColors, LEGEND_STYLE } from "@/components/finguard
 import { INCOME_CATEGORIES } from "@/services/types";
 import { useTheme } from "@/context/ThemeContext";
 
+// Cashflow page: a single-year grid of income by category, spending, and
+// derived saving figures, plus an income/spending/saving bar chart and an
+// income-distribution pie chart. Like expenses.tsx and networth.tsx, it
+// fetches with `useEffect` into `services/api.ts` rather than TanStack
+// Query, and refetches on `year` or `AppContext`'s `refreshTick` changes.
+// Editing an income cell (`setCell`) applies the new value to local state
+// immediately, then calls `api.setIncomeCell`; it does not roll back the
+// optimistic update if that call rejects.
 export const Route = createFileRoute("/cashflow")({
   head: () => ({ meta: [{ title: "Cashflow · Finguard" }] }),
   component: CashflowPage,
@@ -43,6 +51,9 @@ function CashflowPage() {
 
   const months = useMemo(() => Array.from({ length: 12 }, (_, i) => i + 1), []);
 
+  // Sums every primary category present for the month, whatever categories
+  // that turns out to be; unlike income, spending categories are not a
+  // fixed known list on the frontend.
   const totalSpendingByMonth = useMemo(
     () => months.map((m) => Object.values(spending[m] ?? {}).reduce((s, n) => s + n, 0)),
     [spending, months],
@@ -168,6 +179,13 @@ function CashflowPage() {
   );
 }
 
+/**
+ * One footer row of the cashflow grid (Income, Spending, Saving, or Saving
+ * %), rendering one value per month plus a row-end total. For `variant:
+ * "percent"` the "total" column is the average of the 12 monthly
+ * percentages, not the percentage of the yearly totals, so it can differ
+ * from `yearlySaving / yearlyIncome`.
+ */
 function DerivedRow({
   label,
   values,

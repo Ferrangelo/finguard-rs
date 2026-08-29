@@ -2,6 +2,18 @@
 //!
 //! Exposes a JSON REST API for finguard-zen to perform expenses, cashflow,
 //! networth, and categories management operations using the backend Polars logic.
+//!
+//! This module is the HTTP surface only: it defines the route table, decodes
+//! and validates request bodies/query strings into the DTOs below, and
+//! translates domain errors ([`finguard_rs_backend::Error`], via [`AppError`])
+//! into HTTP status codes. All persistence and business logic live one layer
+//! down in [`finguard_rs_backend::df_operations`] (Parquet-backed dataframes)
+//! and [`finguard_rs_backend::config`] (JSON category config); handlers here
+//! should stay thin wrappers around those types.
+//!
+//! The `.route(...)` calls in [`main`] are the single source of truth for the
+//! API surface. Grep for `.route(` rather than trusting a cached copy of the
+//! route list in documentation, including `PROJECT_SUMMARY.md`.
 
 use axum::{
     Json, Router,
@@ -25,6 +37,13 @@ use http_error::AppError;
 // ======================================================================
 // JSON Serialisation Models
 // ======================================================================
+//
+// These structs define the wire format of the REST API. Every one of them is
+// mirrored by a hand-written TypeScript type in `frontend/src/services/types.ts`
+// and consumed through the matching fetch call in `frontend/src/services/api.ts`.
+// Adding, renaming, removing, or retyping a field here requires the matching
+// change on the frontend side; there is no shared schema generation between
+// the two, so nothing else will catch a mismatch until it fails at runtime.
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExpenseJson {
@@ -99,6 +118,10 @@ pub struct CreditDebtRowJson {
 // ======================================================================
 // Query/Payload Structs
 // ======================================================================
+//
+// Request-side shapes (query strings and JSON bodies). Same cross-language
+// contract as the DTOs above: each of these mirrors the request shape built
+// by the corresponding call in `frontend/src/services/api.ts`.
 
 #[derive(Deserialize, Debug)]
 pub struct YearQuery {
@@ -162,7 +185,7 @@ pub struct SetInvestmentCellPayload {
     pub id: String,
     pub year: i32,
     pub month: u32,
-    pub field: String, // "qty" or "price"
+    pub field: String, // "quantity" or "price"; see `InvestmentHoldings::set_quantity_or_price`
     pub value: f64,
 }
 
@@ -186,11 +209,17 @@ pub struct SetCreditDebtCellPayload {
 // Helper Functions
 // ======================================================================
 
+/// Read a parquet file eagerly. Returns an error if `path` cannot be opened or
+/// does not contain a valid parquet stream; callers are expected to check
+/// [`std::path::Path::exists`] first when a missing file is a normal case.
 fn read_parquet(path: &std::path::Path) -> finguard_rs_backend::Result<polars::prelude::DataFrame> {
     let file = std::fs::File::open(path)?;
     Ok(polars::prelude::ParquetReader::new(file).finish()?)
 }
 
+/// Read a required string column, propagating any error (missing column, wrong
+/// dtype) to the caller. Nulls become `""`. Use this for columns the caller
+/// cannot proceed without.
 fn str_col_to_vec(
     df: &polars::prelude::DataFrame,
     name: &str,
@@ -203,6 +232,9 @@ fn str_col_to_vec(
         .collect())
 }
 
+/// Read a string column leniently: a missing column or dtype mismatch yields
+/// an empty `Vec` instead of an error. Nulls become `""`. Used for columns
+/// that may legitimately be absent from an older parquet file.
 fn column_strings(df: &polars::prelude::DataFrame, name: &str) -> Vec<String> {
     match df.column(name).and_then(|c| c.str().cloned()) {
         Ok(s) => s.iter().map(|o| o.unwrap_or("").to_string()).collect(),
@@ -210,6 +242,10 @@ fn column_strings(df: &polars::prelude::DataFrame, name: &str) -> Vec<String> {
     }
 }
 
+/// Read a numeric column as `f64`, casting if necessary. Missing column, a
+/// non-numeric dtype, or nulls all fall back silently (missing column yields
+/// an empty `Vec`; nulls become `0.0`), matching [`column_strings`]'s lenient
+/// contract.
 fn column_f64(df: &polars::prelude::DataFrame, name: &str) -> Vec<f64> {
     let Ok(col) = df.column(name) else {
         return Vec::new();
@@ -221,6 +257,9 @@ fn column_f64(df: &polars::prelude::DataFrame, name: &str) -> Vec<f64> {
     }
 }
 
+/// Read a numeric column as `i64`, casting if necessary. Same lenient
+/// fallbacks as [`column_f64`] (empty `Vec` if the column is missing or not
+/// numeric, `0` for nulls).
 fn column_i64(df: &polars::prelude::DataFrame, name: &str) -> Vec<i64> {
     let Ok(col) = df.column(name) else {
         return Vec::new();
@@ -232,6 +271,11 @@ fn column_i64(df: &polars::prelude::DataFrame, name: &str) -> Vec<i64> {
     }
 }
 
+/// Read a `Date` column and return only the day-of-month component (1-31) of
+/// each value, not the full date; `expense_date`'s year/month are already
+/// known from the request (see [`get_expenses_handler`]), so only the day is
+/// needed to build [`ExpenseJson`]. Same lenient fallbacks as [`column_f64`]
+/// (empty `Vec` if the column is missing or not date-castable, `0` for nulls).
 fn column_dates_day(df: &polars::prelude::DataFrame, name: &str) -> Vec<i32> {
     use chrono::Datelike;
     let Ok(col) = df.column(name) else {
@@ -253,6 +297,11 @@ fn column_dates_day(df: &polars::prelude::DataFrame, name: &str) -> Vec<i32> {
     }
 }
 
+/// Set `target_col` to `value` on every row where `key_col` equals `key`,
+/// leaving other rows unchanged. Does not save; callers persist the mutated
+/// dataframe (e.g. via `liq.save()`) afterward. Used by the metadata-update
+/// handlers to patch a single field (such as `currency`) on an already-loaded
+/// wide table without going through a dedicated setter on the domain type.
 fn set_df_str_where(
     df: &mut polars::prelude::DataFrame,
     key_col: &str,
@@ -278,7 +327,20 @@ fn set_df_str_where(
 // ======================================================================
 // Handlers
 // ======================================================================
+//
+// Grouped below by resource, matching the route groups in [`main`]. Each
+// handler validates its Axum extractors (Axum itself rejects a request whose
+// query string or JSON body cannot deserialize into the target struct before
+// the handler body runs), calls into `df_operations`/`config`, and maps any
+// resulting [`finguard_rs_backend::Error`] to an HTTP status through
+// [`AppError`] (see `http_error.rs` for the status mapping).
 
+/// List the years that have any data on disk, newest first.
+///
+/// Scans the immediate subdirectories of the dbs root and keeps the ones whose
+/// name parses as an `i32`. Returns an empty list (never an error) if the dbs
+/// root or its listing cannot be read, since "no years yet" is a normal state
+/// for a fresh installation.
 fn discover_years() -> Vec<i32> {
     let Ok(root) = finguard_rs_backend::paths::get_dbs_root() else {
         return vec![];
@@ -299,10 +361,20 @@ fn discover_years() -> Vec<i32> {
     years
 }
 
+/// `GET /api/years`: list years with any on-disk data. See [`discover_years`].
 async fn list_years_handler() -> Json<Vec<i32>> {
     Json(discover_years())
 }
 
+/// `GET /api/expenses`: list expense rows for `year`, optionally narrowed to
+/// one `month` (otherwise all 12 months are read and concatenated) and
+/// further filtered by `name`/`category` substring and `min`/`max` amount.
+///
+/// A month with no parquet file yet is treated as empty (skipped), not an
+/// error, so requesting a full year with partial data still succeeds. Each
+/// returned [`ExpenseJson::id`] is that row's position in the month's
+/// unfiltered dataframe, which [`delete_expense_handler`] and
+/// [`upsert_expense_handler`] expect back verbatim.
 async fn get_expenses_handler(
     Query(q): Query<GetExpensesQuery>,
 ) -> Result<Json<Vec<ExpenseJson>>, AppError> {
@@ -348,6 +420,15 @@ async fn get_expenses_handler(
     Ok(Json(all))
 }
 
+/// `POST /api/expenses`: create or update an expense row in
+/// `payload.year`/`payload.month`'s monthly parquet file.
+///
+/// An empty `payload.id` means "create": the row is appended and the response
+/// carries the new row's index as its `id`. A non-empty `id` means "update
+/// the row at that index"; it must parse as a `u32` or this returns
+/// [`Error::InvalidArgument`] (`400`). Either path rewrites the month's
+/// parquet file and recomputes the primaries/secondaries summary tables for
+/// the year.
 async fn upsert_expense_handler(
     Json(payload): Json<ExpenseJson>,
 ) -> Result<Json<ExpenseJson>, AppError> {
@@ -387,6 +468,12 @@ async fn upsert_expense_handler(
     }
 }
 
+/// `DELETE /api/expenses/:id`: remove the expense at row index `id` from
+/// `q.year`/`q.month`'s monthly parquet file, then recompute the
+/// primaries/secondaries summary tables for the year.
+///
+/// Returns [`Error::InvalidArgument`] (`400`) if `id` does not parse as a
+/// `u32`.
 async fn delete_expense_handler(
     Path(id): Path<String>,
     Query(q): Query<DeleteExpenseQuery>,
@@ -399,6 +486,10 @@ async fn delete_expense_handler(
     Ok(())
 }
 
+/// `GET /api/recurring`: list `q.year`'s recurring expense templates. Each
+/// [`RecurringTemplateJson::id`] is that row's position in the year's
+/// recurring-expenses table, which [`delete_recurring_handler`] expects back
+/// verbatim.
 async fn get_recurring_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<Vec<RecurringTemplateJson>>, AppError> {
@@ -427,6 +518,11 @@ async fn get_recurring_handler(
     Ok(Json(list))
 }
 
+/// `POST /api/recurring`: append a recurring expense template for
+/// `payload.year` and save the table.
+///
+/// Returns [`Error::InvalidArgument`] (`400`) if `payload.day` is outside
+/// 1..=28 (a template must fire in every month, including February).
 async fn add_recurring_handler(
     Json(payload): Json<AddRecurringPayload>,
 ) -> Result<Json<RecurringTemplateJson>, AppError> {
@@ -452,6 +548,11 @@ async fn add_recurring_handler(
     }))
 }
 
+/// `DELETE /api/recurring/:id`: remove the recurring template at row index
+/// `id` from `q.year`'s table and save.
+///
+/// Returns [`Error::InvalidArgument`] (`400`) if `id` does not parse as a
+/// `u32`.
 async fn delete_recurring_handler(
     Path(id): Path<String>,
     Query(q): Query<YearQuery>,
@@ -464,6 +565,11 @@ async fn delete_recurring_handler(
     Ok(())
 }
 
+/// `POST /api/recurring/apply`: insert every recurring template for
+/// `payload.year` into `payload.month`'s detailed-expenses table, skipping
+/// templates that already have a matching row (same name and day-of-month) so
+/// the endpoint is safe to call more than once for the same month. Returns
+/// the number of rows actually added.
 async fn apply_recurring_handler(
     Json(payload): Json<ApplyRecurringPayload>,
 ) -> Result<Json<u32>, AppError> {
@@ -473,6 +579,9 @@ async fn apply_recurring_handler(
     Ok(Json(added_names.len() as u32))
 }
 
+/// `GET /api/mappings`: list every stored expense-name-to-category mapping.
+/// Each [`MappingRuleJson::id`] is the mapping's lower-cased key (the expense
+/// name), which [`delete_mapping_handler`] expects back.
 async fn get_mappings_handler() -> Result<Json<Vec<MappingRuleJson>>, AppError> {
     let map = config::get_all_mappings()?;
     let mut list = Vec::new();
@@ -487,6 +596,13 @@ async fn get_mappings_handler() -> Result<Json<Vec<MappingRuleJson>>, AppError> 
     Ok(Json(list))
 }
 
+/// `POST /api/mappings`: add or overwrite the mapping for `payload.match_str`.
+///
+/// Always overwrites an existing mapping for the same (trimmed, lower-cased)
+/// key rather than returning [`Error::AlreadyExists`] (unlike
+/// [`config::add_mapping`]'s general `overwrite` parameter, this handler
+/// hardcodes `overwrite = true`). The response echoes back the stored
+/// (trimmed, lower-cased) values, not the raw payload.
 async fn add_mapping_handler(
     Json(payload): Json<MappingRuleJson>,
 ) -> Result<Json<MappingRuleJson>, AppError> {
@@ -505,11 +621,16 @@ async fn add_mapping_handler(
     }))
 }
 
+/// `DELETE /api/mappings/:id`: remove the mapping keyed by `id`.
+///
+/// Returns [`Error::NotFound`] (`404`) if no mapping exists for that key.
 async fn delete_mapping_handler(Path(id): Path<String>) -> Result<(), AppError> {
     config::remove_mapping(&id)?;
     Ok(())
 }
 
+/// `GET /api/categories`: return every manually registered primary and
+/// secondary category name.
 async fn get_categories_handler() -> Result<Json<CategoriesJson>, AppError> {
     let known = config::get_known_categories()?;
     Ok(Json(CategoriesJson {
@@ -518,6 +639,14 @@ async fn get_categories_handler() -> Result<Json<CategoriesJson>, AppError> {
     }))
 }
 
+/// `POST /api/categories/:kind`: register `payload.name` as a new category of
+/// `kind` (`"primary"` or `"secondary"`; the `kind` in the path is
+/// authoritative, `payload.kind` is not read) and return the updated category
+/// lists.
+///
+/// Returns [`Error::InvalidArgument`] (`400`) for an unknown `kind`, or
+/// [`Error::AlreadyExists`] (`409`) if the name is already registered for
+/// that kind.
 async fn add_category_handler(
     Path(kind): Path<String>,
     Json(payload): Json<AddCategoryPayload>,
@@ -530,6 +659,16 @@ async fn add_category_handler(
     }))
 }
 
+/// `DELETE /api/categories/:kind/:name`: unregister `name` from `kind`'s
+/// known-category list and strip its row from every year's primaries or
+/// secondaries summary file.
+///
+/// Refuses to delete (returns [`Error::InvalidArgument`], `400`) while the
+/// category still has a nonzero total across all years (checked with a
+/// `1e-9` tolerance for float rounding), so a category cannot be removed out
+/// from under existing expenses. This deletion of summary rows across every
+/// year is irreversible; it does not touch the underlying monthly detailed
+/// expense rows, only the cached per-year totals.
 async fn delete_category_handler(
     Path((kind, name)): Path<(String, String)>,
 ) -> Result<Json<CategoriesJson>, AppError> {
@@ -553,6 +692,10 @@ async fn delete_category_handler(
     }))
 }
 
+/// `GET /api/categories/totals?kind=`: return the cumulative
+/// `expense_in_ref_currency` total per category of `kind`, summed across every
+/// year's summary file. Backs [`delete_category_handler`]'s "still in use"
+/// check on the frontend before a user attempts a delete.
 async fn get_category_totals_handler(
     Query(q): Query<KindQuery>,
 ) -> Result<Json<std::collections::HashMap<String, f64>>, AppError> {
@@ -564,6 +707,11 @@ async fn get_category_totals_handler(
     Ok(Json(hm))
 }
 
+/// `GET /api/cashflow/income`: return `q.year`'s manually entered income
+/// values as `{ month => { category => amount } }` for the four income
+/// categories (`"Salary"`, `"Interests Bank account"`, `"Dividendi e Cedole"`,
+/// `"Other"`). A category/month with no stored row reads as `0.0` rather than
+/// being omitted.
 async fn get_income_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<std::collections::HashMap<u32, std::collections::HashMap<String, f64>>>, AppError>
@@ -586,6 +734,13 @@ async fn get_income_handler(
     Ok(Json(out))
 }
 
+/// `POST /api/cashflow/income`: set one income cell (`payload.category` for
+/// `payload.month` of `payload.year`), then recompute and save the derived
+/// `Income`/`Spending`/`Saving`/`Saving %` rows for every month of the year.
+///
+/// Returns [`Error::InvalidArgument`] (`400`) if `payload.category` is not
+/// one of the four known income categories or `payload.month` is outside
+/// 1..=12.
 async fn set_income_cell_handler(
     Json(payload): Json<SetIncomeCellPayload>,
 ) -> Result<(), AppError> {
@@ -594,6 +749,14 @@ async fn set_income_cell_handler(
     Ok(())
 }
 
+/// `GET /api/cashflow/spending`: return `q.year`'s per-category spending as
+/// `{ month => { category => amount } }`, read from the `Total`-excluded rows
+/// of the year's `primaries.parquet` summary file for each `YYYY-MM` column
+/// present.
+///
+/// Every month is present in the result even when `primaries.parquet` does
+/// not exist yet or has no column for that month; such months map to an
+/// empty category map rather than being omitted or erroring.
 async fn get_monthly_spending_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<std::collections::HashMap<u32, std::collections::HashMap<String, f64>>>, AppError>
@@ -623,6 +786,14 @@ async fn get_monthly_spending_handler(
     Ok(Json(out))
 }
 
+/// `GET /api/investments`: list `q.year`'s investment assets with their
+/// monthly quantity/price pairs.
+///
+/// [`InvestmentAssetJson::data`] is nested `{ year => { month => QtyPrice } }`
+/// even though this handler only ever fills in `q.year`, matching the
+/// frontend's multi-year-capable data shape (see
+/// `frontend/src/services/types.ts`). Missing or non-numeric monthly cells
+/// read as `0.0` for both quantity and price.
 async fn get_investments_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<Vec<InvestmentAssetJson>>, AppError> {
@@ -667,6 +838,12 @@ async fn get_investments_handler(
     Ok(Json(list))
 }
 
+/// `POST /api/investments`: add a new investment asset to `payload.year` with
+/// all monthly quantities and prices initialized to `0.0`, then save.
+///
+/// Returns [`Error::InvalidArgument`] (`400`) for an unrecognized
+/// `payload.category`, or [`Error::AlreadyExists`] (`409`) if an asset with
+/// that name already exists for the year.
 async fn add_investment_handler(
     Json(payload): Json<AddInvestmentPayload>,
 ) -> Result<Json<InvestmentAssetJson>, AppError> {
@@ -712,6 +889,15 @@ pub struct UpdateInvestmentPayload {
     pub link: Option<String>,
 }
 
+/// `PUT /api/investments/:id`: update metadata for the asset named `id` in
+/// `payload.year`. Each field is applied only when present in the payload; a
+/// present `payload.name` different from `id` renames the asset first, and
+/// the rename takes effect before any `category`/`link` update below it, so
+/// those updates target the asset under its new name.
+///
+/// Returns [`Error::NotFound`] (`404`) if `id` does not exist, or
+/// [`Error::AlreadyExists`] (`409`) if renaming to `payload.name` collides
+/// with an existing asset.
 async fn update_investment_meta_handler(
     Path(id): Path<String>,
     Json(payload): Json<UpdateInvestmentPayload>,
@@ -735,6 +921,9 @@ async fn update_investment_meta_handler(
     Ok(())
 }
 
+/// `DELETE /api/investments/:id?year=`: remove the asset named `id` from both
+/// the quantities and prices tables for `q.year`, then save. Removing a
+/// nonexistent asset is not an error: the filter simply matches zero rows.
 async fn delete_investment_handler(
     Path(id): Path<String>,
     Query(q): Query<DeleteAssetQuery>,
@@ -749,6 +938,13 @@ pub struct DeleteAssetQuery {
     pub year: i32,
 }
 
+/// `POST /api/investments/cell`: set one quantity or price cell for the asset
+/// named `payload.id` in `payload.year`/`payload.month`, saving only the
+/// affected table (`payload.field` selects `"quantity"` or `"price"`).
+///
+/// Returns [`Error::NotFound`] (`404`) if the asset does not exist,
+/// [`Error::InvalidArgument`] (`400`) for an out-of-range month or an
+/// unrecognized `payload.field`.
 async fn set_investment_cell_handler(
     Json(payload): Json<SetInvestmentCellPayload>,
 ) -> Result<(), AppError> {
@@ -757,6 +953,14 @@ async fn set_investment_cell_handler(
     Ok(())
 }
 
+/// `GET /api/liquidity`: list `q.year`'s liquidity (cash/bank) rows with
+/// their monthly balances, nested `{ year => { month => amount } }` like
+/// [`get_investments_handler`].
+///
+/// `category` and `currency` fall back to `"Bank/Broker account"` and
+/// `"EUR"` only if the row index is out of bounds for those columns; in
+/// practice this cannot happen because [`Liquidity::new`] always backfills a
+/// `currency` column of matching length before this handler runs.
 async fn get_liquidity_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<Vec<LiquidityRowJson>>, AppError> {
@@ -806,6 +1010,12 @@ pub struct AddLiquidityPayload {
     pub currency: String,
 }
 
+/// `POST /api/liquidity`: add a new liquidity row to `payload.year` with all
+/// monthly values initialized to `0.0`, then save.
+///
+/// Returns [`Error::InvalidArgument`] (`400`) for an unrecognized
+/// `payload.category`, or [`Error::AlreadyExists`] (`409`) if an asset with
+/// that name already exists for the year.
 async fn add_liquidity_handler(
     Json(payload): Json<AddLiquidityPayload>,
 ) -> Result<Json<LiquidityRowJson>, AppError> {
@@ -836,6 +1046,15 @@ pub struct UpdateLiquidityPayload {
     pub currency: Option<String>,
 }
 
+/// `PUT /api/liquidity/:id`: update metadata for the liquidity row named `id`
+/// in `payload.year`. Same field-by-field, rename-first semantics as
+/// [`update_investment_meta_handler`]. Unlike `category` and `name`,
+/// `currency` has no dedicated setter on [`Liquidity`], so this handler
+/// patches it directly with [`set_df_str_where`] and saves explicitly.
+///
+/// Returns [`Error::NotFound`] (`404`) if `id` does not exist, or
+/// [`Error::AlreadyExists`] (`409`) if renaming to `payload.name` collides
+/// with an existing row.
 async fn update_liquidity_meta_handler(
     Path(id): Path<String>,
     Json(payload): Json<UpdateLiquidityPayload>,
@@ -860,6 +1079,8 @@ async fn update_liquidity_meta_handler(
     Ok(())
 }
 
+/// `DELETE /api/liquidity/:id?year=`: remove the liquidity row named `id` for
+/// `q.year`, then save. Removing a nonexistent row is not an error.
 async fn delete_liquidity_handler(
     Path(id): Path<String>,
     Query(q): Query<DeleteAssetQuery>,
@@ -869,6 +1090,11 @@ async fn delete_liquidity_handler(
     Ok(())
 }
 
+/// `POST /api/liquidity/cell`: set the balance for `payload.id` in
+/// `payload.year`/`payload.month`, then save.
+///
+/// Returns [`Error::NotFound`] (`404`) if the row does not exist,
+/// [`Error::InvalidArgument`] (`400`) for an out-of-range month.
 async fn set_liquidity_cell_handler(
     Json(payload): Json<SetLiquidityCellPayload>,
 ) -> Result<(), AppError> {
@@ -877,6 +1103,13 @@ async fn set_liquidity_cell_handler(
     Ok(())
 }
 
+/// `GET /api/credits_debts`: list `q.year`'s credit/debt entries with their
+/// monthly outstanding amounts, nested `{ year => { month => amount } }` like
+/// [`get_investments_handler`]. A positive amount is a credit owed to the
+/// user; a negative amount is a debt owed by the user (see [`CreditsDebts`]).
+/// `currency` defaults to `"EUR"` only on an out-of-bounds index, which
+/// should not happen since [`CreditsDebts::new`] always backfills a
+/// `currency` column of matching length before this handler runs.
 async fn get_credits_debts_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<Vec<CreditDebtRowJson>>, AppError> {
@@ -920,6 +1153,11 @@ pub struct AddCreditDebtPayload {
     pub currency: String,
 }
 
+/// `POST /api/credits_debts`: add a new credit/debt entry to `payload.year`
+/// with all monthly amounts initialized to `0.0`, then save.
+///
+/// Returns [`Error::AlreadyExists`] (`409`) if an entry with that name
+/// already exists for the year.
 async fn add_credit_debt_handler(
     Json(payload): Json<AddCreditDebtPayload>,
 ) -> Result<Json<CreditDebtRowJson>, AppError> {
@@ -948,6 +1186,15 @@ pub struct UpdateCreditDebtPayload {
     pub currency: Option<String>,
 }
 
+/// `PUT /api/credits_debts/:id`: update metadata for the entry named `id` in
+/// `payload.year`. Same field-by-field, rename-first semantics as
+/// [`update_investment_meta_handler`]; like liquidity, `currency` is patched
+/// directly with [`set_df_str_where`] since [`CreditsDebts`] has no dedicated
+/// currency setter.
+///
+/// Returns [`Error::NotFound`] (`404`) if `id` does not exist, or
+/// [`Error::AlreadyExists`] (`409`) if renaming to `payload.name` collides
+/// with an existing entry.
 async fn update_credit_debt_meta_handler(
     Path(id): Path<String>,
     Json(payload): Json<UpdateCreditDebtPayload>,
@@ -969,6 +1216,8 @@ async fn update_credit_debt_meta_handler(
     Ok(())
 }
 
+/// `DELETE /api/credits_debts/:id?year=`: remove the entry named `id` for
+/// `q.year`, then save. Removing a nonexistent entry is not an error.
 async fn delete_credits_debts_handler(
     Path(id): Path<String>,
     Query(q): Query<DeleteAssetQuery>,
@@ -978,6 +1227,11 @@ async fn delete_credits_debts_handler(
     Ok(())
 }
 
+/// `POST /api/credits_debts/cell`: set the outstanding amount for
+/// `payload.id` in `payload.year`/`payload.month`, then save.
+///
+/// Returns [`Error::NotFound`] (`404`) if the entry does not exist,
+/// [`Error::InvalidArgument`] (`400`) for an out-of-range month.
 async fn set_credits_debts_cell_handler(
     Json(payload): Json<SetCreditDebtCellPayload>,
 ) -> Result<(), AppError> {
@@ -990,6 +1244,15 @@ async fn set_credits_debts_cell_handler(
 // Server Initialization
 // ======================================================================
 
+/// Build the route table and CORS layer, then bind and serve.
+///
+/// `FINGUARD_HOST`/`FINGUARD_PORT` override the default bind address
+/// (`127.0.0.1:3111`); both are read once at startup, not per request. CORS
+/// is fully permissive (any origin, method, header), which accommodates the
+/// dev frontend running on a different port (`:5173`); this has no
+/// authentication or origin restriction of its own, so exposing this port
+/// beyond a trusted local network or reverse proxy would let any origin call
+/// the API.
 #[tokio::main]
 async fn main() {
     let cors = CorsLayer::permissive();
@@ -1063,11 +1326,6 @@ async fn main() {
             post(set_credits_debts_cell_handler),
         )
         .layer(cors);
-
-    // let addr = SocketAddr::from(([127, 0, 0, 1], 3111));
-    // println!("Finguard server running on http://{}", addr);
-    // let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    // axum::serve(listener, app).await.unwrap();
 
     let host = std::env::var("FINGUARD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("FINGUARD_PORT")

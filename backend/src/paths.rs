@@ -24,6 +24,11 @@
 //!
 //! Path resolution reads the environment at call time (it is *not* cached) so
 //! that tests can override `XDG_DATA_HOME` / `HOME` between invocations.
+//!
+//! This layout and naming convention are a compatibility boundary shared with
+//! the original Python application at `/home/anferrar/Projects/finguard`:
+//! both projects read and write the same directory tree, so a change here
+//! must stay readable by (or be mirrored into) that project.
 
 use std::path::{Path, PathBuf};
 

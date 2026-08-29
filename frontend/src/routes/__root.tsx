@@ -15,6 +15,17 @@ import { AppProvider } from "@/context/AppContext";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { Header } from "@/components/finguard/Header";
 
+// App shell: the root TanStack Router route. Defines the document head
+// (title, meta, fonts, global stylesheet), the root-level 404 and error
+// boundaries, the outer HTML shell (`shellComponent`), and the provider
+// stack that wraps every route (`component`).
+//
+// Provider order in `RootComponent`, outermost first:
+//   QueryClientProvider > ThemeProvider > AppProvider > Header + Outlet.
+// `QueryClientProvider` must be outermost because `Route.useRouteContext()`
+// supplies the same `QueryClient` instance created in `router.tsx`.
+// `ThemeProvider` must be inside `QueryClientProvider` but outside
+// `AppProvider` (see frontend/THEME_SYSTEM.md).
 function NotFoundComponent() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -37,6 +48,10 @@ function NotFoundComponent() {
   );
 }
 
+// Root-level error boundary for any route render error. In addition to
+// rendering the fallback UI, it forwards the error to Lovable's injected
+// error-reporting hook if present (see lib/lovable-error-reporting.ts),
+// so a render error surfaces in the Lovable editor when running there.
 function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   console.error(error);
   const router = useRouter();
@@ -116,6 +131,10 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
 
 function RootShell({ children }: { children: ReactNode }) {
   return (
+    // `className="dark"` is applied unconditionally here; the active theme
+    // (including light themes such as arctic) is layered on top via the
+    // injected per-theme stylesheet, not by toggling this class. See
+    // frontend/THEME_SYSTEM.md.
     <html lang="en" className="dark">
       <head>
         <HeadContent />
