@@ -1,4 +1,5 @@
 # FinGuard-rs
+I could not find a personal finance apps that did everything my (Mr. Rip's) spreadsheets did, so I built my own.
 
 Personal finance management tool with a modern web dashboard for tracking investments, expenses, cashflow, liquidity, and net worth. Everything is stored locally as Parquet files with zero cloud dependencies.
 
