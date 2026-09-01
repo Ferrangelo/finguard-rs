@@ -337,10 +337,12 @@ export async function setInvestmentCell(
   field: "qty" | "price",
   value: number,
 ): Promise<void> {
+  // The backend accepts "quantity" or "price"; "qty" is only the in-memory field name.
+  const wireField = field === "qty" ? "quantity" : field;
   await apiFetch("/api/investments/cell", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, year, month, field, value }),
+    body: JSON.stringify({ id, year, month, field: wireField, value }),
   });
 }
 

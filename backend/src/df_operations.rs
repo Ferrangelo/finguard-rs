@@ -1733,3 +1733,74 @@ impl RecurringExpenses {
         write_parquet(&self.df, &self.path)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Point `XDG_DATA_HOME` (and `HOME`, as a guard) at a fresh temp
+    /// directory so `InvestmentHoldings` never touches the user's real data
+    /// under `~/.local/share/finguard/`.
+    ///
+    /// # Safety
+    ///
+    /// `std::env::set_var` is unsafe because it is not thread-safe; callers
+    /// must hold `#[serial_test::serial]` so no other test reads or writes
+    /// these variables concurrently.
+    fn with_temp_data_home() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+            std::env::set_var("HOME", dir.path());
+        }
+        dir
+    }
+
+    /// Pins the wire values `set_quantity_or_price` accepts. This is a
+    /// regression test for the bug where the frontend sent `"qty"` and the
+    /// backend rejected it with `Error::InvalidArgument`.
+    #[test]
+    #[serial_test::serial]
+    fn set_quantity_or_price_accepts_only_quantity_and_price() {
+        let _temp = with_temp_data_home();
+
+        let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        holdings
+            .add_asset("Test Asset", "Stocks/ETF", "")
+            .expect("add asset");
+
+        holdings
+            .set_quantity_or_price("Test Asset", 1, 10.0, "quantity")
+            .expect("'quantity' must be accepted");
+        let qty = holdings
+            .df
+            .column("01")
+            .expect("holdings frame has month column")
+            .f64()
+            .expect("month column is f64")
+            .get(0);
+        assert_eq!(qty, Some(10.0));
+
+        holdings
+            .set_quantity_or_price("Test Asset", 1, 25.5, "price")
+            .expect("'price' must be accepted");
+        let price = holdings
+            .df_prices
+            .column("01")
+            .expect("prices frame has month column")
+            .f64()
+            .expect("month column is f64")
+            .get(0);
+        assert_eq!(price, Some(25.5));
+
+        let qty_err = holdings
+            .set_quantity_or_price("Test Asset", 1, 1.0, "qty")
+            .expect_err("'qty' must be rejected, not silently accepted");
+        assert!(matches!(qty_err, Error::InvalidArgument(_)));
+
+        let other_err = holdings
+            .set_quantity_or_price("Test Asset", 1, 1.0, "bogus")
+            .expect_err("unrecognized field must be rejected");
+        assert!(matches!(other_err, Error::InvalidArgument(_)));
+    }
+}
