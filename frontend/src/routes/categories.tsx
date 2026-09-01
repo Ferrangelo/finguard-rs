@@ -96,12 +96,12 @@ function CategoryColumn({
           <tbody className="divide-y divide-border/40">
             {list.map((c) => {
               const t = totals[c] ?? 0;
-              // Only hides the delete button for a positive total. The
-              // backend rejects a delete whenever the total's absolute
-              // value is nonzero (see `deleteCategory` in services/api.ts),
-              // so a category whose all-time total is negative shows a
-              // delete button the backend will still reject.
-              const hasExpenses = t > 0;
+              // This condition mirrors the backend's delete guard in
+              // delete_category_handler (backend/src/main.rs). The
+              // backend rejects a delete when total.abs() >= 1e-9, using that
+              // tolerance for float rounding. The UI shows a delete button only
+              // when the backend will accept it.
+              const hasExpenses = Math.abs(t) >= 1e-9;
               return (
                 <tr key={c} className="hover:bg-muted/20">
                   <td className="px-3 py-2 font-medium">{c}</td>
