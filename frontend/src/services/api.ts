@@ -198,17 +198,14 @@ export async function deleteMapping(id: string): Promise<void> {
 }
 
 /**
- * Finds the first mapping rule whose `match` pattern is a substring of
- * `name` (case-insensitive). Used client-side to suggest a category while
- * the user types an expense name. This is a looser substring match than the
- * backend's own lookup (`config::get_mapping` in backend/src/config.rs),
- * which requires an exact match on the trimmed, lower-cased expense name,
- * so this helper can suggest a mapping the backend would not apply
- * automatically.
+ * Matches `name` (normalized with trim and lowercase) to a mapping rule's
+ * `match` field. This mirrors the backend's exact-match lookup in
+ * `config::get_mapping` (backend/src/config.rs) to ensure the UI suggests
+ * only mappings the backend will actually apply.
  */
 export function lookupMapping(name: string, rules: MappingRule[]): MappingRule | undefined {
-  const n = name.toLowerCase();
-  return rules.find((r) => n.includes(r.match));
+  const n = name.trim().toLowerCase();
+  return rules.find((r) => r.match === n);
 }
 
 /** GET /api/categories. Returns the full set of known primary and secondary expense categories. */

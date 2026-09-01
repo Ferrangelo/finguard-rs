@@ -32,9 +32,9 @@ export interface RecurringTemplate {
 
 /**
  * Frontend shape for a category-mapping rule (auto-assigns primary/secondary
- * categories to an expense whose name contains `match`). The backend's
- * `MappingRuleJson` names this field `match_str` instead of `match` because
- * `match` is a Rust keyword; `services/api.ts` translates between the two
+ * categories to an expense whose trimmed, lower-cased name exactly equals `match`).
+ * The backend's `MappingRuleJson` names this field `match_str` instead of `match`
+ * because `match` is a Rust keyword; `services/api.ts` translates between the two
  * shapes on every mapping request.
  */
 export interface MappingRule {
