@@ -1,27 +1,22 @@
-// Client-side currency conversion and formatting for display purposes only
-// (charts, totals across mixed currencies). Conversion rates are fixed
-// constants, not fetched from any live source or from the backend, so they
-// drift from real exchange rates over time. The backend's own reference-
-// currency conversion (`convert_in_ref_currency` in
-// backend/src/df_operations.rs) is a rate-1.0 stub that does not actually
-// convert, so backend-computed totals (e.g. category totals, cashflow
-// summaries) do not currency-convert; only this module's client-side totals
-// do, so a mixed-currency total shown in the UI can differ from the
-// backend's own aggregates for the same data.
+// Currency conversion and formatting for display. No conversion is applied:
+// every rate in FX is 1, so toRef returns its input unchanged. The rate table
+// and its call sites are kept as the single place to add real rates when live
+// conversion lands. The backend does not convert either
+// (convert_in_ref_currency in backend/src/df_operations.rs multiplies by 1.0),
+// so UI totals match backend aggregates over the same rows.
 import type { Currency } from "./types";
 
-// Fixed EUR-referenced conversion rates. EUR is the reference currency
-// (rate 1); every other rate is "how many EUR one unit of that currency is
-// worth", so `amount * FX[currency]` converts into EUR.
+// Identity rates. Every currency is 1, so no conversion happens. Real rates,
+// fetched or backend-supplied, go here.
 export const FX: Record<Currency, number> = {
   EUR: 1,
-  USD: 0.92,
-  GBP: 1.17,
-  CHF: 1.04,
-  JPY: 0.0061,
+  USD: 1,
+  GBP: 1,
+  CHF: 1,
+  JPY: 1,
 };
 
-/** Converts `amount` from `currency` into the EUR reference currency using the fixed `FX` rates. */
+/** Returns `amount` unchanged, because every `FX` rate is 1. Kept as the extension point for real conversion. */
 export function toRef(amount: number, currency: Currency): number {
   return amount * (FX[currency] ?? 1);
 }
