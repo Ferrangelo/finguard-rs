@@ -49,9 +49,9 @@ import { useTheme } from "@/context/ThemeContext";
 // Optimistic cell edits: `InvestmentsTab.setCell`, `LiquidityTab.setLiqCell`,
 // and `LiquidityTab.setCdCell` update local state immediately (so the input
 // reflects the typed value with no round trip latency), then call the
-// matching `api.set*Cell` function. None of the three roll the local state
-// back if that call rejects; a failed save leaves the optimistic value
-// displayed until the next full refetch corrects it.
+// matching `api.set*Cell` function. If that call rejects, each one notifies
+// the error and still calls `refresh()`, so the optimistic value is replaced
+// by server truth on the next refetch instead of staying displayed as saved.
 //
 // Sub-tabs:
 // - InvestmentsTab: per-asset monthly quantity, price, or computed value
@@ -122,8 +122,12 @@ function InvestmentsTab() {
         return { ...a, data: d };
       }),
     );
-    await api.setInvestmentCell(id, year, m, field, v);
-    notify("success", "Saved");
+    try {
+      await api.setInvestmentCell(id, year, m, field, v);
+      notify("success", "Saved");
+    } catch (err) {
+      notify("error", err instanceof Error ? err.message : "Save failed");
+    }
     refresh();
   };
 
@@ -378,8 +382,12 @@ function LiquidityTab() {
           : { ...r, data: { ...r.data, [year]: { ...(r.data[year] ?? {}), [m]: v } } },
       ),
     );
-    await api.setLiquidityCell(id, year, m, v);
-    notify("success", "Saved");
+    try {
+      await api.setLiquidityCell(id, year, m, v);
+      notify("success", "Saved");
+    } catch (err) {
+      notify("error", err instanceof Error ? err.message : "Save failed");
+    }
     refresh();
   };
   const setCdCell = async (id: string, m: number, v: number) => {
@@ -390,8 +398,12 @@ function LiquidityTab() {
           : { ...r, data: { ...r.data, [year]: { ...(r.data[year] ?? {}), [m]: v } } },
       ),
     );
-    await api.setCreditDebtCell(id, year, m, v);
-    notify("success", "Saved");
+    try {
+      await api.setCreditDebtCell(id, year, m, v);
+      notify("success", "Saved");
+    } catch (err) {
+      notify("error", err instanceof Error ? err.message : "Save failed");
+    }
     refresh();
   };
 
