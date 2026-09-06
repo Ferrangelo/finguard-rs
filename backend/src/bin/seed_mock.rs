@@ -492,17 +492,20 @@ fn main() -> Result<()> {
         "VWCE ETF",
         "Stocks/ETF",
         "https://finance.yahoo.com/quote/VWCE.DE",
+        "EUR",
     )?;
     inv.add_asset(
         "MSCI World ETF",
         "Stocks/ETF",
         "https://finance.yahoo.com/quote/IWDA.AS",
+        "EUR",
     )?;
-    inv.add_asset("Gold", "Commodities", "")?;
+    inv.add_asset("Gold", "Commodities", "", "EUR")?;
     inv.add_asset(
         "EU Bond ETF",
         "Bonds",
         "https://finance.yahoo.com/quote/AGGH.MI",
+        "EUR",
     )?;
 
     // Monthly [Jan..Dec] quantity and price per asset.

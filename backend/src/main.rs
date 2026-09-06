@@ -108,6 +108,12 @@ pub struct InvestmentAssetJson {
     pub name: String,
     pub category: String,
     pub link: Option<String>,
+    /// Defaults to the empty string for a client that predates this field, the
+    /// same tolerance `fx_rate`/`rate_date` got in the earlier currency step.
+    /// An empty string is a caller bug, not a valid currency; `InvestmentHoldings::new`
+    /// itself never produces one, since it backfills from settings.
+    #[serde(default)]
+    pub currency: String,
     pub data: std::collections::HashMap<i32, std::collections::HashMap<u32, QtyPrice>>,
 }
 
@@ -945,6 +951,7 @@ async fn get_investments_handler(
     let assets = str_col_to_vec(&inv.df, "asset_name")?;
     let categories = str_col_to_vec(&inv.df, "category")?;
     let links = str_col_to_vec(&inv.df, "link")?;
+    let currencies = str_col_to_vec(&inv.df, "currency")?;
 
     let mut list = Vec::new();
     for (i, name) in assets.iter().enumerate() {
@@ -976,6 +983,7 @@ async fn get_investments_handler(
                 .cloned()
                 .unwrap_or_else(|| "Stocks/ETF".to_string()),
             link: links.get(i).filter(|s| !s.is_empty()).cloned(),
+            currency: currencies.get(i).cloned().unwrap_or_default(),
             data: data_map,
         });
     }
@@ -985,6 +993,10 @@ async fn get_investments_handler(
 /// `POST /api/investments`: add a new investment asset to `payload.year` with
 /// all monthly quantities and prices initialized to `0.0`, then save.
 ///
+/// An empty or absent `payload.currency` (the current frontend does not send
+/// one yet) falls back to the configured reference currency, the same
+/// backfill [`InvestmentHoldings::new`] applies to a pre-existing file.
+///
 /// Returns [`Error::InvalidArgument`] (`400`) for an unrecognized
 /// `payload.category`, or [`Error::AlreadyExists`] (`409`) if an asset with
 /// that name already exists for the year.
@@ -993,7 +1005,12 @@ async fn add_investment_handler(
 ) -> Result<Json<InvestmentAssetJson>, AppError> {
     let mut inv = InvestmentHoldings::new(payload.year)?;
     let link_str = payload.link.as_deref().unwrap_or("");
-    inv.add_asset(&payload.name, &payload.category, link_str)?;
+    let currency = if payload.currency.is_empty() {
+        config::get_currency_settings()?.reference_currency
+    } else {
+        payload.currency.clone()
+    };
+    inv.add_asset(&payload.name, &payload.category, link_str, &currency)?;
 
     let mut data_map = std::collections::HashMap::new();
     let mut m_map = std::collections::HashMap::new();
@@ -1013,6 +1030,7 @@ async fn add_investment_handler(
         name: payload.name,
         category: payload.category,
         link: payload.link,
+        currency,
         data: data_map,
     }))
 }
@@ -1023,6 +1041,11 @@ pub struct AddInvestmentPayload {
     pub name: String,
     pub category: String,
     pub link: Option<String>,
+    /// Falls back to the reference currency in the handler when empty; see
+    /// [`add_investment_handler`]. Defaulted so a client that predates this
+    /// field still deserializes.
+    #[serde(default)]
+    pub currency: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1031,13 +1054,19 @@ pub struct UpdateInvestmentPayload {
     pub name: Option<String>,
     pub category: Option<String>,
     pub link: Option<String>,
+    pub currency: Option<String>,
 }
 
 /// `PUT /api/investments/:id`: update metadata for the asset named `id` in
 /// `payload.year`. Each field is applied only when present in the payload; a
 /// present `payload.name` different from `id` renames the asset first, and
-/// the rename takes effect before any `category`/`link` update below it, so
-/// those updates target the asset under its new name.
+/// the rename takes effect before any `category`/`link`/`currency` update
+/// below it, so those updates target the asset under its new name.
+///
+/// Unlike `category` and `link`, `currency` has no dedicated setter on
+/// [`InvestmentHoldings`] (it lives on `df` only), so this handler patches it
+/// directly with [`set_df_str_where`] and saves, matching
+/// [`update_liquidity_meta_handler`].
 ///
 /// Returns [`Error::NotFound`] (`404`) if `id` does not exist, or
 /// [`Error::AlreadyExists`] (`409`) if renaming to `payload.name` collides
@@ -1058,6 +1087,10 @@ async fn update_investment_meta_handler(
 
     if let Some(cat) = &payload.category {
         inv.set_category(&final_name, cat)?;
+    }
+    if let Some(cur) = &payload.currency {
+        set_df_str_where(&mut inv.df, "asset_name", &final_name, "currency", cur)?;
+        inv.save_df()?;
     }
     if let Some(lnk) = &payload.link {
         inv.set_link(&final_name, lnk)?;
@@ -1669,5 +1702,40 @@ mod tests {
         let reloaded = DetailedExpenses::new(2026, 9).expect("reload detailed expenses");
         let fx_rate = column_f64(&reloaded.expense_df, "fx_rate")[0];
         assert_eq!(fx_rate, resolved.rate);
+    }
+
+    /// `PUT /api/investments/:id` must update the stored currency when the
+    /// payload includes one. `InvestmentHoldings` has no dedicated currency
+    /// setter, so this exercises the same direct-patch path as
+    /// [`update_liquidity_meta_handler`].
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn update_investment_meta_handler_updates_currency() {
+        let _temp = with_temp_env_offline();
+
+        let mut inv = InvestmentHoldings::new(2026).expect("load holdings");
+        inv.add_asset("Test Asset", "Stocks/ETF", "", "EUR")
+            .expect("add asset");
+
+        update_investment_meta_handler(
+            Path("Test Asset".to_string()),
+            Json(UpdateInvestmentPayload {
+                year: 2026,
+                name: None,
+                category: None,
+                link: None,
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        // `AppError` does not implement `Debug` (see `http_error.rs`), so
+        // `.expect` cannot be used directly; unwrap through its `Display`.
+        .unwrap_or_else(|AppError(err)| panic!("update succeeds: {err}"));
+
+        let reloaded = InvestmentHoldings::new(2026).expect("reload holdings");
+        assert_eq!(
+            str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
+            vec!["USD".to_string()]
+        );
     }
 }
