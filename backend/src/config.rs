@@ -7,6 +7,8 @@
 //! - `category_mappings.json`: object keyed by lower-cased expense name →
 //!   `{ "primary_category": str, "secondary_category": str }`.
 //! - `known_categories.json`: `{ "primary": [...], "secondary": [...] }`.
+//! - `currency.json`: `{ "reference_currency": str, "current_month_rate_mode":
+//!   str }`, read by [`crate::fx`] for currency-conversion settings.
 //!
 //! Both files are written with `serde_json`'s pretty printer (4-space indent),
 //! matching Python's `json.dump(..., indent=4, ensure_ascii=False)`. Mapping
@@ -26,6 +28,7 @@ use crate::error::{Error, Result};
 const CONFIG_DIR_NAME: &str = "finguard";
 const CONFIG_FILE_NAME: &str = "category_mappings.json";
 const CATEGORIES_FILE_NAME: &str = "known_categories.json";
+const CURRENCY_FILE_NAME: &str = "currency.json";
 
 /// A category pair associated with an expense name.
 ///
@@ -212,6 +215,84 @@ fn validate_kind(kind: &str) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------
+// Currency settings
+// ------------------------------------------------------------------
+
+/// Which rate the in-progress month uses when net worth is aggregated.
+///
+/// `PreviousMonthEnd` freezes the current month at the last fully published
+/// rate (the prior month's close), so a running total does not shift as the
+/// day's rate updates. `Live` always uses the newest published rate instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentMonthRateMode {
+    #[default]
+    PreviousMonthEnd,
+    Live,
+}
+
+fn default_reference_currency() -> String {
+    "EUR".to_string()
+}
+
+/// User-configurable currency settings, persisted at `currency.json`.
+///
+/// The serde field names match the on-disk JSON keys exactly. Both fields
+/// default (to `"EUR"` and [`CurrentMonthRateMode::PreviousMonthEnd`]) when
+/// the file, or either field in it, is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrencySettings {
+    /// The currency every amount is converted into for display and totals.
+    #[serde(default = "default_reference_currency")]
+    pub reference_currency: String,
+    /// How the in-progress month's rate is chosen; see
+    /// [`CurrentMonthRateMode`].
+    #[serde(default)]
+    pub current_month_rate_mode: CurrentMonthRateMode,
+}
+
+impl Default for CurrencySettings {
+    fn default() -> Self {
+        Self {
+            reference_currency: default_reference_currency(),
+            current_month_rate_mode: CurrentMonthRateMode::default(),
+        }
+    }
+}
+
+/// Return the full path to the currency-settings JSON file.
+fn get_currency_path() -> Result<PathBuf> {
+    Ok(get_config_dir()?.join(CURRENCY_FILE_NAME))
+}
+
+/// Load currency settings from disk. Returns the default settings if the file
+/// does not exist yet.
+fn load_currency_settings() -> Result<CurrencySettings> {
+    let path = get_currency_path()?;
+    if !path.exists() {
+        return Ok(CurrencySettings::default());
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    Ok(serde_json::from_str(&contents)?)
+}
+
+/// Persist currency settings to disk (pretty-printed).
+fn save_currency_settings(data: &CurrencySettings) -> Result<()> {
+    write_json(&get_currency_path()?, data)
+}
+
+/// Return the current currency settings, or the defaults if none were ever
+/// saved.
+pub fn get_currency_settings() -> Result<CurrencySettings> {
+    load_currency_settings()
+}
+
+/// Replace the stored currency settings.
+pub fn set_currency_settings(settings: &CurrencySettings) -> Result<()> {
+    save_currency_settings(settings)
+}
+
 /// Return the appropriate category list for `kind`. Assumes `kind` is valid.
 fn list_for_kind<'a>(data: &'a mut KnownCategories, kind: &str) -> &'a mut Vec<String> {
     if kind == "primary" {
@@ -269,4 +350,67 @@ pub fn remove_known_category(name: &str, kind: &str) -> Result<()> {
     };
     list.remove(pos);
     save_known_categories(&data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Points `XDG_CONFIG_HOME` and `HOME` at a fresh temp dir, matching the
+    /// `with_temp_data_home` pattern used for the data-home tests elsewhere in
+    /// the crate.
+    fn with_temp_config_home() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            std::env::set_var("HOME", dir.path());
+        }
+        dir
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn currency_settings_default_when_file_absent() {
+        let _temp = with_temp_config_home();
+
+        let settings = get_currency_settings().expect("default settings");
+        assert_eq!(settings.reference_currency, "EUR");
+        assert_eq!(
+            settings.current_month_rate_mode,
+            CurrentMonthRateMode::PreviousMonthEnd
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn currency_settings_round_trip() {
+        let _temp = with_temp_config_home();
+
+        let saved = CurrencySettings {
+            reference_currency: "USD".to_string(),
+            current_month_rate_mode: CurrentMonthRateMode::Live,
+        };
+        set_currency_settings(&saved).expect("save settings");
+
+        let loaded = get_currency_settings().expect("load settings");
+        assert_eq!(loaded, saved);
+    }
+
+    /// A saved file missing a field (e.g. written by an older version) must
+    /// still load, falling back to that field's default.
+    #[test]
+    #[serial_test::serial]
+    fn currency_settings_defaults_missing_field() {
+        let _temp = with_temp_config_home();
+
+        let path = get_currency_path().expect("currency path");
+        std::fs::write(&path, r#"{"reference_currency": "GBP"}"#).expect("write partial file");
+
+        let loaded = get_currency_settings().expect("load settings");
+        assert_eq!(loaded.reference_currency, "GBP");
+        assert_eq!(
+            loaded.current_month_rate_mode,
+            CurrentMonthRateMode::PreviousMonthEnd
+        );
+    }
 }
