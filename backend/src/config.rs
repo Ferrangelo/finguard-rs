@@ -81,7 +81,7 @@ fn get_config_path() -> Result<PathBuf> {
 /// a [`PrettyFormatter`] with a 4-space indent. serde_json never escapes
 /// non-ASCII characters (it emits UTF-8 directly), matching `ensure_ascii=False`.
 /// Like Python's `json.dump`, no trailing newline is written.
-fn write_json<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
     let mut buf = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);

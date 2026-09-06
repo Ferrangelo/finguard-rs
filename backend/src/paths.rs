@@ -37,6 +37,7 @@ use crate::error::{Error, Result};
 const APP_DIR_NAME: &str = "finguard";
 const DBS_DIR_NAME: &str = "dbs";
 const PARQUET_SUFFIX: &str = "_detailed_expenses.parquet";
+const FX_RATES_FILE_NAME: &str = "fx_rates.json";
 
 /// Filename for the per-year primary-category summary.
 pub const PRIMARIES_FILENAME: &str = "primaries.parquet";
@@ -72,6 +73,16 @@ pub fn get_dbs_root() -> Result<PathBuf> {
     let dbs_root = get_data_home()?.join(APP_DIR_NAME).join(DBS_DIR_NAME);
     std::fs::create_dir_all(&dbs_root)?;
     Ok(dbs_root)
+}
+
+/// Return `<XDG_DATA_HOME>/finguard/fx_rates.json`, creating the parent
+/// directory if necessary. This is the cached FX rate table read and written
+/// by [`crate::fx`], sitting next to `dbs/` rather than inside it because it
+/// is not a Parquet table.
+pub fn get_fx_rates_path() -> Result<PathBuf> {
+    let app_dir = get_data_home()?.join(APP_DIR_NAME);
+    std::fs::create_dir_all(&app_dir)?;
+    Ok(app_dir.join(FX_RATES_FILE_NAME))
 }
 
 /// Return `<dbs_root>/<year>/`, creating it if necessary.

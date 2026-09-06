@@ -32,6 +32,7 @@ impl IntoResponse for AppError {
             Error::Io(_) | Error::Json(_) | Error::Polars(_) | Error::NoHomeDir => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            Error::Network(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
 
         let body = ErrorBody {

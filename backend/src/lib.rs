@@ -14,6 +14,8 @@
 //! - [`plots`]: derives chart-ready series (pie/bar/line data, no styling)
 //!   from the dataframes in [`df_operations`].
 //! - [`expr`]: a small safe arithmetic evaluator for amount input fields.
+//! - [`fx`]: currency settings, the cached Frankfurter (ECB) exchange-rate
+//!   table, and the rate resolvers used to convert amounts between currencies.
 //! - [`error`]: the crate-wide [`Error`]/[`Result`] pair used by every module.
 //!
 //! Several parts of this crate deliberately reproduce behavior from the
@@ -28,6 +30,7 @@ pub mod config;
 pub mod df_operations;
 pub mod error;
 pub mod expr;
+pub mod fx;
 pub mod paths;
 pub mod plots;
 

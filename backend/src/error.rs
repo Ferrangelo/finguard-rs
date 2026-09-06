@@ -45,4 +45,9 @@ pub enum Error {
     /// The user's home directory could not be determined.
     #[error("could not determine home directory")]
     NoHomeDir,
+
+    /// A network request to an external service failed, or its response was
+    /// not in the shape the caller expected.
+    #[error("{0}")]
+    Network(String),
 }
