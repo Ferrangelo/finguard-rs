@@ -1,8 +1,7 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
   Link,
-  createRootRouteWithContext,
+  createRootRoute,
   useRouter,
   HeadContent,
   Scripts,
@@ -21,11 +20,9 @@ import { Header } from "@/components/finguard/Header";
 // stack that wraps every route (`component`).
 //
 // Provider order in `RootComponent`, outermost first:
-//   QueryClientProvider > ThemeProvider > AppProvider > Header + Outlet.
-// `QueryClientProvider` must be outermost because `Route.useRouteContext()`
-// supplies the same `QueryClient` instance created in `router.tsx`.
-// `ThemeProvider` must be inside `QueryClientProvider` but outside
-// `AppProvider` (see frontend/THEME_SYSTEM.md).
+//   ThemeProvider > AppProvider > Header + Outlet.
+// `ThemeProvider` must be outside `AppProvider` (see
+// frontend/THEME_SYSTEM.md).
 function NotFoundComponent() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -90,7 +87,7 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   );
 }
 
-export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
+export const Route = createRootRoute({
   head: () => ({
     meta: [
       { charSet: "utf-8" },
@@ -148,20 +145,16 @@ function RootShell({ children }: { children: ReactNode }) {
 }
 
 function RootComponent() {
-  const { queryClient } = Route.useRouteContext();
-
   return (
-    <QueryClientProvider client={queryClient}>
-      <ThemeProvider>
-        <AppProvider>
-          <div className="min-h-screen">
-            <Header />
-            <main className="mx-auto max-w-[1600px] px-4 py-6 md:px-6">
-              <Outlet />
-            </main>
-          </div>
-        </AppProvider>
-      </ThemeProvider>
-    </QueryClientProvider>
+    <ThemeProvider>
+      <AppProvider>
+        <div className="min-h-screen">
+          <Header />
+          <main className="mx-auto max-w-[1600px] px-4 py-6 md:px-6">
+            <Outlet />
+          </main>
+        </div>
+      </AppProvider>
+    </ThemeProvider>
   );
 }
