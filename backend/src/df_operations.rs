@@ -326,6 +326,17 @@ fn str_col_to_vec(df: &DataFrame, name: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Read a `Date` column into an owned `Vec<NaiveDate>`.
+fn date_col_to_vec(df: &DataFrame, name: &str) -> Result<Vec<NaiveDate>> {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let days = df.column(name)?.cast(&DataType::Int32)?;
+    Ok(days
+        .i32()?
+        .iter()
+        .map(|o| epoch + chrono::Duration::days(o.unwrap_or(0) as i64))
+        .collect())
+}
+
 /// Build a `Date`-typed column from a list of [`NaiveDate`] values.
 fn date_series(name: &str, dates: &[NaiveDate]) -> Series {
     let days: Vec<i32> = dates
@@ -346,6 +357,11 @@ fn date_series(name: &str, dates: &[NaiveDate]) -> Series {
 // ======================================================================
 
 /// Build an empty detailed-expenses dataframe with the canonical schema.
+///
+/// `fx_rate` and `rate_date` record how `expense_in_ref_currency` was
+/// derived from `expense_amount`: `fx_rate` is the multiplier applied, and
+/// `rate_date` is the date that multiplier was published for (see
+/// [`crate::fx::rate_on`]).
 fn empty_expenses_df() -> DataFrame {
     DataFrame::empty_with_schema(&Schema::from_iter([
         Field::new("expense_name".into(), DataType::String),
@@ -353,6 +369,8 @@ fn empty_expenses_df() -> DataFrame {
         Field::new("expense_amount".into(), DataType::Float64),
         Field::new("currency".into(), DataType::String),
         Field::new("expense_in_ref_currency".into(), DataType::Float64),
+        Field::new("fx_rate".into(), DataType::Float64),
+        Field::new("rate_date".into(), DataType::Date),
         Field::new("primary_category".into(), DataType::String),
         Field::new("secondary_category".into(), DataType::String),
     ]))
@@ -398,6 +416,23 @@ impl DetailedExpenses {
                 df = df
                     .lazy()
                     .with_column(col("expense_date").cast(DataType::Date))
+                    .collect()?;
+            }
+            // Migrate a file written before fx tracking existed: backfill
+            // fx_rate to 1.0 and rate_date to the row's own expense_date.
+            // Every pre-migration row is already in the reference currency
+            // (all existing data is euro), so this backfills provenance only
+            // and never recomputes expense_in_ref_currency.
+            if !has_column(&df, "fx_rate") {
+                df = df
+                    .lazy()
+                    .with_column(lit(1.0_f64).alias("fx_rate"))
+                    .collect()?;
+            }
+            if !has_column(&df, "rate_date") {
+                df = df
+                    .lazy()
+                    .with_column(col("expense_date").alias("rate_date"))
                     .collect()?;
             }
             normalize_currency_column(df)?
@@ -1954,6 +1989,59 @@ mod tests {
         assert_eq!(
             str_col_to_vec(&reloaded.expense_df, "currency").expect("read currency column"),
             vec!["EUR", "USD"]
+        );
+    }
+
+    /// Loading a parquet file written before fx tracking existed (no
+    /// `fx_rate`/`rate_date` columns) must backfill `fx_rate` to `1.0` and
+    /// `rate_date` to each row's own `expense_date`, without touching
+    /// `expense_in_ref_currency` (every pre-migration row is already euro).
+    #[test]
+    #[serial_test::serial]
+    fn load_migrates_a_file_missing_fx_columns() {
+        let _temp = with_temp_data_home();
+        let path = get_monthly_parquet_path(2026, 9).expect("monthly parquet path");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create year dir");
+
+        // Build a pre-migration file by hand: the canonical schema minus
+        // `fx_rate` and `rate_date`.
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let pre_migration = DataFrame::new_infer_height(vec![
+            Column::new("expense_name".into(), &["Old Rent"]),
+            date_series("expense_date", &[date]).into(),
+            Column::new("expense_amount".into(), &[1_200.0]),
+            Column::new("currency".into(), &["EUR"]),
+            Column::new("expense_in_ref_currency".into(), &[1_200.0]),
+            Column::new("primary_category".into(), &["Housing"]),
+            Column::new("secondary_category".into(), &["Rent"]),
+        ])
+        .expect("build pre-migration frame");
+        write_parquet(&pre_migration, &path).expect("write pre-migration file");
+
+        let de = DetailedExpenses::new(2026, 9).expect("load and migrate");
+
+        assert_eq!(
+            de.expense_df
+                .column("fx_rate")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0),
+            Some(1.0)
+        );
+        assert_eq!(
+            date_col_to_vec(&de.expense_df, "rate_date").unwrap(),
+            vec![date]
+        );
+        // The pre-existing amount must survive the migration unchanged.
+        assert_eq!(
+            de.expense_df
+                .column("expense_in_ref_currency")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0),
+            Some(1_200.0)
         );
     }
 }
