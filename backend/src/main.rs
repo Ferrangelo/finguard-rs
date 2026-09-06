@@ -164,6 +164,14 @@ pub struct ApplyRecurringPayload {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct RefreshRatesPayload {
+    pub year: i32,
+    /// Refreshes every month of `year` when omitted, matching
+    /// [`GetExpensesQuery::month`]'s convention.
+    pub month: Option<u32>,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct AddRecurringPayload {
     pub year: i32,
     pub name: String,
@@ -666,6 +674,53 @@ async fn apply_recurring_handler(
 
     let added_names = rec.insert_resolved(&mut de, &resolved)?;
     Ok(Json(added_names.len() as u32))
+}
+
+/// `POST /api/expenses/refresh-rates`: re-resolve the FX rate for every row
+/// in `payload.year` (or just `payload.month`, if given) whose stored
+/// `rate_date` predates its `expense_date`, and rewrite only the ones whose
+/// re-resolved `rate_date` is now strictly later than what is stored.
+/// Returns the number of rows actually changed.
+///
+/// Safe to call repeatedly: a row already resolved on its own date (which
+/// includes every weekend expense, since the ECB never later republishes an
+/// earlier date) is never touched again, so a second call after one that
+/// changed nothing new also changes nothing.
+async fn refresh_expense_rates_handler(
+    Json(payload): Json<RefreshRatesPayload>,
+) -> Result<Json<u32>, AppError> {
+    let months: Vec<u32> = match payload.month {
+        Some(m) => vec![m],
+        None => (1..=12).collect(),
+    };
+
+    let mut total_updated = 0u32;
+    for m in months {
+        let mut de = match DetailedExpenses::new(payload.year, m) {
+            Ok(de) => de,
+            Err(_) => continue,
+        };
+
+        let candidates = de.stale_rate_candidates()?;
+        if candidates.is_empty() {
+            continue;
+        }
+
+        let mut updates = Vec::with_capacity(candidates.len());
+        for c in candidates {
+            let resolved = fx::rate_on(c.expense_date, &c.currency).await?;
+            let Some(new_rate_date) = resolved.rate_date else {
+                continue;
+            };
+            if new_rate_date > c.stored_rate_date {
+                updates.push((c.row_index, resolved.rate, new_rate_date));
+            }
+        }
+
+        total_updated += de.apply_refreshed_rates(&updates)?;
+    }
+
+    Ok(Json(total_updated))
 }
 
 /// `GET /api/mappings`: list every stored expense-name-to-category mapping.
@@ -1362,6 +1417,10 @@ async fn main() {
             get(get_expenses_handler).post(upsert_expense_handler),
         )
         .route("/api/expenses/:id", delete(delete_expense_handler))
+        .route(
+            "/api/expenses/refresh-rates",
+            post(refresh_expense_rates_handler),
+        )
         // Recurring Templates
         .route(
             "/api/recurring",
@@ -1429,4 +1488,186 @@ async fn main() {
     println!("Finguard server running on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Points `XDG_DATA_HOME`, `XDG_CONFIG_HOME` and `HOME` at a fresh temp
+    /// dir and forces offline FX mode, so tests never touch real user data or
+    /// make a network call. Matches `fx.rs`'s own `with_temp_env_offline`.
+    fn with_temp_env_offline() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var("FINGUARD_FX_OFFLINE", "1");
+        }
+        dir
+    }
+
+    /// Write the FX rate cache directly at its on-disk path (see the module
+    /// docs on `finguard_rs_backend::fx`), since the cache's `RateCache` type
+    /// and (de)serialization helpers are private to that module and this is
+    /// the binary crate, not the library crate, so it cannot reach them even
+    /// via `pub(crate)`.
+    fn seed_fx_cache(dates: &[(&str, &[(&str, f64)])]) {
+        let mut days = Vec::new();
+        for (date, pairs) in dates {
+            let entries: Vec<String> = pairs
+                .iter()
+                .map(|(currency, rate)| format!("\"{currency}\":{rate}"))
+                .collect();
+            days.push(format!("\"{date}\":{{{}}}", entries.join(",")));
+        }
+        let body = format!("{{\"base\":\"EUR\",\"rates\":{{{}}}}}", days.join(","));
+        let path = finguard_rs_backend::paths::get_fx_rates_path().expect("fx rates path");
+        std::fs::write(path, body).expect("seed fx cache");
+    }
+
+    /// Registering both `/api/expenses/:id` (a dynamic segment) and
+    /// `/api/expenses/refresh-rates` (a literal segment) at the same depth
+    /// must not panic when the router is built: axum's router (via matchit)
+    /// resolves a literal match ahead of a dynamic parameter, so the two
+    /// coexist. This is a regression guard for that route table shape.
+    #[test]
+    fn expenses_id_and_refresh_rates_routes_coexist() {
+        let _app: Router = Router::new()
+            .route("/api/expenses/:id", delete(delete_expense_handler))
+            .route(
+                "/api/expenses/refresh-rates",
+                post(refresh_expense_rates_handler),
+            );
+    }
+
+    /// A row entered before its real date's rate was published (e.g. a
+    /// same-day expense entered when only an older cached rate existed)
+    /// resolves at entry time to that older date. Once the real date's rate
+    /// is later cached, refreshing must pick it up and rewrite the row.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn refresh_updates_a_superseded_future_dated_row() {
+        let _temp = with_temp_env_offline();
+        // At "entry time" only 2026-09-01 is cached; 2026-09-04 (the
+        // expense's real date) falls back to it.
+        seed_fx_cache(&[("2026-09-01", &[("USD", 1.10)])]);
+
+        let entry_date = chrono::NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let entry_resolved = fx::rate_on(entry_date, "USD")
+            .await
+            .expect("resolve at entry time");
+        let entry_rate_date = entry_resolved
+            .rate_date
+            .expect("USD always has a rate date");
+        assert_eq!(
+            entry_rate_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            "must fall back to the only cached date"
+        );
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row(
+            "Future Purchase",
+            4,
+            100.0,
+            Some("Housing"),
+            "USD",
+            Some("Rent"),
+            entry_resolved.rate,
+            entry_rate_date,
+        )
+        .expect("add row with the entry-time rate");
+
+        // The real date's rate is later published.
+        seed_fx_cache(&[
+            ("2026-09-01", &[("USD", 1.10)]),
+            ("2026-09-04", &[("USD", 1.20)]),
+        ]);
+
+        let updated = refresh_expense_rates_handler(Json(RefreshRatesPayload {
+            year: 2026,
+            month: Some(9),
+        }))
+        .await
+        // `AppError` does not implement `Debug` (see `http_error.rs`), so
+        // `.expect` cannot be used directly; unwrap through its `Display`.
+        .unwrap_or_else(|AppError(err)| panic!("refresh succeeds: {err}"));
+        assert_eq!(updated.0, 1, "the superseded row must be rewritten");
+
+        let reloaded = DetailedExpenses::new(2026, 9).expect("reload detailed expenses");
+        assert_eq!(
+            reloaded
+                .expense_df
+                .column("rate_date")
+                .unwrap()
+                .cast(&polars::prelude::DataType::Int32)
+                .unwrap()
+                .i32()
+                .unwrap()
+                .get(0),
+            Some(
+                (chrono::NaiveDate::from_ymd_opt(2026, 9, 4).unwrap()
+                    - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                .num_days() as i32
+            ),
+            "rate_date must move to the newly published date"
+        );
+        let new_rate = column_f64(&reloaded.expense_df, "fx_rate")[0];
+        assert_eq!(new_rate, 1.0 / 1.20);
+        let ref_amount = column_f64(&reloaded.expense_df, "expense_in_ref_currency")[0];
+        assert_eq!(ref_amount, 100.0 * new_rate);
+    }
+
+    /// A weekend expense resolves to the nearest earlier (Friday) rate, which
+    /// is final: the ECB never later republishes an earlier date. Refreshing
+    /// must leave it untouched, and a second refresh must change nothing
+    /// either, proving the endpoint is idempotent.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn refresh_leaves_a_weekend_row_alone_on_a_second_run() {
+        let _temp = with_temp_env_offline();
+        // Only Friday 2026-09-04 is cached; Saturday 2026-09-05 falls back to it.
+        seed_fx_cache(&[("2026-09-04", &[("USD", 1.15)])]);
+
+        let expense_date = chrono::NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+        let resolved = fx::rate_on(expense_date, "USD")
+            .await
+            .expect("resolve for the weekend expense");
+        let rate_date = resolved.rate_date.expect("USD always has a rate date");
+        assert_eq!(
+            rate_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 4).unwrap()
+        );
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row(
+            "Weekend Purchase",
+            5,
+            50.0,
+            Some("Leisure"),
+            "USD",
+            Some("Out"),
+            resolved.rate,
+            rate_date,
+        )
+        .expect("add the weekend row");
+
+        for _ in 0..2 {
+            let updated = refresh_expense_rates_handler(Json(RefreshRatesPayload {
+                year: 2026,
+                month: Some(9),
+            }))
+            .await
+            // `AppError` does not implement `Debug` (see `http_error.rs`), so
+            // `.expect` cannot be used directly; unwrap through its `Display`.
+            .unwrap_or_else(|AppError(err)| panic!("refresh succeeds: {err}"));
+            assert_eq!(updated.0, 0, "a Friday-resolved weekend row is never stale");
+        }
+
+        let reloaded = DetailedExpenses::new(2026, 9).expect("reload detailed expenses");
+        let fx_rate = column_f64(&reloaded.expense_df, "fx_rate")[0];
+        assert_eq!(fx_rate, resolved.rate);
+    }
 }

@@ -376,6 +376,22 @@ fn empty_expenses_df() -> DataFrame {
     ]))
 }
 
+/// A row whose stored FX rate might be superseded by a newer published rate:
+/// its expense date, currency, and the `rate_date` currently on file.
+///
+/// Returned by [`DetailedExpenses::stale_rate_candidates`].
+#[derive(Debug, Clone)]
+pub struct StaleRateCandidate {
+    /// Position of this row in `expense_df`, for [`DetailedExpenses::apply_refreshed_rates`].
+    pub row_index: u32,
+    /// The row's `expense_date`.
+    pub expense_date: NaiveDate,
+    /// The row's `currency`.
+    pub currency: String,
+    /// The `rate_date` currently stored for this row.
+    pub stored_rate_date: NaiveDate,
+}
+
 /// Manage a monthly detailed-expenses parquet file.
 ///
 /// The file lives at
@@ -722,6 +738,81 @@ impl DetailedExpenses {
         write_parquet(&self.expense_df, &self.expense_df_path)?;
         self.update_all_summary_tables()?;
         Ok(())
+    }
+
+    /// Return every row whose stored `rate_date` predates its `expense_date`,
+    /// the necessary (but not sufficient) condition for a stale rate.
+    ///
+    /// Resolving whether a candidate is *actually* stale needs a fresh async
+    /// [`crate::fx::rate_on`] call, which this synchronous dataframe layer
+    /// cannot make. So the caller must re-resolve each candidate's rate and
+    /// only pass it to [`Self::apply_refreshed_rates`] when the newly
+    /// resolved `rate_date` is strictly later than `stored_rate_date`. A row
+    /// whose rate already matches its own `expense_date` (including every
+    /// weekend expense, since the ECB never later republishes an earlier
+    /// date) is excluded here and can never reappear, which is what keeps a
+    /// refresh idempotent.
+    pub fn stale_rate_candidates(&self) -> Result<Vec<StaleRateCandidate>> {
+        let dates = date_col_to_vec(&self.expense_df, "expense_date")?;
+        let rate_dates = date_col_to_vec(&self.expense_df, "rate_date")?;
+        let currencies = str_col_to_vec(&self.expense_df, "currency")?;
+
+        let mut out = Vec::new();
+        for i in 0..dates.len() {
+            if rate_dates[i] < dates[i] {
+                out.push(StaleRateCandidate {
+                    row_index: i as u32,
+                    expense_date: dates[i],
+                    currency: currencies[i].clone(),
+                    stored_rate_date: rate_dates[i],
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply already re-resolved `(row_index, fx_rate, rate_date)` triples,
+    /// recomputing each row's `expense_in_ref_currency` from its existing
+    /// `expense_amount`, then save and recompute the summary tables.
+    ///
+    /// Callers must have already confirmed each new `rate_date` is strictly
+    /// later than the row's previous one (see [`Self::stale_rate_candidates`]);
+    /// this method does not re-check that itself.
+    pub fn apply_refreshed_rates(&mut self, updates: &[(u32, f64, NaiveDate)]) -> Result<u32> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let mut df = self.expense_df.clone().lazy().with_row_index("_idx", None);
+        for &(row_index, fx_rate, rate_date) in updates {
+            let pred = col("_idx").eq(lit(row_index));
+            let rate_days = (rate_date - epoch).num_days() as i32;
+            df = df
+                .with_column(
+                    when(pred.clone())
+                        .then(col("expense_amount") * lit(fx_rate))
+                        .otherwise(col("expense_in_ref_currency"))
+                        .alias("expense_in_ref_currency"),
+                )
+                .with_column(
+                    when(pred.clone())
+                        .then(lit(fx_rate))
+                        .otherwise(col("fx_rate"))
+                        .alias("fx_rate"),
+                )
+                .with_column(
+                    when(pred.clone())
+                        .then(lit(rate_days).cast(DataType::Date))
+                        .otherwise(col("rate_date"))
+                        .alias("rate_date"),
+                );
+        }
+
+        self.expense_df = df.drop(cols(["_idx"])).collect()?;
+        write_parquet(&self.expense_df, &self.expense_df_path)?;
+        self.update_all_summary_tables()?;
+        Ok(updates.len() as u32)
     }
 
     /// Return a filtered copy of the expense dataframe.
@@ -2221,6 +2312,96 @@ mod tests {
                 .unwrap()
                 .get(0),
             Some(1_200.0)
+        );
+    }
+
+    /// A row whose `rate_date` already equals its `expense_date` is never a
+    /// stale-rate candidate (the common case, and the terminal state every
+    /// weekend expense reaches).
+    #[test]
+    #[serial_test::serial]
+    fn stale_rate_candidates_excludes_rows_already_on_their_own_date() {
+        let _temp = with_temp_data_home();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row(
+            "Rent",
+            4,
+            1_000.0,
+            Some("Housing"),
+            "EUR",
+            Some("Rent"),
+            1.0,
+            date,
+        )
+        .expect("add row");
+
+        assert!(de.stale_rate_candidates().unwrap().is_empty());
+    }
+
+    /// `apply_refreshed_rates` must recompute `expense_in_ref_currency` from
+    /// the row's existing `expense_amount` and overwrite exactly the targeted
+    /// row's `fx_rate`/`rate_date`, leaving other rows untouched.
+    #[test]
+    #[serial_test::serial]
+    fn apply_refreshed_rates_updates_only_the_targeted_row() {
+        let _temp = with_temp_data_home();
+        let old_date = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let expense_date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row(
+            "Untouched",
+            2,
+            50.0,
+            Some("Groceries"),
+            "EUR",
+            Some("Othergroceries"),
+            1.0,
+            NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(),
+        )
+        .expect("add untouched row");
+        de.add_row(
+            "Stale",
+            4,
+            100.0,
+            Some("Groceries"),
+            "USD",
+            Some("Othergroceries"),
+            0.9,
+            old_date,
+        )
+        .expect("add stale row");
+
+        let updated = de
+            .apply_refreshed_rates(&[(1, 0.8, expense_date)])
+            .expect("apply refresh");
+        assert_eq!(updated, 1);
+
+        assert_eq!(
+            de.expense_df
+                .column("expense_in_ref_currency")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0),
+            Some(50.0),
+            "row 0 must be untouched"
+        );
+        assert_eq!(
+            de.expense_df
+                .column("expense_in_ref_currency")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(1),
+            Some(80.0),
+            "row 1 must use the new rate against its existing amount"
+        );
+        assert_eq!(
+            date_col_to_vec(&de.expense_df, "rate_date").unwrap(),
+            vec![NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(), expense_date]
         );
     }
 }
