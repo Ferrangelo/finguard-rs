@@ -138,6 +138,28 @@ pub fn resolve_category(value: &str, existing: &HashSet<String>) -> String {
     normalize_category_value(value)
 }
 
+/// Rewrite every legacy `"E"` value in `df`'s `currency` column to `"EUR"`.
+///
+/// Older parquet files (and older seed data) stored the euro as the
+/// single-letter code `"E"`. New rows always write `"EUR"`, but a table
+/// loaded from disk can still carry the legacy value, so every load path maps
+/// it forward here instead of leaking it to the API. A no-op when the column
+/// is absent or the table has no rows, so callers can apply it unconditionally.
+fn normalize_currency_column(df: DataFrame) -> Result<DataFrame> {
+    if !has_column(&df, "currency") || df.height() == 0 {
+        return Ok(df);
+    }
+    Ok(df
+        .lazy()
+        .with_column(
+            when(col("currency").eq(lit("E")))
+                .then(lit("EUR"))
+                .otherwise(col("currency"))
+                .alias("currency"),
+        )
+        .collect()?)
+}
+
 /// Return the total `expense_in_ref_currency` for every category of `kind`,
 /// summed across **all** year summary parquet files.
 ///
@@ -378,7 +400,7 @@ impl DetailedExpenses {
                     .with_column(col("expense_date").cast(DataType::Date))
                     .collect()?;
             }
-            df
+            normalize_currency_column(df)?
         } else {
             empty_expenses_df()
         };
@@ -1369,7 +1391,8 @@ pub struct Liquidity {
 
 impl Liquidity {
     /// Construct for `year`, loading from disk (migrating a missing `currency`
-    /// column to `"E"`) or initialising empty.
+    /// column to `"EUR"` and a legacy `"E"` value in an existing one to
+    /// `"EUR"`) or initialising empty.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, LIQUIDITY_FILENAME)?;
         let df = if path.exists() {
@@ -1377,10 +1400,10 @@ impl Liquidity {
             if !has_column(&df, "currency") {
                 df = df
                     .lazy()
-                    .with_column(lit("E").alias("currency"))
+                    .with_column(lit("EUR").alias("currency"))
                     .collect()?;
             }
-            df
+            normalize_currency_column(df)?
         } else {
             empty_wide_df(&["asset_name", "category", "currency"])
         };
@@ -1502,7 +1525,8 @@ pub struct CreditsDebts {
 
 impl CreditsDebts {
     /// Construct for `year`, loading from disk (migrating a missing `currency`
-    /// to `"E"` and dropping a legacy `type` column) or initialising empty.
+    /// column to `"EUR"`, a legacy `"E"` value in an existing one to `"EUR"`,
+    /// and dropping a legacy `type` column) or initialising empty.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, CREDITS_DEBTS_FILENAME)?;
         let df = if path.exists() {
@@ -1510,9 +1534,10 @@ impl CreditsDebts {
             if !has_column(&df, "currency") {
                 df = df
                     .lazy()
-                    .with_column(lit("E").alias("currency"))
+                    .with_column(lit("EUR").alias("currency"))
                     .collect()?;
             }
+            let mut df = normalize_currency_column(df)?;
             if has_column(&df, "type") {
                 df = df.drop("type")?;
             }
@@ -1613,11 +1638,12 @@ pub struct RecurringExpenses {
 }
 
 impl RecurringExpenses {
-    /// Construct for `year`, loading from disk or initialising empty.
+    /// Construct for `year`, loading from disk (normalizing a legacy `"E"`
+    /// currency value to `"EUR"`) or initialising empty.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, RECURRING_EXPENSES_FILENAME)?;
         let df = if path.exists() {
-            read_parquet(&path)?
+            normalize_currency_column(read_parquet(&path)?)?
         } else {
             empty_recurring_df()
         };
@@ -1802,5 +1828,132 @@ mod tests {
             .set_quantity_or_price("Test Asset", 1, 1.0, "bogus")
             .expect_err("unrecognized field must be rejected");
         assert!(matches!(other_err, Error::InvalidArgument(_)));
+    }
+
+    /// `normalize_currency_column` must rewrite the legacy `"E"` code to
+    /// `"EUR"` and leave every other code, such as `"USD"`, unchanged.
+    #[test]
+    fn normalize_currency_column_maps_legacy_e_to_eur() {
+        let df =
+            DataFrame::new_infer_height(vec![Column::new("currency".into(), &["E", "USD", "E"])])
+                .expect("build test frame");
+
+        let normalized = normalize_currency_column(df).expect("normalize currency column");
+
+        assert_eq!(
+            str_col_to_vec(&normalized, "currency").expect("read currency column"),
+            vec!["EUR", "USD", "EUR"]
+        );
+    }
+
+    /// A table without a `currency` column must pass through unchanged
+    /// instead of erroring, since not every table always has one at every
+    /// stage of the load path.
+    #[test]
+    fn normalize_currency_column_is_noop_without_currency_column() {
+        let df = DataFrame::new_infer_height(vec![Column::new("asset_name".into(), &["Test"])])
+            .expect("build test frame");
+
+        let normalized = normalize_currency_column(df.clone()).expect("normalize currency column");
+
+        assert_eq!(normalized.get_column_names(), df.get_column_names());
+    }
+
+    /// Reloading a liquidity table must migrate a legacy `"E"` currency value
+    /// to `"EUR"`, matching what the `/liquidity` handler in `main.rs` reads.
+    #[test]
+    #[serial_test::serial]
+    fn liquidity_load_normalizes_legacy_currency() {
+        let _temp = with_temp_data_home();
+
+        let mut liq = Liquidity::new(2026).expect("load liquidity");
+        liq.add_asset("Legacy Account", "Cash", "E")
+            .expect("add legacy asset");
+        liq.add_asset("Modern Account", "Cash", "USD")
+            .expect("add modern asset");
+
+        let reloaded = Liquidity::new(2026).expect("reload liquidity");
+        assert_eq!(
+            str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
+            vec!["EUR", "USD"]
+        );
+    }
+
+    /// Reloading a credits/debts table must migrate a legacy `"E"` currency
+    /// value to `"EUR"`, matching what the `/credits-debts` handler in
+    /// `main.rs` reads.
+    #[test]
+    #[serial_test::serial]
+    fn credits_debts_load_normalizes_legacy_currency() {
+        let _temp = with_temp_data_home();
+
+        let mut cd = CreditsDebts::new(2026).expect("load credits/debts");
+        cd.add_entry("Legacy Loan", "E").expect("add legacy entry");
+        cd.add_entry("Modern Loan", "USD")
+            .expect("add modern entry");
+
+        let reloaded = CreditsDebts::new(2026).expect("reload credits/debts");
+        assert_eq!(
+            str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
+            vec!["EUR", "USD"]
+        );
+    }
+
+    /// Reloading a recurring-expenses table must migrate a legacy `"E"`
+    /// currency value to `"EUR"`, matching what the recurring-expenses
+    /// handler in `main.rs` reads.
+    #[test]
+    #[serial_test::serial]
+    fn recurring_expenses_load_normalizes_legacy_currency() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        recurring
+            .add("Legacy Rent", 1, 1_000.0, "E", "Housing", "Rent")
+            .expect("add legacy recurring expense");
+        recurring
+            .add("Modern Rent", 1, 1_000.0, "USD", "Housing", "Rent")
+            .expect("add modern recurring expense");
+
+        let reloaded = RecurringExpenses::new(2026).expect("reload recurring expenses");
+        assert_eq!(
+            str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
+            vec!["EUR", "USD"]
+        );
+    }
+
+    /// Reloading a detailed-expenses table must migrate a legacy `"E"`
+    /// currency value to `"EUR"`, matching what the expenses handler in
+    /// `main.rs` reads.
+    #[test]
+    #[serial_test::serial]
+    fn detailed_expenses_load_normalizes_legacy_currency() {
+        let _temp = with_temp_data_home();
+
+        let mut de = DetailedExpenses::new(2026, 1).expect("load detailed expenses");
+        de.add_row(
+            "Legacy Purchase",
+            1,
+            10.0,
+            Some("Housing"),
+            "E",
+            Some("Rent"),
+        )
+        .expect("add legacy expense row");
+        de.add_row(
+            "Modern Purchase",
+            1,
+            10.0,
+            Some("Housing"),
+            "USD",
+            Some("Rent"),
+        )
+        .expect("add modern expense row");
+
+        let reloaded = DetailedExpenses::new(2026, 1).expect("reload detailed expenses");
+        assert_eq!(
+            str_col_to_vec(&reloaded.expense_df, "currency").expect("read currency column"),
+            vec!["EUR", "USD"]
+        );
     }
 }

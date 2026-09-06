@@ -130,11 +130,11 @@ fn main() -> Result<()> {
     // 4. Recurring expense templates.
     // -----------------------------------------------------------------------
     let mut recurring = RecurringExpenses::new(year)?;
-    recurring.add("Rent", 1, 1_500.00, "E", "housing", "rent")?;
-    recurring.add("Netflix", 10, 15.99, "E", "leisure", "streaming")?;
-    recurring.add("Gym", 5, 45.00, "E", "leisure", "gym")?;
-    recurring.add("Internet", 15, 30.00, "E", "otherexpenses", "internet")?;
-    recurring.add("Phone Plan", 20, 20.00, "E", "otherexpenses", "phone")?;
+    recurring.add("Rent", 1, 1_500.00, "EUR", "housing", "rent")?;
+    recurring.add("Netflix", 10, 15.99, "EUR", "leisure", "streaming")?;
+    recurring.add("Gym", 5, 45.00, "EUR", "leisure", "gym")?;
+    recurring.add("Internet", 15, 30.00, "EUR", "otherexpenses", "internet")?;
+    recurring.add("Phone Plan", 20, 20.00, "EUR", "otherexpenses", "phone")?;
 
     // -----------------------------------------------------------------------
     // 5. Detailed expenses: January through December.
@@ -147,7 +147,7 @@ fn main() -> Result<()> {
     // Helper: add a slice of (day, name, amount, primary, secondary) rows.
     fn add_rows(de: &mut DetailedExpenses, rows: &[(u32, &str, f64, &str, &str)]) -> Result<()> {
         for &(day, name, amount, primary, secondary) in rows {
-            de.add_row(name, day, amount, Some(primary), "E", Some(secondary))?;
+            de.add_row(name, day, amount, Some(primary), "EUR", Some(secondary))?;
         }
         Ok(())
     }
@@ -523,9 +523,9 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     let mut liq = Liquidity::new(year)?;
 
-    liq.add_asset("Main Checking", "Bank/Broker account", "E")?;
-    liq.add_asset("Savings Account", "Bank/Broker account", "E")?;
-    liq.add_asset("Cash Wallet", "Cash", "E")?;
+    liq.add_asset("Main Checking", "Bank/Broker account", "EUR")?;
+    liq.add_asset("Savings Account", "Bank/Broker account", "EUR")?;
+    liq.add_asset("Cash Wallet", "Cash", "EUR")?;
 
     // Main checking reflects spending fluctuations; savings grows steadily.
     let checking = [
@@ -554,8 +554,8 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     let mut cd = CreditsDebts::new(year)?;
 
-    cd.add_entry("Mortgage", "E")?;
-    cd.add_entry("Loan to Friend", "E")?;
+    cd.add_entry("Mortgage", "EUR")?;
+    cd.add_entry("Loan to Friend", "EUR")?;
 
     // Mortgage balance decreasing by ~€400/month (negative = liability).
     let mortgage = [
