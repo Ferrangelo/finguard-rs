@@ -145,17 +145,47 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
 
     // Helper: add a slice of (day, name, amount, primary, secondary) rows.
+    //
+    // Every seed expense is EUR, the default reference currency, so the
+    // identity rate applies: fx_rate 1.0, rate_date the row's own date.
     fn add_rows(de: &mut DetailedExpenses, rows: &[(u32, &str, f64, &str, &str)]) -> Result<()> {
         for &(day, name, amount, primary, secondary) in rows {
-            de.add_row(name, day, amount, Some(primary), "EUR", Some(secondary))?;
+            let date = chrono::NaiveDate::from_ymd_opt(de.year, de.month, day)
+                .expect("seed data uses valid calendar days");
+            de.add_row(
+                name,
+                day,
+                amount,
+                Some(primary),
+                "EUR",
+                Some(secondary),
+                1.0,
+                date,
+            )?;
         }
+        Ok(())
+    }
+
+    // Helper: insert every recurring template not yet present in `de`'s
+    // month. Mirrors `add_rows`'s identity-rate reasoning above.
+    fn apply_recurring(rec: &RecurringExpenses, de: &mut DetailedExpenses) -> Result<()> {
+        let pending = rec.pending_for_month(de)?;
+        let resolved: Vec<_> = pending
+            .into_iter()
+            .map(|p| {
+                let date = chrono::NaiveDate::from_ymd_opt(de.year, de.month, p.expense_day)
+                    .expect("recurring day is validated to 1..=28 on add");
+                (p, 1.0, date)
+            })
+            .collect();
+        rec.insert_resolved(de, &resolved)?;
         Ok(())
     }
 
     // January, a quiet winter month
     {
         let mut de = DetailedExpenses::new(year, 1)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -178,7 +208,7 @@ fn main() -> Result<()> {
     // February: Valentine's dinner splurge
     {
         let mut de = DetailedExpenses::new(year, 2)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -201,7 +231,7 @@ fn main() -> Result<()> {
     // March: ski trip drives spending up
     {
         let mut de = DetailedExpenses::new(year, 3)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -226,7 +256,7 @@ fn main() -> Result<()> {
     // April: spring wardrobe refresh
     {
         let mut de = DetailedExpenses::new(year, 4)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -248,7 +278,7 @@ fn main() -> Result<()> {
     // May: concert night out
     {
         let mut de = DetailedExpenses::new(year, 5)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -272,7 +302,7 @@ fn main() -> Result<()> {
     // June: summer prep (swimwear + headphones)
     {
         let mut de = DetailedExpenses::new(year, 6)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -296,7 +326,7 @@ fn main() -> Result<()> {
     // July: summer vacation (biggest spending month)
     {
         let mut de = DetailedExpenses::new(year, 7)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -318,7 +348,7 @@ fn main() -> Result<()> {
     // August: calm recovery month
     {
         let mut de = DetailedExpenses::new(year, 8)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -339,7 +369,7 @@ fn main() -> Result<()> {
     // September: back to routine, autumn clothes
     {
         let mut de = DetailedExpenses::new(year, 9)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -361,7 +391,7 @@ fn main() -> Result<()> {
     // October: Halloween + birthday gift
     {
         let mut de = DetailedExpenses::new(year, 10)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -384,7 +414,7 @@ fn main() -> Result<()> {
     // November: Black Friday + winter jacket
     {
         let mut de = DetailedExpenses::new(year, 11)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[
@@ -407,7 +437,7 @@ fn main() -> Result<()> {
     // December: Christmas (highest spending month)
     {
         let mut de = DetailedExpenses::new(year, 12)?;
-        recurring.apply_to_month(&mut de)?;
+        apply_recurring(&recurring, &mut de)?;
         add_rows(
             &mut de,
             &[

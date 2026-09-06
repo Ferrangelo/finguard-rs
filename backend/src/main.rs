@@ -28,6 +28,7 @@ use finguard_rs_backend::config;
 use finguard_rs_backend::df_operations::{
     Cashflow, CreditsDebts, DetailedExpenses, InvestmentHoldings, Liquidity, RecurringExpenses,
 };
+use finguard_rs_backend::fx;
 use finguard_rs_backend::paths::{PRIMARIES_FILENAME, get_year_summary_path};
 use polars::prelude::SerReader;
 
@@ -56,6 +57,18 @@ pub struct ExpenseJson {
     pub currency: String,
     pub primary: String,
     pub secondary: String,
+    /// Multiplier applied to `amount` to get `expense_in_ref_currency`
+    /// (always 1.0 when `currency` already is the reference currency).
+    /// Ignored on write (`#[serde(default)]` so a request built against the
+    /// old contract, without this field, still deserializes): the server
+    /// always resolves this itself from `currency` and the effective
+    /// `expense_date`.
+    #[serde(default)]
+    pub fx_rate: f64,
+    /// The date `fx_rate` was published for, as `"YYYY-MM-DD"`. Ignored on
+    /// write, for the same reason as `fx_rate`.
+    #[serde(default)]
+    pub rate_date: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -297,6 +310,31 @@ fn column_dates_day(df: &polars::prelude::DataFrame, name: &str) -> Vec<i32> {
     }
 }
 
+/// Read a `Date` column and format each value as `"YYYY-MM-DD"`. Same lenient
+/// fallbacks as [`column_f64`] (empty `Vec` if the column is missing or not
+/// date-castable, the Unix epoch's date for nulls).
+fn column_dates_iso(df: &polars::prelude::DataFrame, name: &str) -> Vec<String> {
+    let Ok(col) = df.column(name) else {
+        return Vec::new();
+    };
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    match col.cast(&polars::prelude::DataType::Int32) {
+        Ok(c) => match c.i32() {
+            Ok(s) => s
+                .iter()
+                .map(|o| {
+                    let days = o.unwrap_or(0);
+                    (epoch + chrono::Duration::days(days as i64))
+                        .format("%Y-%m-%d")
+                        .to_string()
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Set `target_col` to `value` on every row where `key_col` equals `key`,
 /// leaving other rows unchanged. Does not save; callers persist the mutated
 /// dataframe (e.g. via `liq.save()`) afterward. Used by the metadata-update
@@ -401,6 +439,8 @@ async fn get_expenses_handler(
         let currencies = column_strings(&filtered_df, "currency");
         let primaries = column_strings(&filtered_df, "primary_category");
         let secondaries = column_strings(&filtered_df, "secondary_category");
+        let fx_rates = column_f64(&filtered_df, "fx_rate");
+        let rate_dates = column_dates_iso(&filtered_df, "rate_date");
 
         for fi in 0..filtered_df.height() {
             all.push(ExpenseJson {
@@ -413,6 +453,8 @@ async fn get_expenses_handler(
                 currency: currencies.get(fi).cloned().unwrap_or_default(),
                 primary: primaries.get(fi).cloned().unwrap_or_default(),
                 secondary: secondaries.get(fi).cloned().unwrap_or_default(),
+                fx_rate: fx_rates.get(fi).copied().unwrap_or(1.0),
+                rate_date: rate_dates.get(fi).cloned().unwrap_or_default(),
             });
         }
     }
@@ -429,11 +471,29 @@ async fn get_expenses_handler(
 /// [`Error::InvalidArgument`] (`400`). Either path rewrites the month's
 /// parquet file and recomputes the primaries/secondaries summary tables for
 /// the year.
+///
+/// `payload.fx_rate`/`payload.rate_date` are ignored: the rate is always
+/// resolved fresh here, via [`fx::rate_on`], for `payload.currency` on the
+/// expense's own date (`payload.year`/`payload.month`/`payload.day`), not for
+/// today. The response carries the resolved values back.
 async fn upsert_expense_handler(
     Json(payload): Json<ExpenseJson>,
 ) -> Result<Json<ExpenseJson>, AppError> {
     let year = payload.year;
     let month = payload.month;
+    let expense_date =
+        chrono::NaiveDate::from_ymd_opt(year, month, payload.day).ok_or_else(|| {
+            finguard_rs_backend::Error::InvalidArgument(format!(
+                "invalid date {year}-{month:02}-{:02}",
+                payload.day
+            ))
+        })?;
+    let resolved = fx::rate_on(expense_date, &payload.currency).await?;
+    // `rate_date` is `None` only for the reference-currency identity case
+    // (see `fx::ResolvedRate`), which has no external publication date to
+    // report; the expense's own date is the correct value to store there.
+    let rate_date = resolved.rate_date.unwrap_or(expense_date);
+
     let mut de = DetailedExpenses::new(year, month)?;
 
     if payload.id.is_empty() {
@@ -444,11 +504,15 @@ async fn upsert_expense_handler(
             Some(&payload.primary),
             &payload.currency,
             Some(&payload.secondary),
+            resolved.rate,
+            rate_date,
         )?;
 
         let new_id = (de.expense_df.height() as i32 - 1).to_string();
         let mut response = payload;
         response.id = new_id;
+        response.fx_rate = resolved.rate;
+        response.rate_date = rate_date.format("%Y-%m-%d").to_string();
         Ok(Json(response))
     } else {
         let idx = payload
@@ -463,8 +527,13 @@ async fn upsert_expense_handler(
             Some(&payload.currency),
             Some(&payload.primary),
             Some(&payload.secondary),
+            resolved.rate,
+            rate_date,
         )?;
-        Ok(Json(payload))
+        let mut response = payload;
+        response.fx_rate = resolved.rate;
+        response.rate_date = rate_date.format("%Y-%m-%d").to_string();
+        Ok(Json(response))
     }
 }
 
@@ -570,12 +639,32 @@ async fn delete_recurring_handler(
 /// templates that already have a matching row (same name and day-of-month) so
 /// the endpoint is safe to call more than once for the same month. Returns
 /// the number of rows actually added.
+///
+/// Each inserted row's FX rate is resolved via [`fx::rate_on`] for the date
+/// it actually lands on (`payload.year`/`payload.month`/template day), not
+/// for today.
 async fn apply_recurring_handler(
     Json(payload): Json<ApplyRecurringPayload>,
 ) -> Result<Json<u32>, AppError> {
     let rec = RecurringExpenses::new(payload.year)?;
     let mut de = DetailedExpenses::new(payload.year, payload.month)?;
-    let added_names = rec.apply_to_month(&mut de)?;
+
+    let pending = rec.pending_for_month(&de)?;
+    let mut resolved = Vec::with_capacity(pending.len());
+    for row in pending {
+        let date = chrono::NaiveDate::from_ymd_opt(payload.year, payload.month, row.expense_day)
+            .ok_or_else(|| {
+                finguard_rs_backend::Error::InvalidArgument(format!(
+                    "invalid date {}-{:02}-{:02}",
+                    payload.year, payload.month, row.expense_day
+                ))
+            })?;
+        let rate = fx::rate_on(date, &row.currency).await?;
+        let rate_date = rate.rate_date.unwrap_or(date);
+        resolved.push((row, rate.rate, rate_date));
+    }
+
+    let added_names = rec.insert_resolved(&mut de, &resolved)?;
     Ok(Json(added_names.len() as u32))
 }
 
