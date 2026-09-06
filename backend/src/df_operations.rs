@@ -1287,20 +1287,28 @@ fn set_f64_where(
 
 /// Yearly investment holdings table. `df` holds quantities; `df_prices` holds
 /// per-month unit prices; [`Self::df_value`] multiplies them.
+///
+/// `currency` lives on `df` only, not on `df_prices`. A holding has exactly
+/// one currency, `df` is the frame the API reads asset metadata from (see
+/// `get_investments_handler` in `main.rs`), and `df_value`'s join already
+/// selects only the price columns out of `df_prices`, so a copy on
+/// `df_prices` would never reach a caller and would just be a second value to
+/// keep in sync.
 pub struct InvestmentHoldings {
     /// Calendar year of this table.
     pub year: i32,
     path: std::path::PathBuf,
     path_prices: std::path::PathBuf,
-    /// Quantities dataframe (`asset_name, category, link, 01..12`).
+    /// Quantities dataframe (`asset_name, category, link, currency, 01..12`).
     pub df: DataFrame,
-    /// Prices dataframe (same schema as `df`).
+    /// Prices dataframe (`asset_name, category, link, 01..12`; no `currency`).
     pub df_prices: DataFrame,
 }
 
 impl InvestmentHoldings {
     /// Construct for `year`, loading holdings and prices from disk (or
-    /// initialising empty), migrating a missing `link` column.
+    /// initialising empty), migrating a missing `link` column on both frames
+    /// and a missing or legacy `currency` column on `df`.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, INVESTMENTS_FILENAME)?;
         let path_prices = get_year_summary_path(year, INVESTMENTS_PRICES_FILENAME)?;
@@ -1317,9 +1325,22 @@ impl InvestmentHoldings {
             }
         };
 
+        let mut df = load(&path)?;
+        if !has_column(&df, "currency") {
+            // Holdings saved before this column existed are already priced in
+            // the reference currency, so backfill it from settings rather
+            // than a fixed value the user may since have changed.
+            let reference_currency = config::get_currency_settings()?.reference_currency;
+            df = df
+                .lazy()
+                .with_column(lit(reference_currency).alias("currency"))
+                .collect()?;
+        }
+        let df = normalize_currency_column(df)?;
+
         Ok(Self {
             year,
-            df: load(&path)?,
+            df,
             df_prices: load(&path_prices)?,
             path,
             path_prices,
@@ -1331,7 +1352,16 @@ impl InvestmentHoldings {
     }
 
     /// Add a new asset row (monthly quantities initialised to 0) and save.
-    pub fn add_asset(&mut self, asset_name: &str, category: &str, link: &str) -> Result<()> {
+    ///
+    /// `currency` is stored on `df` only; the row appended to `df_prices`
+    /// keeps that frame's existing `asset_name, category, link` schema.
+    pub fn add_asset(
+        &mut self,
+        asset_name: &str,
+        category: &str,
+        link: &str,
+        currency: &str,
+    ) -> Result<()> {
         if !INVESTMENT_CATEGORIES.contains(&category) {
             return Err(Error::InvalidArgument(format!(
                 "'{category}' is not a valid category. Choose from: {INVESTMENT_CATEGORIES:?}"
@@ -1346,9 +1376,15 @@ impl InvestmentHoldings {
             ("asset_name", asset_name),
             ("category", category),
             ("link", link),
+            ("currency", currency),
         ])?;
-        self.df = concat_df_diagonal(&[self.df.clone(), new_row.clone()])?;
-        self.df_prices = concat_df_diagonal(&[self.df_prices.clone(), new_row])?;
+        let price_row = wide_row(&[
+            ("asset_name", asset_name),
+            ("category", category),
+            ("link", link),
+        ])?;
+        self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
+        self.df_prices = concat_df_diagonal(&[self.df_prices.clone(), price_row])?;
         self.save()
     }
 
@@ -1492,8 +1528,10 @@ impl InvestmentHoldings {
 
     /// Return a dataframe of quantity × price for each asset and month.
     ///
-    /// Same shape as `df` (`asset_name, category, link, 01..12`) but each
-    /// monthly cell contains `quantity * price`.
+    /// Same shape as `df` (`asset_name, category, link, currency, 01..12`)
+    /// but each monthly cell contains `quantity * price`. The join only pulls
+    /// the price columns out of `df_prices`, so `df`'s other columns,
+    /// including `currency`, pass through unchanged.
     pub fn df_value(&self) -> Result<DataFrame> {
         let mcols = month_labels();
         let price_select: Vec<Expr> = std::iter::once(col("asset_name"))
@@ -2000,7 +2038,7 @@ mod tests {
 
         let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
         holdings
-            .add_asset("Test Asset", "Stocks/ETF", "")
+            .add_asset("Test Asset", "Stocks/ETF", "", "EUR")
             .expect("add asset");
 
         holdings
@@ -2036,6 +2074,112 @@ mod tests {
             .set_quantity_or_price("Test Asset", 1, 1.0, "bogus")
             .expect_err("unrecognized field must be rejected");
         assert!(matches!(other_err, Error::InvalidArgument(_)));
+    }
+
+    /// A pre-existing investments file with no `currency` column must
+    /// backfill it from the configured reference currency, not a fixed
+    /// value: the user can change the reference currency, and existing
+    /// holdings were priced in whatever it was at the time.
+    #[test]
+    #[serial_test::serial]
+    fn investment_holdings_backfill_uses_configured_reference_currency() {
+        let _temp = with_temp_data_home();
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "GBP".to_string(),
+            current_month_rate_mode: Default::default(),
+        })
+        .expect("set currency settings");
+
+        let path = get_year_summary_path(2026, INVESTMENTS_FILENAME).expect("investments path");
+        let legacy_row = wide_row(&[
+            ("asset_name", "Legacy Holding"),
+            ("category", "Stocks/ETF"),
+            ("link", ""),
+        ])
+        .expect("build legacy row without a currency column");
+        write_parquet(&legacy_row, &path).expect("write legacy investments file");
+
+        let holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        assert_eq!(
+            str_col_to_vec(&holdings.df, "currency").expect("read currency column"),
+            vec!["GBP"]
+        );
+    }
+
+    /// Reloading an investments table must migrate a legacy `"E"` currency
+    /// value to `"EUR"`, matching every other table with a currency column.
+    #[test]
+    #[serial_test::serial]
+    fn investment_holdings_load_normalizes_legacy_currency() {
+        let _temp = with_temp_data_home();
+
+        let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        holdings
+            .add_asset("Legacy Asset", "Stocks/ETF", "", "E")
+            .expect("add legacy asset");
+        holdings
+            .add_asset("Modern Asset", "Stocks/ETF", "", "USD")
+            .expect("add modern asset");
+
+        let reloaded = InvestmentHoldings::new(2026).expect("reload holdings");
+        assert_eq!(
+            str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
+            vec!["EUR", "USD"]
+        );
+    }
+
+    /// `add_asset` must store the given currency on `df`, the frame the API
+    /// reads asset metadata from, and must not add a `currency` column to
+    /// `df_prices`, which owns none (see the `InvestmentHoldings` struct
+    /// docs for why).
+    #[test]
+    #[serial_test::serial]
+    fn investment_holdings_add_asset_stores_currency_on_df_only() {
+        let _temp = with_temp_data_home();
+
+        let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        holdings
+            .add_asset("Test Asset", "Stocks/ETF", "", "USD")
+            .expect("add asset");
+
+        assert_eq!(
+            str_col_to_vec(&holdings.df, "currency").expect("read currency column"),
+            vec!["USD"]
+        );
+        assert!(
+            !has_column(&holdings.df_prices, "currency"),
+            "currency belongs on df only, not df_prices"
+        );
+    }
+
+    /// `df_value` must still multiply quantity by price correctly with a
+    /// `currency` column present on `df`.
+    #[test]
+    #[serial_test::serial]
+    fn investment_holdings_df_value_unaffected_by_currency_column() {
+        let _temp = with_temp_data_home();
+
+        let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        holdings
+            .add_asset("Test Asset", "Stocks/ETF", "", "USD")
+            .expect("add asset");
+        holdings
+            .set_quantity("Test Asset", 1, 10.0)
+            .expect("set quantity");
+        holdings
+            .set_price("Test Asset", 1, 25.0)
+            .expect("set price");
+
+        let value = holdings.df_value().expect("compute value");
+        assert_eq!(
+            value
+                .column("01")
+                .expect("value frame has month column")
+                .f64()
+                .expect("month column is f64")
+                .get(0),
+            Some(250.0)
+        );
     }
 
     /// `normalize_currency_column` must rewrite the legacy `"E"` code to
