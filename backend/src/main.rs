@@ -321,6 +321,27 @@ fn column_f64(df: &polars::prelude::DataFrame, name: &str) -> Vec<f64> {
     }
 }
 
+/// Read a numeric column as `f64`, casting if necessary, defaulting a null
+/// cell to `default` instead of the `0.0` [`column_f64`] uses. Same lenient
+/// fallback as [`column_f64`] for a missing column or non-numeric dtype
+/// (empty `Vec`).
+///
+/// Built for the `fx_rate` column: `0.0` is not a safe stand-in for "no rate
+/// resolved here", since multiplying an amount by it would silently zero out
+/// money instead of leaving it unconverted. No write path leaves `fx_rate`
+/// null today, but `1.0` (the value the migration backfills for a pre-FX row)
+/// is the safe default if one ever did.
+fn column_f64_or(df: &polars::prelude::DataFrame, name: &str, default: f64) -> Vec<f64> {
+    let Ok(col) = df.column(name) else {
+        return Vec::new();
+    };
+    let casted = col.cast(&polars::prelude::DataType::Float64);
+    match casted.as_ref().unwrap_or(col).f64() {
+        Ok(s) => s.iter().map(|o| o.unwrap_or(default)).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Read a numeric column as `i64`, casting if necessary. Same lenient
 /// fallbacks as [`column_f64`] (empty `Vec` if the column is missing or not
 /// numeric, `0` for nulls).
@@ -490,7 +511,9 @@ async fn get_expenses_handler(
         let currencies = column_strings(&filtered_df, "currency");
         let primaries = column_strings(&filtered_df, "primary_category");
         let secondaries = column_strings(&filtered_df, "secondary_category");
-        let fx_rates = column_f64(&filtered_df, "fx_rate");
+        // A null `fx_rate` defaults to 1.0, not `column_f64`'s usual 0.0: see
+        // `column_f64_or`.
+        let fx_rates = column_f64_or(&filtered_df, "fx_rate", 1.0);
         let rate_dates = column_dates_iso(&filtered_df, "rate_date");
 
         for fi in 0..filtered_df.height() {
