@@ -165,6 +165,45 @@ pub struct NetworthEvolutionJson {
     pub net_worth: Vec<f64>,
 }
 
+/// `GET`/`PUT /api/settings/currency` request and response body, mirroring
+/// [`config::CurrencySettings`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CurrencySettingsJson {
+    pub reference_currency: String,
+    /// `"previous_month_end"` or `"live"`; see [`config::CurrentMonthRateMode`].
+    pub current_month_rate_mode: config::CurrentMonthRateMode,
+}
+
+/// One calendar month's resolved rates in [`MonthlyFxRatesJson`], keyed by
+/// currency code.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MonthlyFxRateJson {
+    pub month: u32,
+    /// Currency code -> multiplier that converts an amount **in that
+    /// currency** into [`MonthlyFxRatesJson::reference_currency`]. To convert
+    /// a reference-currency amount into a display currency, divide by this
+    /// value instead of multiplying. Never contains the reference currency
+    /// itself (always an implicit `1.0`, so it is left out) or a currency
+    /// listed in [`MonthlyFxRatesJson::unavailable_currencies`].
+    pub rate_to_reference: std::collections::HashMap<String, f64>,
+}
+
+/// `GET /api/fx/monthly-rates` response body: one resolved rate per currency
+/// per calendar month of `year`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MonthlyFxRatesJson {
+    pub year: i32,
+    /// Every rate in `months` converts *into* this currency; the numbers are
+    /// meaningless without it.
+    pub reference_currency: String,
+    pub months: Vec<MonthlyFxRateJson>,
+    /// Currencies that could not be resolved for any month, typically because
+    /// the network is unavailable and nothing is cached yet. Omitted from
+    /// `months` rather than failing the whole request, so a reference-only
+    /// portfolio still gets a working response with no network access.
+    pub unavailable_currencies: Vec<String>,
+}
+
 // ======================================================================
 // Query/Payload Structs
 // ======================================================================
@@ -182,6 +221,16 @@ pub struct YearQuery {
 pub struct NetworthAllocationQuery {
     pub year: i32,
     pub month: u32,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct MonthlyFxRatesQuery {
+    pub year: i32,
+    /// Comma-separated extra currency codes to resolve alongside whatever
+    /// `year`'s investment, liquidity, and credits/debts rows already use
+    /// (see [`networth_currencies`]). Absent or empty asks for exactly the
+    /// currencies already present in that data.
+    pub currencies: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -474,6 +523,54 @@ fn discover_years() -> Vec<i32> {
 /// `GET /api/years`: list years with any on-disk data. See [`discover_years`].
 async fn list_years_handler() -> Json<Vec<i32>> {
     Json(discover_years())
+}
+
+/// The reference currencies the frontend currency picker offers. An update
+/// naming any other code is rejected before it reaches disk (see
+/// [`update_currency_settings_handler`]), because every later rate lookup
+/// ([`fx::rate_on`], [`fx::monthly_rates`]) resolves against whatever is
+/// saved here, and an unsupported code would only fail those lookups later,
+/// far from this request and hard to trace back to it.
+const SUPPORTED_REFERENCE_CURRENCIES: [&str; 5] = ["EUR", "USD", "GBP", "CHF", "JPY"];
+
+/// `GET /api/settings/currency`: the current reference currency and
+/// in-progress-month rate mode (see [`config::CurrencySettings`]).
+async fn get_currency_settings_handler() -> Result<Json<CurrencySettingsJson>, AppError> {
+    let settings = config::get_currency_settings()?;
+    Ok(Json(CurrencySettingsJson {
+        reference_currency: settings.reference_currency,
+        current_month_rate_mode: settings.current_month_rate_mode,
+    }))
+}
+
+/// `PUT /api/settings/currency`: replace the reference currency and
+/// in-progress-month rate mode, and return the saved values.
+///
+/// Returns [`Error::InvalidArgument`] (`400`) for a `payload.reference_currency`
+/// outside [`SUPPORTED_REFERENCE_CURRENCIES`], without persisting it.
+///
+/// [`Error::InvalidArgument`]: finguard_rs_backend::Error::InvalidArgument
+async fn update_currency_settings_handler(
+    Json(payload): Json<CurrencySettingsJson>,
+) -> Result<Json<CurrencySettingsJson>, AppError> {
+    let reference_currency = payload.reference_currency.trim().to_uppercase();
+    if !SUPPORTED_REFERENCE_CURRENCIES.contains(&reference_currency.as_str()) {
+        return Err(finguard_rs_backend::Error::InvalidArgument(format!(
+            "unsupported reference currency '{reference_currency}'; expected one of \
+             {SUPPORTED_REFERENCE_CURRENCIES:?}"
+        ))
+        .into());
+    }
+
+    let settings = config::CurrencySettings {
+        reference_currency,
+        current_month_rate_mode: payload.current_month_rate_mode,
+    };
+    config::set_currency_settings(&settings)?;
+    Ok(Json(CurrencySettingsJson {
+        reference_currency: settings.reference_currency,
+        current_month_rate_mode: settings.current_month_rate_mode,
+    }))
 }
 
 /// `GET /api/expenses`: list expense rows for `year`, optionally narrowed to
@@ -1543,6 +1640,77 @@ async fn get_networth_allocation_handler(
     })))
 }
 
+/// `GET /api/fx/monthly-rates?year=&currencies=`: one resolved rate per
+/// currency per calendar month of `year`, so a client can convert an amount
+/// already stored in the reference currency into a chosen display currency
+/// at each month's own rate, rather than one current rate.
+///
+/// Resolves every currency already present in `year`'s investment, liquidity,
+/// and credits/debts rows (see [`networth_currencies`]), plus every code in
+/// `q.currencies` (a comma-separated list). Every rate in the response
+/// converts *from* the named currency *into* [`CurrencySettingsJson::reference_currency`]:
+/// see [`MonthlyFxRateJson::rate_to_reference`] for the exact direction and
+/// how to invert it.
+///
+/// A currency that cannot be resolved for any month, typically because the
+/// network is unavailable and nothing is cached yet, is left out of `months`
+/// and reported in [`MonthlyFxRatesJson::unavailable_currencies`] instead of
+/// failing the whole request; a portfolio held entirely in the reference
+/// currency never triggers a lookup at all, so it always gets a complete
+/// response with no network access.
+async fn get_monthly_fx_rates_handler(
+    Query(q): Query<MonthlyFxRatesQuery>,
+) -> Result<Json<MonthlyFxRatesJson>, AppError> {
+    let reference_currency = config::get_currency_settings()?.reference_currency;
+
+    let mut currencies = networth_currencies(q.year)?;
+    if let Some(extra) = &q.currencies {
+        currencies.extend(
+            extra
+                .split(',')
+                .map(|c| c.trim().to_uppercase())
+                .filter(|c| !c.is_empty()),
+        );
+    }
+    currencies.sort();
+    currencies.dedup();
+
+    let mut months: Vec<MonthlyFxRateJson> = (1..=12u32)
+        .map(|month| MonthlyFxRateJson {
+            month,
+            rate_to_reference: std::collections::HashMap::new(),
+        })
+        .collect();
+    let mut unavailable_currencies = Vec::new();
+
+    // Resolved one currency at a time, rather than in a single
+    // `fx::monthly_rates` call across every currency, so a currency that
+    // fails to resolve (no network, nothing cached) is reported and skipped
+    // instead of failing every other currency's lookup too.
+    for currency in &currencies {
+        if currency == &reference_currency {
+            continue;
+        }
+        match fx::monthly_rates(q.year, std::slice::from_ref(currency)).await {
+            Ok(rates) => {
+                for month_json in &mut months {
+                    if let Ok(rate) = rates.rate(month_json.month, currency) {
+                        month_json.rate_to_reference.insert(currency.clone(), rate);
+                    }
+                }
+            }
+            Err(_) => unavailable_currencies.push(currency.clone()),
+        }
+    }
+
+    Ok(Json(MonthlyFxRatesJson {
+        year: q.year,
+        reference_currency,
+        months,
+        unavailable_currencies,
+    }))
+}
+
 // ======================================================================
 // Server Initialization
 // ======================================================================
@@ -1570,6 +1738,10 @@ async fn main() {
             delete(delete_category_handler),
         )
         .route("/api/categories/totals", get(get_category_totals_handler))
+        .route(
+            "/api/settings/currency",
+            get(get_currency_settings_handler).put(update_currency_settings_handler),
+        )
         // Expense transactions
         .route(
             "/api/expenses",
@@ -1641,6 +1813,7 @@ async fn main() {
             "/api/networth/allocation",
             get(get_networth_allocation_handler),
         )
+        .route("/api/fx/monthly-rates", get(get_monthly_fx_rates_handler))
         .layer(cors);
 
     let host = std::env::var("FINGUARD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -1871,6 +2044,151 @@ mod tests {
         assert_eq!(
             str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
             vec!["USD".to_string()]
+        );
+    }
+
+    /// A null `fx_rate` cell must default to `1.0`, matching the value the
+    /// pre-FX-migration backfill uses (see `df_operations`'s
+    /// `load_migrates_a_file_missing_fx_columns`), not `column_f64`'s usual
+    /// `0.0`. `0.0` would silently zero out a monetary amount instead of
+    /// leaving it unconverted.
+    #[test]
+    fn column_f64_or_defaults_a_null_cell_to_the_given_default() {
+        use polars::prelude::{Column, DataFrame};
+        let df = DataFrame::new_infer_height(vec![Column::new(
+            "fx_rate".into(),
+            &[Some(1.5), None, Some(2.0)],
+        )])
+        .expect("build a df with a null fx_rate cell");
+
+        assert_eq!(column_f64_or(&df, "fx_rate", 1.0), vec![1.5, 1.0, 2.0]);
+        // `column_f64` itself is untouched: it still maps the null to `0.0`,
+        // which is exactly the value this endpoint must no longer serve for
+        // `fx_rate`.
+        assert_eq!(column_f64(&df, "fx_rate"), vec![1.5, 0.0, 2.0]);
+    }
+
+    /// `GET` then `PUT` then `GET` again on `/api/settings/currency` must
+    /// round-trip the saved values, including normalizing a lowercase
+    /// reference currency to uppercase.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn currency_settings_round_trip_through_the_endpoints() {
+        let _temp = with_temp_env_offline();
+
+        let initial = get_currency_settings_handler()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("get succeeds: {err}"));
+        assert_eq!(initial.0.reference_currency, "EUR");
+        assert_eq!(
+            initial.0.current_month_rate_mode,
+            config::CurrentMonthRateMode::PreviousMonthEnd
+        );
+
+        let updated = update_currency_settings_handler(Json(CurrencySettingsJson {
+            reference_currency: "usd".to_string(),
+            current_month_rate_mode: config::CurrentMonthRateMode::Live,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("update succeeds: {err}"));
+        assert_eq!(updated.0.reference_currency, "USD");
+        assert_eq!(
+            updated.0.current_month_rate_mode,
+            config::CurrentMonthRateMode::Live
+        );
+
+        let reloaded = get_currency_settings_handler()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("get succeeds: {err}"));
+        assert_eq!(reloaded.0.reference_currency, "USD");
+        assert_eq!(
+            reloaded.0.current_month_rate_mode,
+            config::CurrentMonthRateMode::Live
+        );
+    }
+
+    /// `PUT /api/settings/currency` must reject a reference currency outside
+    /// the frontend's supported set, and must not persist it: a bad reference
+    /// currency would make every later rate lookup fail far from this
+    /// request.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn currency_settings_update_rejects_an_unsupported_reference_currency() {
+        let _temp = with_temp_env_offline();
+
+        let err = update_currency_settings_handler(Json(CurrencySettingsJson {
+            reference_currency: "XXX".to_string(),
+            current_month_rate_mode: config::CurrentMonthRateMode::Live,
+        }))
+        .await
+        .expect_err("an unsupported reference currency must be rejected");
+        assert!(matches!(
+            err.0,
+            finguard_rs_backend::Error::InvalidArgument(_)
+        ));
+
+        // Nothing must have been persisted: the default settings still load.
+        let settings = config::get_currency_settings().expect("load settings");
+        assert_eq!(settings.reference_currency, "EUR");
+    }
+
+    /// A brand-new year has no investment, liquidity, or credits/debts rows
+    /// in any currency, and the request names no extra currency either, so
+    /// the reference currency is the only one involved. That must succeed
+    /// with an empty rate table and nothing marked unavailable, even with the
+    /// network disabled and nothing cached: the reference currency never
+    /// needs a lookup.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn monthly_fx_rates_reference_currency_only_needs_no_network() {
+        let _temp = with_temp_env_offline();
+
+        let response = get_monthly_fx_rates_handler(Query(MonthlyFxRatesQuery {
+            year: 2026,
+            currencies: None,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("reference-only request succeeds: {err}"));
+
+        assert_eq!(response.0.reference_currency, "EUR");
+        assert_eq!(response.0.months.len(), 12);
+        assert!(
+            response
+                .0
+                .months
+                .iter()
+                .all(|m| m.rate_to_reference.is_empty())
+        );
+        assert!(response.0.unavailable_currencies.is_empty());
+    }
+
+    /// A requested currency with nothing cached and the network disabled must
+    /// be reported in `unavailable_currencies` and left out of every month's
+    /// `rate_to_reference`, instead of failing the whole request.
+    ///
+    /// Uses a year (2000) far enough in the past that every month resolves
+    /// through `month_end_rate` (the "completed month" path) regardless of
+    /// today's real date, so the assertion cannot depend on when the test
+    /// actually runs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn monthly_fx_rates_reports_an_unresolvable_currency_as_unavailable() {
+        let _temp = with_temp_env_offline();
+
+        let response = get_monthly_fx_rates_handler(Query(MonthlyFxRatesQuery {
+            year: 2000,
+            currencies: Some("USD".to_string()),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("degraded request still succeeds: {err}"));
+
+        assert_eq!(response.0.unavailable_currencies, vec!["USD".to_string()]);
+        assert!(
+            response
+                .0
+                .months
+                .iter()
+                .all(|m| !m.rate_to_reference.contains_key("USD"))
         );
     }
 }
