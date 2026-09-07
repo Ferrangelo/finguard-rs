@@ -139,46 +139,24 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // 5. Detailed expenses: January through December.
     //
-    //    Each block: apply recurring templates first, then add variable costs,
-    //    then update the cumulative primaries/secondaries summary tables so
-    //    that Cashflow::recompute() has spending data later.
+    //    Each block: apply recurring templates first, then add variable
+    //    costs. The reference-currency amount is derived at read time from
+    //    `expense_amount`/`currency` (see `df_operations::resolve_fact`),
+    //    not stored here, so there is no summary table to update.
     // -----------------------------------------------------------------------
 
     // Helper: add a slice of (day, name, amount, primary, secondary) rows.
-    //
-    // Every seed expense is EUR, the default reference currency, so the
-    // identity rate applies: fx_rate 1.0, rate_date the row's own date.
     fn add_rows(de: &mut DetailedExpenses, rows: &[(u32, &str, f64, &str, &str)]) -> Result<()> {
         for &(day, name, amount, primary, secondary) in rows {
-            let date = chrono::NaiveDate::from_ymd_opt(de.year, de.month, day)
-                .expect("seed data uses valid calendar days");
-            de.add_row(
-                name,
-                day,
-                amount,
-                Some(primary),
-                "EUR",
-                Some(secondary),
-                1.0,
-                date,
-            )?;
+            de.add_row(name, day, amount, Some(primary), "EUR", Some(secondary))?;
         }
         Ok(())
     }
 
-    // Helper: insert every recurring template not yet present in `de`'s
-    // month. Mirrors `add_rows`'s identity-rate reasoning above.
+    // Helper: insert every recurring template not yet present in `de`'s month.
     fn apply_recurring(rec: &RecurringExpenses, de: &mut DetailedExpenses) -> Result<()> {
         let pending = rec.pending_for_month(de)?;
-        let resolved: Vec<_> = pending
-            .into_iter()
-            .map(|p| {
-                let date = chrono::NaiveDate::from_ymd_opt(de.year, de.month, p.expense_day)
-                    .expect("recurring day is validated to 1..=28 on add");
-                (p, 1.0, date)
-            })
-            .collect();
-        rec.insert_resolved(de, &resolved)?;
+        rec.insert_resolved(de, &pending)?;
         Ok(())
     }
 
@@ -202,7 +180,6 @@ fn main() -> Result<()> {
                 (25, "Insurance", 95.00, "fees", "insurance"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // February: Valentine's dinner splurge
@@ -225,7 +202,6 @@ fn main() -> Result<()> {
                 (22, "Cinema", 28.00, "leisure", "cinema"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // March: ski trip drives spending up
@@ -250,7 +226,6 @@ fn main() -> Result<()> {
                 (10, "Restaurant", 95.00, "out", "restaurant"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // April: spring wardrobe refresh
@@ -272,7 +247,6 @@ fn main() -> Result<()> {
                 (20, "Clothes", 145.00, "clothing", "clothes"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // May: concert night out
@@ -296,7 +270,6 @@ fn main() -> Result<()> {
                 (25, "Concert", 85.00, "leisure", "concert"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // June: summer prep (swimwear + headphones)
@@ -320,7 +293,6 @@ fn main() -> Result<()> {
                 (15, "Headphones", 160.00, "leisure", "electronics"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // July: summer vacation (biggest spending month)
@@ -342,7 +314,6 @@ fn main() -> Result<()> {
                 (9, "Beach", 25.00, "leisure", "mrleisure"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // August: calm recovery month
@@ -363,7 +334,6 @@ fn main() -> Result<()> {
                 (28, "Restaurant", 48.00, "out", "restaurant"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // September: back to routine, autumn clothes
@@ -385,7 +355,6 @@ fn main() -> Result<()> {
                 (22, "Clothes", 135.00, "clothing", "clothes"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // October: Halloween + birthday gift
@@ -408,7 +377,6 @@ fn main() -> Result<()> {
                 (31, "Halloween", 35.00, "leisure", "mrleisure"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // November: Black Friday + winter jacket
@@ -431,7 +399,6 @@ fn main() -> Result<()> {
                 (22, "Clothes", 180.00, "clothing", "clothes"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     // December: Christmas (highest spending month)
@@ -456,7 +423,6 @@ fn main() -> Result<()> {
                 (5, "Decoration", 65.00, "leisure", "mrleisure"),
             ],
         )?;
-        de.update_all_summary_tables()?;
     }
 
     println!("  ✓ Expenses seeded (Jan–Dec 2025)");

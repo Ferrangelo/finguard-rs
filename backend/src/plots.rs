@@ -22,13 +22,16 @@
 //!
 //! [iced]: https://github.com/iced-rs/iced
 
+use std::collections::HashMap;
+
+use chrono::NaiveDate;
 use polars::prelude::*;
 
 use crate::df_operations::{
-    Cashflow, CreditsDebts, DetailedExpenses, InvestmentHoldings, Liquidity,
+    Cashflow, CreditsDebts, DetailedExpenses, InvestmentHoldings, Liquidity, resolve_fact,
 };
 use crate::error::Result;
-use crate::fx::MonthlyRates;
+use crate::fx::{MonthlyRates, ResolvedRate};
 use crate::paths::{PRIMARIES_FILENAME, SECONDARIES_FILENAME, get_year_summary_path};
 
 // ======================================================================
@@ -740,33 +743,46 @@ pub fn networth_evolution_line(
 
 /// Pie chart of a single month's expenses by category.
 ///
-/// Uses [`DetailedExpenses::create_expenses_summary_table`] for the relevant
-/// category column. One slice per row whose label is non-empty and whose total
-/// is `> 0`, with integer (round-half-even) rounding.
+/// Groups `de`'s rows by `kind`'s category (`"primary"` or anything else,
+/// treated as `"secondary"`, matching [`kind_parts`]'s convention), summing
+/// each row's amount converted into `reference_currency` via
+/// [`crate::df_operations::resolve_fact`] and `rates` (resolved once per
+/// distinct `(date, currency)` pair by the caller; see
+/// [`crate::df_operations::distinct_rate_keys`]). One slice per category
+/// whose label is non-empty and whose total is `> 0`, with integer
+/// (round-half-even) rounding.
 ///
-/// Note: matching the Python original, an empty summary table returns
-/// `Ok(None)`, but a non-empty table with no qualifying slices returns
+/// Note: matching the Python original, a month with no rows returns
+/// `Ok(None)`, but a non-empty month with no qualifying slices returns
 /// `Ok(Some(PieChart { slices: vec![] }))`.
-pub fn monthly_expenses_pie(de: &DetailedExpenses, kind: &str) -> Result<Option<PieChart>> {
-    let cat_col = if kind == "primary" {
-        "primary_category"
-    } else {
-        "secondary_category"
-    };
-    let df = de.create_expenses_summary_table(cat_col)?;
-    if df.height() == 0 {
+pub fn monthly_expenses_pie(
+    de: &DetailedExpenses,
+    kind: &str,
+    reference_currency: &str,
+    rates: &HashMap<(NaiveDate, String), ResolvedRate>,
+) -> Result<Option<PieChart>> {
+    let facts = de.expense_facts()?;
+    if facts.is_empty() {
         return Ok(None);
     }
 
-    let labels = str_col(&df, cat_col)?;
-    let values = f64_col(&df, "total_expense_in_ref_currency")?;
+    let mut totals: indexmap::IndexMap<String, f64> = indexmap::IndexMap::new();
+    for fact in &facts {
+        let label = if kind == "primary" {
+            &fact.primary_category
+        } else {
+            &fact.secondary_category
+        };
+        let (rate, _) = resolve_fact(fact, reference_currency, rates)?;
+        *totals.entry(label.clone()).or_insert(0.0) += fact.expense_amount * rate;
+    }
 
     let mut slices = Vec::new();
-    for (label, val) in labels.iter().zip(values.iter()) {
-        if !label.is_empty() && *val > 0.0 {
+    for (label, val) in totals {
+        if !label.is_empty() && val > 0.0 {
             slices.push(PieSlice {
-                name: label.clone(),
-                value: round_half_even(*val),
+                name: label,
+                value: round_half_even(val),
             });
         }
     }

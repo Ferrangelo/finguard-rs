@@ -11,7 +11,6 @@
 use std::collections::HashSet;
 
 use chrono::NaiveDate;
-use indexmap::IndexMap;
 use polars::functions::concat_df_diagonal;
 use polars::prelude::*;
 
@@ -55,24 +54,6 @@ fn special_cases() -> &'static [(&'static str, &'static str)] {
         ("patreon-like", "Patreon-Like"),
     ]
 }
-
-/// Canonical display order for primary categories.
-const PRIMARY_CATEGORY_ORDER: &[&str] = &[
-    "Housing",
-    "Health",
-    "Groceries",
-    "Transport",
-    "Lunchbreak",
-    "Out",
-    "Travel",
-    "Baby",
-    "Clothing",
-    "Leisure",
-    "Gifts",
-    "Fees",
-    "OtherExpenses",
-    "Missioni",
-];
 
 /// Row labels for the income categories (user-editable values).
 const INCOME_CATEGORIES: &[&str] = &[
@@ -158,83 +139,6 @@ fn normalize_currency_column(df: DataFrame) -> Result<DataFrame> {
                 .alias("currency"),
         )
         .collect()?)
-}
-
-/// Return the total `expense_in_ref_currency` for every category of `kind`,
-/// summed across **all** year summary parquet files.
-///
-/// Categories whose rows only contain zeros still appear with a value of `0.0`.
-/// The synthetic `"Total"` row is excluded. Per-file errors are swallowed
-/// (mirroring the Python `try/except: pass`).
-///
-/// `kind` must be `"primary"` or `"secondary"`.
-pub fn get_category_totals_across_all_years(kind: &str) -> Result<IndexMap<String, f64>> {
-    if kind != "primary" && kind != "secondary" {
-        return Err(Error::InvalidArgument(format!(
-            "kind must be 'primary' or 'secondary', got '{kind}'"
-        )));
-    }
-    let filename = if kind == "primary" {
-        PRIMARIES_FILENAME
-    } else {
-        SECONDARIES_FILENAME
-    };
-    let category_col = format!("{kind}_category");
-    let mut totals: IndexMap<String, f64> = IndexMap::new();
-
-    // Mirror Python's broad try/except: swallow any error encountered while
-    // iterating directories or reading files.
-    let _ = (|| -> Result<()> {
-        let root = get_dbs_root()?;
-        for entry in std::fs::read_dir(root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let path = entry.path().join(filename);
-            if !path.exists() {
-                continue;
-            }
-            let df = match read_parquet(&path) {
-                Ok(df) => df,
-                Err(_) => continue,
-            };
-            if !df
-                .get_column_names()
-                .iter()
-                .any(|c| c.as_str() == category_col)
-            {
-                continue;
-            }
-            let month_cols: Vec<String> = df
-                .get_column_names()
-                .iter()
-                .map(|s| s.to_string())
-                .filter(|c| *c != category_col)
-                .collect();
-            let cat_series = df.column(&category_col)?.str()?.clone();
-            for (i, cat_opt) in cat_series.iter().enumerate() {
-                let Some(cat) = cat_opt else { continue };
-                if cat.is_empty() || cat == "Total" {
-                    continue;
-                }
-                let mut row_total = 0.0;
-                for mc in &month_cols {
-                    let v = df
-                        .column(mc)?
-                        .f64()
-                        .ok()
-                        .and_then(|s| s.get(i))
-                        .unwrap_or(0.0);
-                    row_total += v;
-                }
-                *totals.entry(cat.to_string()).or_insert(0.0) += row_total;
-            }
-        }
-        Ok(())
-    })();
-
-    Ok(totals)
 }
 
 /// Delete the row for `name` from every year-summary parquet file of `kind`.
@@ -358,38 +262,20 @@ fn date_series(name: &str, dates: &[NaiveDate]) -> Series {
 
 /// Build an empty detailed-expenses dataframe with the canonical schema.
 ///
-/// `fx_rate` and `rate_date` record how `expense_in_ref_currency` was
-/// derived from `expense_amount`: `fx_rate` is the multiplier applied, and
-/// `rate_date` is the date that multiplier was published for (see
-/// [`crate::fx::rate_on`]).
+/// The schema stores only the facts of an expense: its own amount and
+/// currency. It deliberately holds no reference-currency amount or FX rate;
+/// those are derived at read time from `expense_amount`/`currency` (see
+/// [`ExpenseFact`] and [`resolve_fact`]) so that changing the reference
+/// currency never mislabels a stored figure.
 fn empty_expenses_df() -> DataFrame {
     DataFrame::empty_with_schema(&Schema::from_iter([
         Field::new("expense_name".into(), DataType::String),
         Field::new("expense_date".into(), DataType::Date),
         Field::new("expense_amount".into(), DataType::Float64),
         Field::new("currency".into(), DataType::String),
-        Field::new("expense_in_ref_currency".into(), DataType::Float64),
-        Field::new("fx_rate".into(), DataType::Float64),
-        Field::new("rate_date".into(), DataType::Date),
         Field::new("primary_category".into(), DataType::String),
         Field::new("secondary_category".into(), DataType::String),
     ]))
-}
-
-/// A row whose stored FX rate might be superseded by a newer published rate:
-/// its expense date, currency, and the `rate_date` currently on file.
-///
-/// Returned by [`DetailedExpenses::stale_rate_candidates`].
-#[derive(Debug, Clone)]
-pub struct StaleRateCandidate {
-    /// Position of this row in `expense_df`, for [`DetailedExpenses::apply_refreshed_rates`].
-    pub row_index: u32,
-    /// The row's `expense_date`.
-    pub expense_date: NaiveDate,
-    /// The row's `currency`.
-    pub currency: String,
-    /// The `rate_date` currently stored for this row.
-    pub stored_rate_date: NaiveDate,
 }
 
 /// Manage a monthly detailed-expenses parquet file.
@@ -434,22 +320,15 @@ impl DetailedExpenses {
                     .with_column(col("expense_date").cast(DataType::Date))
                     .collect()?;
             }
-            // Migrate a file written before fx tracking existed: backfill
-            // fx_rate to 1.0 and rate_date to the row's own expense_date.
-            // Every pre-migration row is already in the reference currency
-            // (all existing data is euro), so this backfills provenance only
-            // and never recomputes expense_in_ref_currency.
-            if !has_column(&df, "fx_rate") {
-                df = df
-                    .lazy()
-                    .with_column(lit(1.0_f64).alias("fx_rate"))
-                    .collect()?;
-            }
-            if !has_column(&df, "rate_date") {
-                df = df
-                    .lazy()
-                    .with_column(col("expense_date").alias("rate_date"))
-                    .collect()?;
+            // A file written before this schema simplification may still
+            // carry `expense_in_ref_currency`/`fx_rate`/`rate_date`. Drop
+            // them rather than erroring: they are derived at read time now
+            // (see `ExpenseFact`/`resolve_fact`), and the file loses them for
+            // good the next time it is written.
+            for stale_column in ["expense_in_ref_currency", "fx_rate", "rate_date"] {
+                if has_column(&df, stale_column) {
+                    df = df.drop(stale_column)?;
+                }
             }
             normalize_currency_column(df)?
         } else {
@@ -463,22 +342,11 @@ impl DetailedExpenses {
         })
     }
 
-    /// Convert `amount` into the reference currency using an already-resolved
-    /// `rate` (see [`crate::fx::rate_on`]). This dataframe layer stays
-    /// synchronous and network-free: resolving the rate is the caller's job.
-    fn convert_in_ref_currency(amount: f64, rate: f64) -> f64 {
-        amount * rate
-    }
-
     /// Append an expense row and save the updated dataframe.
     ///
     /// If `primary_category` or `secondary_category` are `None`, they are
     /// resolved from the category-mappings config. Returns
     /// [`Error::InvalidArgument`] when `primary_category` cannot be resolved.
-    ///
-    /// `fx_rate` and `rate_date` must already be resolved by the caller (see
-    /// [`crate::fx::rate_on`]); this method only multiplies and stores them.
-    #[allow(clippy::too_many_arguments)]
     pub fn add_row(
         &mut self,
         expense_name: &str,
@@ -487,8 +355,6 @@ impl DetailedExpenses {
         primary_category: Option<&str>,
         currency: &str,
         secondary_category: Option<&str>,
-        fx_rate: f64,
-        rate_date: NaiveDate,
     ) -> Result<()> {
         let mut primary = primary_category.map(|s| s.to_string());
         let mut secondary = secondary_category.map(|s| s.to_string());
@@ -521,8 +387,6 @@ impl DetailedExpenses {
         let primary = primary.unwrap();
         let secondary = secondary.unwrap();
 
-        let expense_in_ref_currency = Self::convert_in_ref_currency(expense_amount, fx_rate);
-
         let date =
             NaiveDate::from_ymd_opt(self.year, self.month, expense_day).ok_or_else(|| {
                 Error::InvalidArgument(format!(
@@ -536,9 +400,6 @@ impl DetailedExpenses {
             date_series("expense_date", &[date]).into(),
             Column::new("expense_amount".into(), &[expense_amount]),
             Column::new("currency".into(), &[currency]),
-            Column::new("expense_in_ref_currency".into(), &[expense_in_ref_currency]),
-            Column::new("fx_rate".into(), &[fx_rate]),
-            date_series("rate_date", &[rate_date]).into(),
             Column::new(
                 "primary_category".into(),
                 &[normalize_category_value(&primary)],
@@ -551,11 +412,10 @@ impl DetailedExpenses {
 
         self.expense_df = concat_df_diagonal(&[self.expense_df.clone(), new_row])?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
-        self.update_all_summary_tables()?;
         Ok(())
     }
 
-    /// Remove the `row_index`-th row, save, and recompute the summary tables.
+    /// Remove the `row_index`-th row, then save.
     pub fn delete_row(&mut self, row_index: u32) -> Result<()> {
         self.expense_df = self
             .expense_df
@@ -566,7 +426,6 @@ impl DetailedExpenses {
             .drop(cols(["_idx"]))
             .collect()?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
-        self.update_all_summary_tables()?;
         Ok(())
     }
 
@@ -607,11 +466,11 @@ impl DetailedExpenses {
         set
     }
 
-    /// Apply field edits to the `row_index`-th row, save, and recompute summaries.
+    /// Apply field edits to the `row_index`-th row, then save.
     ///
     /// This ports the `save_edit` logic from `ui_expenses.py`: any field left
     /// `None` is unchanged; `expense_day` rebuilds `expense_date` from the
-    /// table's year/month; `expense_amount` also drives `expense_in_ref_currency`.
+    /// table's year/month.
     ///
     /// Categories are resolved via [`resolve_category`] (not
     /// [`normalize_category_value`]): the edited value is first matched
@@ -621,15 +480,6 @@ impl DetailedExpenses {
     /// spelling, and only normalized on no match. This mirrors the Python edit
     /// dialog, which builds `existing_pri` / `existing_sec` and calls
     /// `resolve_category`.
-    ///
-    /// Divergence from Python: `save_edit` did not recompute the on-disk summary
-    /// tables. This port calls [`Self::update_all_summary_tables`] after editing
-    /// (intentional improvement) so the summaries stay consistent with the edit.
-    ///
-    /// `fx_rate` and `rate_date` must already be resolved by the caller for
-    /// the row's post-edit date and currency (see [`crate::fx::rate_on`]), and
-    /// are always written, since the caller resolves them fresh on every call
-    /// regardless of which fields changed.
     #[allow(clippy::too_many_arguments)]
     pub fn edit_row(
         &mut self,
@@ -640,8 +490,6 @@ impl DetailedExpenses {
         currency: Option<&str>,
         primary_category: Option<&str>,
         secondary_category: Option<&str>,
-        fx_rate: f64,
-        rate_date: NaiveDate,
     ) -> Result<()> {
         let mut df = self.expense_df.clone().lazy().with_row_index("_idx", None);
 
@@ -689,32 +537,6 @@ impl DetailedExpenses {
             );
         }
 
-        // Always recompute expense_in_ref_currency from the (possibly just
-        // updated, possibly unchanged) expense_amount, since the caller
-        // resolves fx_rate/rate_date fresh for this row's post-edit date and
-        // currency on every call. Referencing expense_amount here, after the
-        // block above, picks up any edit just applied to it.
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        let rate_days = (rate_date - epoch).num_days() as i32;
-        df = df
-            .with_column(
-                when(pred.clone())
-                    .then(col("expense_amount") * lit(fx_rate))
-                    .otherwise(col("expense_in_ref_currency"))
-                    .alias("expense_in_ref_currency"),
-            )
-            .with_column(
-                when(pred.clone())
-                    .then(lit(fx_rate))
-                    .otherwise(col("fx_rate"))
-                    .alias("fx_rate"),
-            )
-            .with_column(
-                when(pred.clone())
-                    .then(lit(rate_days).cast(DataType::Date))
-                    .otherwise(col("rate_date"))
-                    .alias("rate_date"),
-            );
         if let Some(pri) = primary_category {
             let primary_set = self.existing_category_set("primary_category");
             df = df.with_column(
@@ -736,83 +558,7 @@ impl DetailedExpenses {
 
         self.expense_df = df.drop(cols(["_idx"])).collect()?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
-        self.update_all_summary_tables()?;
         Ok(())
-    }
-
-    /// Return every row whose stored `rate_date` predates its `expense_date`,
-    /// the necessary (but not sufficient) condition for a stale rate.
-    ///
-    /// Resolving whether a candidate is *actually* stale needs a fresh async
-    /// [`crate::fx::rate_on`] call, which this synchronous dataframe layer
-    /// cannot make. So the caller must re-resolve each candidate's rate and
-    /// only pass it to [`Self::apply_refreshed_rates`] when the newly
-    /// resolved `rate_date` is strictly later than `stored_rate_date`. A row
-    /// whose rate already matches its own `expense_date` (including every
-    /// weekend expense, since the ECB never later republishes an earlier
-    /// date) is excluded here and can never reappear, which is what keeps a
-    /// refresh idempotent.
-    pub fn stale_rate_candidates(&self) -> Result<Vec<StaleRateCandidate>> {
-        let dates = date_col_to_vec(&self.expense_df, "expense_date")?;
-        let rate_dates = date_col_to_vec(&self.expense_df, "rate_date")?;
-        let currencies = str_col_to_vec(&self.expense_df, "currency")?;
-
-        let mut out = Vec::new();
-        for i in 0..dates.len() {
-            if rate_dates[i] < dates[i] {
-                out.push(StaleRateCandidate {
-                    row_index: i as u32,
-                    expense_date: dates[i],
-                    currency: currencies[i].clone(),
-                    stored_rate_date: rate_dates[i],
-                });
-            }
-        }
-        Ok(out)
-    }
-
-    /// Apply already re-resolved `(row_index, fx_rate, rate_date)` triples,
-    /// recomputing each row's `expense_in_ref_currency` from its existing
-    /// `expense_amount`, then save and recompute the summary tables.
-    ///
-    /// Callers must have already confirmed each new `rate_date` is strictly
-    /// later than the row's previous one (see [`Self::stale_rate_candidates`]);
-    /// this method does not re-check that itself.
-    pub fn apply_refreshed_rates(&mut self, updates: &[(u32, f64, NaiveDate)]) -> Result<u32> {
-        if updates.is_empty() {
-            return Ok(0);
-        }
-
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        let mut df = self.expense_df.clone().lazy().with_row_index("_idx", None);
-        for &(row_index, fx_rate, rate_date) in updates {
-            let pred = col("_idx").eq(lit(row_index));
-            let rate_days = (rate_date - epoch).num_days() as i32;
-            df = df
-                .with_column(
-                    when(pred.clone())
-                        .then(col("expense_amount") * lit(fx_rate))
-                        .otherwise(col("expense_in_ref_currency"))
-                        .alias("expense_in_ref_currency"),
-                )
-                .with_column(
-                    when(pred.clone())
-                        .then(lit(fx_rate))
-                        .otherwise(col("fx_rate"))
-                        .alias("fx_rate"),
-                )
-                .with_column(
-                    when(pred.clone())
-                        .then(lit(rate_days).cast(DataType::Date))
-                        .otherwise(col("rate_date"))
-                        .alias("rate_date"),
-                );
-        }
-
-        self.expense_df = df.drop(cols(["_idx"])).collect()?;
-        write_parquet(&self.expense_df, &self.expense_df_path)?;
-        self.update_all_summary_tables()?;
-        Ok(updates.len() as u32)
     }
 
     /// Return a filtered copy of the expense dataframe.
@@ -897,160 +643,167 @@ impl DetailedExpenses {
         lf
     }
 
-    /// Return a summary grouped by `category_col` (`"primary_category"` or
-    /// `"secondary_category"`), summing `expense_in_ref_currency`.
-    pub fn create_expenses_summary_table(&self, category_col: &str) -> Result<DataFrame> {
-        if category_col != "primary_category" && category_col != "secondary_category" {
-            return Err(Error::InvalidArgument(format!(
-                "category_col must be 'primary_category' or 'secondary_category', got \
-                 '{category_col}'"
-            )));
+    /// Return every row's [`ExpenseFact`]s, for computing reference-currency
+    /// totals at read time (see the module docs on why this dataframe layer
+    /// no longer stores a derived amount).
+    pub fn expense_facts(&self) -> Result<Vec<ExpenseFact>> {
+        facts_from_df(&self.expense_df)
+    }
+}
+
+// ======================================================================
+// Read-time reference-currency conversion
+// ======================================================================
+//
+// `expense_amount`/`currency` are the only facts a row stores; everything
+// else about a reference-currency total is derived here, from an already
+// (asynchronously) resolved rate table the caller builds via
+// `distinct_rate_keys` and `crate::fx::rate_on`. Keeping the resolution step
+// out of this module is what keeps `df_operations` synchronous and
+// network-free (see the module docs).
+
+/// One stored expense row's facts: its own amount and currency, with no
+/// reference-currency amount or rate attached.
+#[derive(Debug, Clone)]
+pub struct ExpenseFact {
+    /// The row's `expense_date`.
+    pub expense_date: NaiveDate,
+    /// The row's `currency`, as stored (not yet upper-cased/trimmed).
+    pub currency: String,
+    /// The row's `expense_amount`, in `currency`.
+    pub expense_amount: f64,
+    /// The row's `primary_category`.
+    pub primary_category: String,
+    /// The row's `secondary_category`.
+    pub secondary_category: String,
+}
+
+/// Build [`ExpenseFact`]s from any dataframe carrying the detailed-expenses
+/// columns (shared by [`DetailedExpenses::expense_facts`]).
+fn facts_from_df(df: &DataFrame) -> Result<Vec<ExpenseFact>> {
+    let dates = date_col_to_vec(df, "expense_date")?;
+    let currencies = str_col_to_vec(df, "currency")?;
+    let amounts: Vec<f64> = df
+        .column("expense_amount")?
+        .f64()?
+        .iter()
+        .map(|o| o.unwrap_or(0.0))
+        .collect();
+    let primaries = str_col_to_vec(df, "primary_category")?;
+    let secondaries = str_col_to_vec(df, "secondary_category")?;
+    Ok((0..dates.len())
+        .map(|i| ExpenseFact {
+            expense_date: dates[i],
+            currency: currencies[i].clone(),
+            expense_amount: amounts[i],
+            primary_category: primaries[i].clone(),
+            secondary_category: secondaries[i].clone(),
+        })
+        .collect())
+}
+
+/// Return every [`ExpenseFact`] for `year`'s existing monthly files. A month
+/// with no parquet file yet is skipped rather than treated as an error,
+/// matching [`DetailedExpenses::new`]'s "empty table" convention for it.
+pub fn expense_facts_for_year(year: i32) -> Result<Vec<ExpenseFact>> {
+    let mut facts = Vec::new();
+    for month in 1..=12u32 {
+        let path = get_monthly_parquet_path(year, month)?;
+        if !path.exists() {
+            continue;
         }
-        Ok(self
-            .expense_df
-            .clone()
-            .lazy()
-            .group_by([col(category_col)])
-            .agg([col("expense_in_ref_currency")
-                .sum()
-                .alias("total_expense_in_ref_currency")])
-            .collect()?)
+        facts.extend(DetailedExpenses::new(year, month)?.expense_facts()?);
     }
+    Ok(facts)
+}
 
-    /// Return the current month as a `YYYY-MM` string (e.g. `"2026-03"`).
-    fn month_label(&self) -> String {
-        format!("{}-{:02}", self.year, self.month)
-    }
-
-    /// Core logic for updating a cumulative wide summary table. See module-level
-    /// docs; this faithfully reproduces the Python `_update_summary_table`.
-    fn update_summary_table(&self, kind: &str) -> Result<DataFrame> {
-        let category_col = format!("{kind}_category");
-        let filename = if kind == "primary" {
-            PRIMARIES_FILENAME
-        } else {
-            SECONDARIES_FILENAME
-        };
-        let summary_path = get_year_summary_path(self.year, filename)?;
-        let month_label = self.month_label();
-
-        // current month totals (long format)
-        let monthly = self
-            .expense_df
-            .clone()
-            .lazy()
-            .group_by([col(category_col.as_str())])
-            .agg([col("expense_in_ref_currency")
-                .sum()
-                .alias(month_label.as_str())])
-            .collect()?;
-
-        // load or initialise the summary table
-        let mut summary = if summary_path.exists() {
-            let mut existing = read_parquet(&summary_path)?;
-            if has_column(&existing, &month_label) {
-                existing = existing.drop(&month_label)?;
+/// Return every [`ExpenseFact`] across every year found under the data root.
+///
+/// Scans every year directory under [`get_dbs_root`], the same directory
+/// walk [`remove_category_from_all_summaries`] uses; per-year read errors
+/// are swallowed the same way (a year directory that cannot be read
+/// contributes no facts rather than failing the whole scan).
+pub fn all_expense_facts() -> Result<Vec<ExpenseFact>> {
+    let mut facts = Vec::new();
+    let _ = (|| -> Result<()> {
+        let root = get_dbs_root()?;
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
             }
-            // Outer/full join with coalesce on the category key.
-            existing
-                .lazy()
-                .join(
-                    monthly.lazy(),
-                    [col(category_col.as_str())],
-                    [col(category_col.as_str())],
-                    JoinArgs::new(JoinType::Full).with_coalesce(JoinCoalesce::CoalesceColumns),
-                )
-                .collect()?
-        } else {
-            monthly
-        };
-
-        // fill all month columns with 0.0 where null
-        let month_cols: Vec<String> = summary
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .filter(|c| *c != category_col)
-            .collect();
-        summary = summary
-            .lazy()
-            .with_columns(
-                month_cols
-                    .iter()
-                    .map(|c| col(c.as_str()).fill_null(lit(0.0)))
-                    .collect::<Vec<_>>(),
-            )
-            .collect()?;
-
-        // sort columns: category first, then months chronologically (YYYY-MM)
-        let mut sorted_month_cols = month_cols.clone();
-        sorted_month_cols.sort();
-        let mut ordered_cols = vec![category_col.clone()];
-        ordered_cols.extend(sorted_month_cols.iter().cloned());
-        summary = summary.select(&ordered_cols)?;
-
-        // Add totals row (strip any pre-existing Total rows first)
-        summary = summary
-            .lazy()
-            .filter(col(category_col.as_str()).neq(lit("Total")))
-            .collect()?;
-
-        // Compute per-month column sums for the Total row.
-        let mut total_cols: Vec<Column> =
-            vec![Column::new(category_col.as_str().into(), &["Total"])];
-        for mc in &sorted_month_cols {
-            let sum = summary.column(mc)?.f64()?.sum().unwrap_or(0.0);
-            total_cols.push(Column::new(mc.as_str().into(), &[sum]));
+            let Some(year) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if let Ok(year_facts) = expense_facts_for_year(year) {
+                facts.extend(year_facts);
+            }
         }
-        let total_row = DataFrame::new_infer_height(total_cols)?;
-        summary = concat_df_diagonal(&[summary, total_row])?;
+        Ok(())
+    })();
+    Ok(facts)
+}
 
-        // sort rows by canonical category order (primary only)
-        if kind == "primary" {
-            let mut order_names: Vec<&str> = PRIMARY_CATEGORY_ORDER.to_vec();
-            order_names.push("Total");
-            let order_idx: Vec<i64> = (0..order_names.len() as i64).collect();
-            let order_df = DataFrame::new_infer_height(vec![
-                Column::new(category_col.as_str().into(), &order_names),
-                Column::new("_order".into(), order_idx),
-            ])?;
-            summary = summary
-                .lazy()
-                .join(
-                    order_df.lazy(),
-                    [col(category_col.as_str())],
-                    [col(category_col.as_str())],
-                    JoinArgs::new(JoinType::Left),
-                )
-                .sort(
-                    ["_order"],
-                    SortMultipleOptions::default().with_nulls_last(true),
-                )
-                .drop(cols(["_order"]))
-                .collect()?;
-        }
+/// Every distinct `(expense_date, currency)` pair in `facts` whose currency
+/// differs from `reference_currency` (which always converts at `1.0`, with
+/// no lookup needed). The caller resolves each pair once via
+/// [`crate::fx::rate_on`] and reuses it for every row that shares it,
+/// instead of one lookup per row.
+pub fn distinct_rate_keys(
+    facts: &[ExpenseFact],
+    reference_currency: &str,
+) -> Vec<(NaiveDate, String)> {
+    let reference_currency = reference_currency.trim().to_uppercase();
+    let mut keys: Vec<(NaiveDate, String)> = facts
+        .iter()
+        .map(|f| (f.expense_date, f.currency.trim().to_uppercase()))
+        .filter(|(_, currency)| *currency != reference_currency)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
 
-        write_parquet(&summary, &summary_path)?;
-        Ok(summary)
+/// Resolve `fact`'s reference-currency rate and the date that rate was
+/// published for, using `rates` (built by the caller from
+/// [`distinct_rate_keys`] and [`crate::fx::rate_on`]).
+///
+/// The reference-currency case needs no entry in `rates`: it always reports
+/// rate `1.0` and `fact.expense_date`, mirroring
+/// [`crate::fx::ResolvedRate`]'s `rate_date: None` convention for that case.
+/// Multiply `fact.expense_amount` by the returned rate to get the
+/// reference-currency amount.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] if `fact`'s `(expense_date, currency)` pair is
+/// missing from `rates`, instead of silently substituting `1.0`.
+pub fn resolve_fact(
+    fact: &ExpenseFact,
+    reference_currency: &str,
+    rates: &std::collections::HashMap<(NaiveDate, String), crate::fx::ResolvedRate>,
+) -> Result<(f64, NaiveDate)> {
+    let currency = fact.currency.trim().to_uppercase();
+    if currency == reference_currency.trim().to_uppercase() {
+        return Ok((1.0, fact.expense_date));
     }
-
-    /// Update and save the cumulative primaries summary table.
-    pub fn update_primaries_summary_table(&self) -> Result<DataFrame> {
-        self.update_summary_table("primary")
-    }
-
-    /// Update and save the cumulative secondaries summary table.
-    pub fn update_secondaries_summary_table(&self) -> Result<DataFrame> {
-        self.update_summary_table("secondary")
-    }
-
-    /// Update both summary tables, returning `(primaries, secondaries)`.
-    pub fn update_all_summary_tables(&self) -> Result<(DataFrame, DataFrame)> {
-        Ok((
-            self.update_primaries_summary_table()?,
-            self.update_secondaries_summary_table()?,
-        ))
-    }
+    let resolved = rates
+        .get(&(fact.expense_date, currency.clone()))
+        .ok_or_else(|| {
+            Error::NotFound(format!(
+                "no resolved FX rate for '{currency}' on {}; it was not included in the rates \
+                 passed to resolve_fact",
+                fact.expense_date
+            ))
+        })?;
+    Ok((
+        resolved.rate,
+        resolved.rate_date.unwrap_or(fact.expense_date),
+    ))
 }
 
 /// Escape regex metacharacters in `s` (equivalent to Python's `re.escape`).
@@ -1828,9 +1581,8 @@ fn empty_recurring_df() -> DataFrame {
 /// A recurring template not yet present in a target month, along with the
 /// data needed to insert it.
 ///
-/// Returned by [`RecurringExpenses::pending_for_month`]; pair each one with
-/// its resolved `(fx_rate, rate_date)` before passing it to
-/// [`RecurringExpenses::insert_resolved`].
+/// Returned by [`RecurringExpenses::pending_for_month`]; pass the list
+/// straight to [`RecurringExpenses::insert_resolved`].
 #[derive(Debug, Clone)]
 pub struct PendingRecurringRow {
     /// The expense name to insert.
@@ -1919,10 +1671,6 @@ impl RecurringExpenses {
     /// Return every recurring definition not yet present in `de`'s month
     /// (matched by `expense_name` and the day component of `expense_date`,
     /// same duplicate check the old single-step `apply_to_month` used).
-    ///
-    /// Split from insertion so the caller can resolve each row's `fx_rate`
-    /// (an async operation) before calling [`Self::insert_resolved`], keeping
-    /// this dataframe layer synchronous and free of any fx/network dependency.
     pub fn pending_for_month(&self, de: &DetailedExpenses) -> Result<Vec<PendingRecurringRow>> {
         let names = str_col_to_vec(&self.df, "expense_name")?;
         let days: Vec<i64> = self
@@ -1975,16 +1723,15 @@ impl RecurringExpenses {
         Ok(pending)
     }
 
-    /// Insert `rows` (as produced by [`Self::pending_for_month`], each paired
-    /// with its already-resolved `(fx_rate, rate_date)`) into `de`, and
-    /// return the inserted names.
+    /// Insert `rows` (as produced by [`Self::pending_for_month`]) into `de`,
+    /// and return the inserted names.
     pub fn insert_resolved(
         &self,
         de: &mut DetailedExpenses,
-        rows: &[(PendingRecurringRow, f64, NaiveDate)],
+        rows: &[PendingRecurringRow],
     ) -> Result<Vec<String>> {
         let mut added = Vec::new();
-        for (row, fx_rate, rate_date) in rows {
+        for row in rows {
             de.add_row(
                 &row.expense_name,
                 row.expense_day,
@@ -1992,8 +1739,6 @@ impl RecurringExpenses {
                 Some(&row.primary_category),
                 &row.currency,
                 Some(&row.secondary_category),
-                *fx_rate,
-                *rate_date,
             )?;
             added.push(row.expense_name.clone());
         }
@@ -2282,7 +2027,6 @@ mod tests {
     fn detailed_expenses_load_normalizes_legacy_currency() {
         let _temp = with_temp_data_home();
 
-        let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         let mut de = DetailedExpenses::new(2026, 1).expect("load detailed expenses");
         de.add_row(
             "Legacy Purchase",
@@ -2291,8 +2035,6 @@ mod tests {
             Some("Housing"),
             "E",
             Some("Rent"),
-            1.0,
-            date,
         )
         .expect("add legacy expense row");
         de.add_row(
@@ -2302,8 +2044,6 @@ mod tests {
             Some("Housing"),
             "USD",
             Some("Rent"),
-            1.0,
-            date,
         )
         .expect("add modern expense row");
 
@@ -2314,111 +2054,17 @@ mod tests {
         );
     }
 
-    /// A non-reference-currency row must store `expense_in_ref_currency` as
-    /// `amount * fx_rate`, alongside the `fx_rate` and `rate_date` it was
-    /// converted with. `add_row` takes these as plain arguments, so this
-    /// touches no fx code and makes no network call.
+    /// A parquet file carrying the removed `expense_in_ref_currency`,
+    /// `fx_rate`, and `rate_date` columns must still load: those columns are
+    /// dropped rather than erroring, and the row's facts
+    /// (`expense_amount`/`currency`) survive untouched.
     #[test]
     #[serial_test::serial]
-    fn add_row_converts_non_reference_currency_with_the_given_rate() {
-        let _temp = with_temp_data_home();
-        let rate_date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-
-        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
-        de.add_row(
-            "Groceries",
-            4,
-            100.0,
-            Some("Groceries"),
-            "USD",
-            Some("Othergroceries"),
-            0.86,
-            rate_date,
-        )
-        .expect("add row");
-
-        assert_eq!(
-            de.expense_df
-                .column("expense_in_ref_currency")
-                .unwrap()
-                .f64()
-                .unwrap()
-                .get(0),
-            Some(86.0)
-        );
-        assert_eq!(
-            de.expense_df
-                .column("fx_rate")
-                .unwrap()
-                .f64()
-                .unwrap()
-                .get(0),
-            Some(0.86)
-        );
-        assert_eq!(
-            date_col_to_vec(&de.expense_df, "rate_date").unwrap(),
-            vec![rate_date]
-        );
-    }
-
-    /// A reference-currency row (the common case: all current data is euro)
-    /// must store rate `1.0` and `rate_date` equal to its own `expense_date`.
-    #[test]
-    #[serial_test::serial]
-    fn add_row_stores_identity_rate_for_the_reference_currency() {
-        let _temp = with_temp_data_home();
-        let expense_date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-
-        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
-        de.add_row(
-            "Rent",
-            4,
-            1_000.0,
-            Some("Housing"),
-            "EUR",
-            Some("Rent"),
-            1.0,
-            expense_date,
-        )
-        .expect("add row");
-
-        assert_eq!(
-            de.expense_df
-                .column("expense_in_ref_currency")
-                .unwrap()
-                .f64()
-                .unwrap()
-                .get(0),
-            Some(1_000.0)
-        );
-        assert_eq!(
-            de.expense_df
-                .column("fx_rate")
-                .unwrap()
-                .f64()
-                .unwrap()
-                .get(0),
-            Some(1.0)
-        );
-        assert_eq!(
-            date_col_to_vec(&de.expense_df, "rate_date").unwrap(),
-            vec![expense_date]
-        );
-    }
-
-    /// Loading a parquet file written before fx tracking existed (no
-    /// `fx_rate`/`rate_date` columns) must backfill `fx_rate` to `1.0` and
-    /// `rate_date` to each row's own `expense_date`, without touching
-    /// `expense_in_ref_currency` (every pre-migration row is already euro).
-    #[test]
-    #[serial_test::serial]
-    fn load_migrates_a_file_missing_fx_columns() {
+    fn load_drops_stale_fx_columns_but_keeps_facts() {
         let _temp = with_temp_data_home();
         let path = get_monthly_parquet_path(2026, 9).expect("monthly parquet path");
         std::fs::create_dir_all(path.parent().unwrap()).expect("create year dir");
 
-        // Build a pre-migration file by hand: the canonical schema minus
-        // `fx_rate` and `rate_date`.
         let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
         let pre_migration = DataFrame::new_infer_height(vec![
             Column::new("expense_name".into(), &["Old Rent"]),
@@ -2426,126 +2072,135 @@ mod tests {
             Column::new("expense_amount".into(), &[1_200.0]),
             Column::new("currency".into(), &["EUR"]),
             Column::new("expense_in_ref_currency".into(), &[1_200.0]),
+            Column::new("fx_rate".into(), &[1.0]),
+            date_series("rate_date", &[date]).into(),
             Column::new("primary_category".into(), &["Housing"]),
             Column::new("secondary_category".into(), &["Rent"]),
         ])
-        .expect("build pre-migration frame");
+        .expect("build a file written under the old schema");
         write_parquet(&pre_migration, &path).expect("write pre-migration file");
 
-        let de = DetailedExpenses::new(2026, 9).expect("load and migrate");
+        let de = DetailedExpenses::new(2026, 9).expect("load and drop stale columns");
 
+        for stale_column in ["expense_in_ref_currency", "fx_rate", "rate_date"] {
+            assert!(
+                !has_column(&de.expense_df, stale_column),
+                "'{stale_column}' must be dropped on load"
+            );
+        }
         assert_eq!(
             de.expense_df
-                .column("fx_rate")
+                .column("expense_amount")
                 .unwrap()
                 .f64()
                 .unwrap()
                 .get(0),
-            Some(1.0)
+            Some(1_200.0),
+            "the stored amount must survive dropping the stale columns"
         );
         assert_eq!(
-            date_col_to_vec(&de.expense_df, "rate_date").unwrap(),
-            vec![date]
-        );
-        // The pre-existing amount must survive the migration unchanged.
-        assert_eq!(
-            de.expense_df
-                .column("expense_in_ref_currency")
-                .unwrap()
-                .f64()
-                .unwrap()
-                .get(0),
-            Some(1_200.0)
+            str_col_to_vec(&de.expense_df, "currency").unwrap(),
+            vec!["EUR"]
         );
     }
 
-    /// A row whose `rate_date` already equals its `expense_date` is never a
-    /// stale-rate candidate (the common case, and the terminal state every
-    /// weekend expense reaches).
+    /// `resolve_fact` must report rate `1.0` for a reference-currency row
+    /// without ever looking `rates` up, so an empty rate table is enough.
     #[test]
-    #[serial_test::serial]
-    fn stale_rate_candidates_excludes_rows_already_on_their_own_date() {
-        let _temp = with_temp_data_home();
-        let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-
-        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
-        de.add_row(
-            "Rent",
-            4,
-            1_000.0,
-            Some("Housing"),
-            "EUR",
-            Some("Rent"),
-            1.0,
-            date,
-        )
-        .expect("add row");
-
-        assert!(de.stale_rate_candidates().unwrap().is_empty());
-    }
-
-    /// `apply_refreshed_rates` must recompute `expense_in_ref_currency` from
-    /// the row's existing `expense_amount` and overwrite exactly the targeted
-    /// row's `fx_rate`/`rate_date`, leaving other rows untouched.
-    #[test]
-    #[serial_test::serial]
-    fn apply_refreshed_rates_updates_only_the_targeted_row() {
-        let _temp = with_temp_data_home();
-        let old_date = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    fn resolve_fact_identity_for_reference_currency() {
         let expense_date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let fact = ExpenseFact {
+            expense_date,
+            currency: "EUR".to_string(),
+            expense_amount: 100.0,
+            primary_category: "Housing".to_string(),
+            secondary_category: "Rent".to_string(),
+        };
 
-        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
-        de.add_row(
-            "Untouched",
-            2,
-            50.0,
-            Some("Groceries"),
-            "EUR",
-            Some("Othergroceries"),
-            1.0,
-            NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(),
-        )
-        .expect("add untouched row");
-        de.add_row(
-            "Stale",
-            4,
-            100.0,
-            Some("Groceries"),
-            "USD",
-            Some("Othergroceries"),
-            0.9,
-            old_date,
-        )
-        .expect("add stale row");
+        let (rate, rate_date) =
+            resolve_fact(&fact, "EUR", &std::collections::HashMap::new()).unwrap();
+        assert_eq!(rate, 1.0);
+        assert_eq!(rate_date, expense_date);
+    }
 
-        let updated = de
-            .apply_refreshed_rates(&[(1, 0.8, expense_date)])
-            .expect("apply refresh");
-        assert_eq!(updated, 1);
-
-        assert_eq!(
-            de.expense_df
-                .column("expense_in_ref_currency")
-                .unwrap()
-                .f64()
-                .unwrap()
-                .get(0),
-            Some(50.0),
-            "row 0 must be untouched"
+    /// `resolve_fact` must report exactly the rate and date resolved for the
+    /// fact's own `expense_date`, regardless of what "today" is: the caller
+    /// (an async handler) already did the resolution, so this is a pure map
+    /// lookup with no room for a different date to leak in.
+    #[test]
+    fn resolve_fact_uses_the_pre_resolved_rate_for_its_own_date() {
+        let expense_date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let published_date = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let fact = ExpenseFact {
+            expense_date,
+            currency: "usd".to_string(),
+            expense_amount: 100.0,
+            primary_category: "Groceries".to_string(),
+            secondary_category: "OtherGroceries".to_string(),
+        };
+        let mut rates = std::collections::HashMap::new();
+        rates.insert(
+            (expense_date, "USD".to_string()),
+            crate::fx::ResolvedRate {
+                rate: 0.86,
+                rate_date: Some(published_date),
+            },
         );
+
+        let (rate, rate_date) = resolve_fact(&fact, "EUR", &rates).unwrap();
+        assert_eq!(rate, 0.86);
+        assert_eq!(rate_date, published_date);
+    }
+
+    /// A currency/date pair missing from `rates` is an error, not a silent
+    /// `1.0`: that silent fallback is exactly the bug this feature removes.
+    #[test]
+    fn resolve_fact_errors_when_the_pair_was_not_resolved() {
+        let fact = ExpenseFact {
+            expense_date: NaiveDate::from_ymd_opt(2026, 9, 4).unwrap(),
+            currency: "USD".to_string(),
+            expense_amount: 100.0,
+            primary_category: "Groceries".to_string(),
+            secondary_category: "OtherGroceries".to_string(),
+        };
+
+        let err = resolve_fact(&fact, "EUR", &std::collections::HashMap::new()).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    /// `distinct_rate_keys` must dedupe repeated `(date, currency)` pairs and
+    /// exclude the reference currency entirely, since that case never needs
+    /// a lookup.
+    #[test]
+    fn distinct_rate_keys_dedupes_and_excludes_the_reference_currency() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let facts = vec![
+            ExpenseFact {
+                expense_date: date,
+                currency: "usd".to_string(),
+                expense_amount: 10.0,
+                primary_category: String::new(),
+                secondary_category: String::new(),
+            },
+            ExpenseFact {
+                expense_date: date,
+                currency: "USD".to_string(),
+                expense_amount: 20.0,
+                primary_category: String::new(),
+                secondary_category: String::new(),
+            },
+            ExpenseFact {
+                expense_date: date,
+                currency: "EUR".to_string(),
+                expense_amount: 30.0,
+                primary_category: String::new(),
+                secondary_category: String::new(),
+            },
+        ];
+
         assert_eq!(
-            de.expense_df
-                .column("expense_in_ref_currency")
-                .unwrap()
-                .f64()
-                .unwrap()
-                .get(1),
-            Some(80.0),
-            "row 1 must use the new rate against its existing amount"
-        );
-        assert_eq!(
-            date_col_to_vec(&de.expense_df, "rate_date").unwrap(),
-            vec![NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(), expense_date]
+            distinct_rate_keys(&facts, "eur"),
+            vec![(date, "USD".to_string())]
         );
     }
 }

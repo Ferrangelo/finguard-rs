@@ -29,9 +29,7 @@ use finguard_rs_backend::df_operations::{
     Cashflow, CreditsDebts, DetailedExpenses, InvestmentHoldings, Liquidity, RecurringExpenses,
 };
 use finguard_rs_backend::fx;
-use finguard_rs_backend::paths::{PRIMARIES_FILENAME, get_year_summary_path};
 use finguard_rs_backend::plots;
-use polars::prelude::SerReader;
 
 mod http_error;
 use http_error::AppError;
@@ -58,12 +56,12 @@ pub struct ExpenseJson {
     pub currency: String,
     pub primary: String,
     pub secondary: String,
-    /// Multiplier applied to `amount` to get `expense_in_ref_currency`
-    /// (always 1.0 when `currency` already is the reference currency).
-    /// Ignored on write (`#[serde(default)]` so a request built against the
-    /// old contract, without this field, still deserializes): the server
-    /// always resolves this itself from `currency` and the effective
-    /// `expense_date`.
+    /// Multiplier applied to `amount` to get the reference-currency amount
+    /// (always 1.0 when `currency` already is the reference currency). This
+    /// is derived at read time, not stored: the server always resolves it
+    /// itself from `currency` and the effective `expense_date`. Ignored on
+    /// write (`#[serde(default)]` so a request built against the old
+    /// contract, without this field, still deserializes).
     #[serde(default)]
     pub fx_rate: f64,
     /// The date `fx_rate` was published for, as `"YYYY-MM-DD"`. Ignored on
@@ -265,14 +263,6 @@ pub struct ApplyRecurringPayload {
 }
 
 #[derive(Deserialize, Debug)]
-pub struct RefreshRatesPayload {
-    pub year: i32,
-    /// Refreshes every month of `year` when omitted, matching
-    /// [`GetExpensesQuery::month`]'s convention.
-    pub month: Option<u32>,
-}
-
-#[derive(Deserialize, Debug)]
 pub struct AddRecurringPayload {
     pub year: i32,
     pub name: String,
@@ -331,14 +321,6 @@ pub struct SetCreditDebtCellPayload {
 // Helper Functions
 // ======================================================================
 
-/// Read a parquet file eagerly. Returns an error if `path` cannot be opened or
-/// does not contain a valid parquet stream; callers are expected to check
-/// [`std::path::Path::exists`] first when a missing file is a normal case.
-fn read_parquet(path: &std::path::Path) -> finguard_rs_backend::Result<polars::prelude::DataFrame> {
-    let file = std::fs::File::open(path)?;
-    Ok(polars::prelude::ParquetReader::new(file).finish()?)
-}
-
 /// Read a required string column, propagating any error (missing column, wrong
 /// dtype) to the caller. Nulls become `""`. Use this for columns the caller
 /// cannot proceed without.
@@ -379,27 +361,6 @@ fn column_f64(df: &polars::prelude::DataFrame, name: &str) -> Vec<f64> {
     }
 }
 
-/// Read a numeric column as `f64`, casting if necessary, defaulting a null
-/// cell to `default` instead of the `0.0` [`column_f64`] uses. Same lenient
-/// fallback as [`column_f64`] for a missing column or non-numeric dtype
-/// (empty `Vec`).
-///
-/// Built for the `fx_rate` column: `0.0` is not a safe stand-in for "no rate
-/// resolved here", since multiplying an amount by it would silently zero out
-/// money instead of leaving it unconverted. No write path leaves `fx_rate`
-/// null today, but `1.0` (the value the migration backfills for a pre-FX row)
-/// is the safe default if one ever did.
-fn column_f64_or(df: &polars::prelude::DataFrame, name: &str, default: f64) -> Vec<f64> {
-    let Ok(col) = df.column(name) else {
-        return Vec::new();
-    };
-    let casted = col.cast(&polars::prelude::DataType::Float64);
-    match casted.as_ref().unwrap_or(col).f64() {
-        Ok(s) => s.iter().map(|o| o.unwrap_or(default)).collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// Read a numeric column as `i64`, casting if necessary. Same lenient
 /// fallbacks as [`column_f64`] (empty `Vec` if the column is missing or not
 /// numeric, `0` for nulls).
@@ -432,31 +393,6 @@ fn column_dates_day(df: &polars::prelude::DataFrame, name: &str) -> Vec<i32> {
                 .map(|o| match o {
                     Some(days) => (epoch + chrono::Duration::days(days as i64)).day() as i32,
                     None => 0,
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Read a `Date` column and format each value as `"YYYY-MM-DD"`. Same lenient
-/// fallbacks as [`column_f64`] (empty `Vec` if the column is missing or not
-/// date-castable, the Unix epoch's date for nulls).
-fn column_dates_iso(df: &polars::prelude::DataFrame, name: &str) -> Vec<String> {
-    let Ok(col) = df.column(name) else {
-        return Vec::new();
-    };
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-    match col.cast(&polars::prelude::DataType::Int32) {
-        Ok(c) => match c.i32() {
-            Ok(s) => s
-                .iter()
-                .map(|o| {
-                    let days = o.unwrap_or(0);
-                    (epoch + chrono::Duration::days(days as i64))
-                        .format("%Y-%m-%d")
-                        .to_string()
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -594,7 +530,12 @@ async fn update_currency_settings_handler(
 async fn get_expenses_handler(
     Query(q): Query<GetExpensesQuery>,
 ) -> Result<Json<Vec<ExpenseJson>>, AppError> {
-    let mut all = Vec::new();
+    // Each returned row's fixed fields, paired with the `ExpenseFact` needed
+    // to resolve its reference-currency rate below. `fx_rate`/`rate_date`
+    // are filled in once every row is collected, so distinct `(date,
+    // currency)` pairs across the whole response can be resolved once each
+    // instead of once per row (see `df_operations::distinct_rate_keys`).
+    let mut rows: Vec<(ExpenseJson, finguard_rs_backend::df_operations::ExpenseFact)> = Vec::new();
     let months = if let Some(m) = q.month {
         vec![m]
     } else {
@@ -617,26 +558,58 @@ async fn get_expenses_handler(
         let currencies = column_strings(&filtered_df, "currency");
         let primaries = column_strings(&filtered_df, "primary_category");
         let secondaries = column_strings(&filtered_df, "secondary_category");
-        // A null `fx_rate` defaults to 1.0, not `column_f64`'s usual 0.0: see
-        // `column_f64_or`.
-        let fx_rates = column_f64_or(&filtered_df, "fx_rate", 1.0);
-        let rate_dates = column_dates_iso(&filtered_df, "rate_date");
 
         for fi in 0..filtered_df.height() {
-            all.push(ExpenseJson {
-                id: indices.get(fi).copied().unwrap_or(0).to_string(),
-                year: q.year,
-                month: m,
-                day: days.get(fi).copied().unwrap_or(1) as u32,
-                name: names.get(fi).cloned().unwrap_or_default(),
-                amount: amounts.get(fi).copied().unwrap_or(0.0),
-                currency: currencies.get(fi).cloned().unwrap_or_default(),
-                primary: primaries.get(fi).cloned().unwrap_or_default(),
-                secondary: secondaries.get(fi).cloned().unwrap_or_default(),
-                fx_rate: fx_rates.get(fi).copied().unwrap_or(1.0),
-                rate_date: rate_dates.get(fi).cloned().unwrap_or_default(),
-            });
+            let day = days.get(fi).copied().unwrap_or(1) as u32;
+            let Some(expense_date) = chrono::NaiveDate::from_ymd_opt(q.year, m, day) else {
+                continue;
+            };
+            let amount = amounts.get(fi).copied().unwrap_or(0.0);
+            let currency = currencies.get(fi).cloned().unwrap_or_default();
+            let primary = primaries.get(fi).cloned().unwrap_or_default();
+            let secondary = secondaries.get(fi).cloned().unwrap_or_default();
+
+            rows.push((
+                ExpenseJson {
+                    id: indices.get(fi).copied().unwrap_or(0).to_string(),
+                    year: q.year,
+                    month: m,
+                    day,
+                    name: names.get(fi).cloned().unwrap_or_default(),
+                    amount,
+                    currency: currency.clone(),
+                    primary: primary.clone(),
+                    secondary: secondary.clone(),
+                    fx_rate: 0.0,
+                    rate_date: String::new(),
+                },
+                finguard_rs_backend::df_operations::ExpenseFact {
+                    expense_date,
+                    currency,
+                    expense_amount: amount,
+                    primary_category: primary,
+                    secondary_category: secondary,
+                },
+            ));
         }
+    }
+
+    let reference_currency = config::get_currency_settings()?.reference_currency;
+    let facts: Vec<_> = rows.iter().map(|(_, fact)| fact.clone()).collect();
+    let keys = finguard_rs_backend::df_operations::distinct_rate_keys(&facts, &reference_currency);
+    let mut rates = std::collections::HashMap::with_capacity(keys.len());
+    for (date, currency) in keys {
+        let resolved = fx::rate_on(date, &currency).await?;
+        rates.insert((date, currency), resolved);
+    }
+
+    let mut all = Vec::with_capacity(rows.len());
+    for (mut expense, fact) in rows {
+        let (rate, rate_date) =
+            finguard_rs_backend::df_operations::resolve_fact(&fact, &reference_currency, &rates)?;
+        expense.fx_rate = rate;
+        expense.rate_date = rate_date.format("%Y-%m-%d").to_string();
+        all.push(expense);
     }
 
     Ok(Json(all))
@@ -649,13 +622,15 @@ async fn get_expenses_handler(
 /// carries the new row's index as its `id`. A non-empty `id` means "update
 /// the row at that index"; it must parse as a `u32` or this returns
 /// [`Error::InvalidArgument`] (`400`). Either path rewrites the month's
-/// parquet file and recomputes the primaries/secondaries summary tables for
-/// the year.
+/// parquet file; only `expense_amount`/`currency` and the other facts are
+/// stored, since the reference-currency amount is derived at read time (see
+/// [`get_expenses_handler`]) rather than stored here.
 ///
-/// `payload.fx_rate`/`payload.rate_date` are ignored: the rate is always
-/// resolved fresh here, via [`fx::rate_on`], for `payload.currency` on the
-/// expense's own date (`payload.year`/`payload.month`/`payload.day`), not for
-/// today. The response carries the resolved values back.
+/// `payload.fx_rate`/`payload.rate_date` are ignored on write: the response
+/// still reports the rate resolved fresh here, via [`fx::rate_on`], for
+/// `payload.currency` on the expense's own date
+/// (`payload.year`/`payload.month`/`payload.day`), not for today, purely as
+/// provenance for the client that just saved the row.
 async fn upsert_expense_handler(
     Json(payload): Json<ExpenseJson>,
 ) -> Result<Json<ExpenseJson>, AppError> {
@@ -671,7 +646,7 @@ async fn upsert_expense_handler(
     let resolved = fx::rate_on(expense_date, &payload.currency).await?;
     // `rate_date` is `None` only for the reference-currency identity case
     // (see `fx::ResolvedRate`), which has no external publication date to
-    // report; the expense's own date is the correct value to store there.
+    // report; the expense's own date is the correct value to report there.
     let rate_date = resolved.rate_date.unwrap_or(expense_date);
 
     let mut de = DetailedExpenses::new(year, month)?;
@@ -684,8 +659,6 @@ async fn upsert_expense_handler(
             Some(&payload.primary),
             &payload.currency,
             Some(&payload.secondary),
-            resolved.rate,
-            rate_date,
         )?;
 
         let new_id = (de.expense_df.height() as i32 - 1).to_string();
@@ -707,8 +680,6 @@ async fn upsert_expense_handler(
             Some(&payload.currency),
             Some(&payload.primary),
             Some(&payload.secondary),
-            resolved.rate,
-            rate_date,
         )?;
         let mut response = payload;
         response.fx_rate = resolved.rate;
@@ -819,10 +790,6 @@ async fn delete_recurring_handler(
 /// templates that already have a matching row (same name and day-of-month) so
 /// the endpoint is safe to call more than once for the same month. Returns
 /// the number of rows actually added.
-///
-/// Each inserted row's FX rate is resolved via [`fx::rate_on`] for the date
-/// it actually lands on (`payload.year`/`payload.month`/template day), not
-/// for today.
 async fn apply_recurring_handler(
     Json(payload): Json<ApplyRecurringPayload>,
 ) -> Result<Json<u32>, AppError> {
@@ -830,69 +797,8 @@ async fn apply_recurring_handler(
     let mut de = DetailedExpenses::new(payload.year, payload.month)?;
 
     let pending = rec.pending_for_month(&de)?;
-    let mut resolved = Vec::with_capacity(pending.len());
-    for row in pending {
-        let date = chrono::NaiveDate::from_ymd_opt(payload.year, payload.month, row.expense_day)
-            .ok_or_else(|| {
-                finguard_rs_backend::Error::InvalidArgument(format!(
-                    "invalid date {}-{:02}-{:02}",
-                    payload.year, payload.month, row.expense_day
-                ))
-            })?;
-        let rate = fx::rate_on(date, &row.currency).await?;
-        let rate_date = rate.rate_date.unwrap_or(date);
-        resolved.push((row, rate.rate, rate_date));
-    }
-
-    let added_names = rec.insert_resolved(&mut de, &resolved)?;
+    let added_names = rec.insert_resolved(&mut de, &pending)?;
     Ok(Json(added_names.len() as u32))
-}
-
-/// `POST /api/expenses/refresh-rates`: re-resolve the FX rate for every row
-/// in `payload.year` (or just `payload.month`, if given) whose stored
-/// `rate_date` predates its `expense_date`, and rewrite only the ones whose
-/// re-resolved `rate_date` is now strictly later than what is stored.
-/// Returns the number of rows actually changed.
-///
-/// Safe to call repeatedly: a row already resolved on its own date (which
-/// includes every weekend expense, since the ECB never later republishes an
-/// earlier date) is never touched again, so a second call after one that
-/// changed nothing new also changes nothing.
-async fn refresh_expense_rates_handler(
-    Json(payload): Json<RefreshRatesPayload>,
-) -> Result<Json<u32>, AppError> {
-    let months: Vec<u32> = match payload.month {
-        Some(m) => vec![m],
-        None => (1..=12).collect(),
-    };
-
-    let mut total_updated = 0u32;
-    for m in months {
-        let mut de = match DetailedExpenses::new(payload.year, m) {
-            Ok(de) => de,
-            Err(_) => continue,
-        };
-
-        let candidates = de.stale_rate_candidates()?;
-        if candidates.is_empty() {
-            continue;
-        }
-
-        let mut updates = Vec::with_capacity(candidates.len());
-        for c in candidates {
-            let resolved = fx::rate_on(c.expense_date, &c.currency).await?;
-            let Some(new_rate_date) = resolved.rate_date else {
-                continue;
-            };
-            if new_rate_date > c.stored_rate_date {
-                updates.push((c.row_index, resolved.rate, new_rate_date));
-            }
-        }
-
-        total_updated += de.apply_refreshed_rates(&updates)?;
-    }
-
-    Ok(Json(total_updated))
 }
 
 /// `GET /api/mappings`: list every stored expense-name-to-category mapping.
@@ -975,20 +881,64 @@ async fn add_category_handler(
     }))
 }
 
+/// Return the cumulative reference-currency total for every category of
+/// `kind`, summed across every stored monthly detailed-expense file, with
+/// each row converted at its own date's rate. `kind` must be `"primary"` or
+/// `"secondary"`.
+///
+/// Reads raw facts (see [`finguard_rs_backend::df_operations::all_expense_facts`])
+/// rather than the persisted `primaries.parquet`/`secondaries.parquet`
+/// summaries, so the result always reflects the *current* reference
+/// currency: those files were denominated in whatever the reference
+/// currency was when each was last written, which goes stale the moment a
+/// user changes it (see [`upsert_expense_handler`]'s module-level rationale
+/// for the same fix one level down, on a single row).
+async fn category_totals_across_all_years(
+    kind: &str,
+) -> Result<std::collections::HashMap<String, f64>, AppError> {
+    if kind != "primary" && kind != "secondary" {
+        return Err(finguard_rs_backend::Error::InvalidArgument(format!(
+            "kind must be 'primary' or 'secondary', got '{kind}'"
+        ))
+        .into());
+    }
+
+    let facts = finguard_rs_backend::df_operations::all_expense_facts()?;
+    let reference_currency = config::get_currency_settings()?.reference_currency;
+    let keys = finguard_rs_backend::df_operations::distinct_rate_keys(&facts, &reference_currency);
+    let mut rates = std::collections::HashMap::with_capacity(keys.len());
+    for (date, currency) in keys {
+        let resolved = fx::rate_on(date, &currency).await?;
+        rates.insert((date, currency), resolved);
+    }
+
+    let mut totals = std::collections::HashMap::new();
+    for fact in &facts {
+        let category = if kind == "primary" {
+            &fact.primary_category
+        } else {
+            &fact.secondary_category
+        };
+        let (rate, _) =
+            finguard_rs_backend::df_operations::resolve_fact(fact, &reference_currency, &rates)?;
+        *totals.entry(category.clone()).or_insert(0.0) += fact.expense_amount * rate;
+    }
+    Ok(totals)
+}
+
 /// `DELETE /api/categories/:kind/:name`: unregister `name` from `kind`'s
-/// known-category list and strip its row from every year's primaries or
-/// secondaries summary file.
+/// known-category list and strip its row from every year's (now-unmaintained,
+/// see [`category_totals_across_all_years`]) primaries or secondaries summary
+/// file.
 ///
 /// Refuses to delete (returns [`Error::InvalidArgument`], `400`) while the
 /// category still has a nonzero total across all years (checked with a
 /// `1e-9` tolerance for float rounding), so a category cannot be removed out
-/// from under existing expenses. This deletion of summary rows across every
-/// year is irreversible; it does not touch the underlying monthly detailed
-/// expense rows, only the cached per-year totals.
+/// from under existing expenses.
 async fn delete_category_handler(
     Path((kind, name)): Path<(String, String)>,
 ) -> Result<Json<CategoriesJson>, AppError> {
-    let totals = finguard_rs_backend::df_operations::get_category_totals_across_all_years(&kind)?;
+    let totals = category_totals_across_all_years(&kind).await?;
     let total = totals.get(&name).copied().unwrap_or(0.0);
     if total.abs() >= 1e-9 {
         return Err(finguard_rs_backend::Error::InvalidArgument(format!(
@@ -1008,19 +958,14 @@ async fn delete_category_handler(
     }))
 }
 
-/// `GET /api/categories/totals?kind=`: return the cumulative
-/// `expense_in_ref_currency` total per category of `kind`, summed across every
-/// year's summary file. Backs [`delete_category_handler`]'s "still in use"
-/// check on the frontend before a user attempts a delete.
+/// `GET /api/categories/totals?kind=`: return the cumulative reference-
+/// currency total per category of `kind` (see
+/// [`category_totals_across_all_years`]). Backs [`delete_category_handler`]'s
+/// "still in use" check on the frontend before a user attempts a delete.
 async fn get_category_totals_handler(
     Query(q): Query<KindQuery>,
 ) -> Result<Json<std::collections::HashMap<String, f64>>, AppError> {
-    let totals = finguard_rs_backend::df_operations::get_category_totals_across_all_years(&q.kind)?;
-    let mut hm = std::collections::HashMap::new();
-    for (k, v) in totals {
-        hm.insert(k, v);
-    }
-    Ok(Json(hm))
+    Ok(Json(category_totals_across_all_years(&q.kind).await?))
 }
 
 /// `GET /api/cashflow/income`: return `q.year`'s manually entered income
@@ -1066,38 +1011,38 @@ async fn set_income_cell_handler(
 }
 
 /// `GET /api/cashflow/spending`: return `q.year`'s per-category spending as
-/// `{ month => { category => amount } }`, read from the `Total`-excluded rows
-/// of the year's `primaries.parquet` summary file for each `YYYY-MM` column
-/// present.
+/// `{ month => { category => amount } }`, computed at read time from
+/// `q.year`'s monthly detailed-expense files (each row converted at its own
+/// date's rate), rather than the persisted `primaries.parquet` summary,
+/// which would report whatever the reference currency was when it was last
+/// written (see [`category_totals_across_all_years`] for the same fix
+/// applied to the all-years total).
 ///
-/// Every month is present in the result even when `primaries.parquet` does
-/// not exist yet or has no column for that month; such months map to an
-/// empty category map rather than being omitted or erroring.
+/// Every month is present in the result even when it has no expense rows;
+/// such months map to an empty category map rather than being omitted.
 async fn get_monthly_spending_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<std::collections::HashMap<u32, std::collections::HashMap<String, f64>>>, AppError>
 {
-    let primaries_path = get_year_summary_path(q.year, PRIMARIES_FILENAME)?;
-    let mut out = std::collections::HashMap::new();
-    for m in 1..=12 {
-        out.insert(m, std::collections::HashMap::new());
+    let facts = finguard_rs_backend::df_operations::expense_facts_for_year(q.year)?;
+    let reference_currency = config::get_currency_settings()?.reference_currency;
+    let keys = finguard_rs_backend::df_operations::distinct_rate_keys(&facts, &reference_currency);
+    let mut rates = std::collections::HashMap::with_capacity(keys.len());
+    for (date, currency) in keys {
+        let resolved = fx::rate_on(date, &currency).await?;
+        rates.insert((date, currency), resolved);
     }
 
-    if primaries_path.exists() {
-        let df = read_parquet(&primaries_path)?;
-        let categories = column_strings(&df, "primary_category");
-        for m in 1..=12 {
-            let col_name = format!("{}-{:02}", q.year, m);
-            if df.get_column_names().iter().any(|c| c.as_str() == col_name) {
-                let values = column_f64(&df, &col_name);
-                let m_map = out.get_mut(&m).unwrap();
-                for (i, cat) in categories.iter().enumerate() {
-                    if cat != "Total" {
-                        m_map.insert(cat.clone(), values.get(i).copied().unwrap_or(0.0));
-                    }
-                }
-            }
-        }
+    let mut out = std::collections::HashMap::new();
+    for m in 1..=12u32 {
+        out.insert(m, std::collections::HashMap::new());
+    }
+    for fact in &facts {
+        let (rate, _) =
+            finguard_rs_backend::df_operations::resolve_fact(fact, &reference_currency, &rates)?;
+        let month = chrono::Datelike::month(&fact.expense_date);
+        let m_map = out.entry(month).or_default();
+        *m_map.entry(fact.primary_category.clone()).or_insert(0.0) += fact.expense_amount * rate;
     }
     Ok(Json(out))
 }
@@ -1771,10 +1716,6 @@ async fn main() {
             get(get_expenses_handler).post(upsert_expense_handler),
         )
         .route("/api/expenses/:id", delete(delete_expense_handler))
-        .route(
-            "/api/expenses/refresh-rates",
-            post(refresh_expense_rates_handler),
-        )
         // Recurring Templates
         .route(
             "/api/recurring",
@@ -1891,148 +1832,184 @@ mod tests {
         std::fs::write(path, body).expect("seed fx cache");
     }
 
-    /// Registering both `/api/expenses/:id` (a dynamic segment) and
-    /// `/api/expenses/refresh-rates` (a literal segment) at the same depth
-    /// must not panic when the router is built: axum's router (via matchit)
-    /// resolves a literal match ahead of a dynamic parameter, so the two
-    /// coexist. This is a regression guard for that route table shape.
-    #[test]
-    fn expenses_id_and_refresh_rates_routes_coexist() {
-        let _app: Router = Router::new()
-            .route("/api/expenses/:id", delete(delete_expense_handler))
-            .route(
-                "/api/expenses/refresh-rates",
-                post(refresh_expense_rates_handler),
-            );
-    }
-
-    /// A row entered before its real date's rate was published (e.g. a
-    /// same-day expense entered when only an older cached rate existed)
-    /// resolves at entry time to that older date. Once the real date's rate
-    /// is later cached, refreshing must pick it up and rewrite the row.
+    /// `POST /api/expenses` for a reference-currency row must report rate
+    /// `1.0` in the response, and must succeed offline with nothing cached:
+    /// the identity case needs no lookup at all.
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
-    async fn refresh_updates_a_superseded_future_dated_row() {
+    async fn upsert_expense_reports_identity_rate_for_reference_currency() {
         let _temp = with_temp_env_offline();
-        // At "entry time" only 2026-09-01 is cached; 2026-09-04 (the
-        // expense's real date) falls back to it.
-        seed_fx_cache(&[("2026-09-01", &[("USD", 1.10)])]);
 
-        let entry_date = chrono::NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
-        let entry_resolved = fx::rate_on(entry_date, "USD")
+        let response = upsert_expense_handler(Json(ExpenseJson {
+            id: String::new(),
+            year: 2026,
+            month: 9,
+            day: 4,
+            name: "Rent".to_string(),
+            amount: 1_000.0,
+            currency: "EUR".to_string(),
+            primary: "Housing".to_string(),
+            secondary: "Rent".to_string(),
+            fx_rate: 0.0,
+            rate_date: String::new(),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("upsert succeeds: {err}"));
+
+        assert_eq!(response.0.fx_rate, 1.0);
+        assert_eq!(response.0.rate_date, "2026-09-04");
+    }
+
+    /// `POST /api/expenses` for a foreign-currency row must report the rate
+    /// and date resolved for the expense's *own* date, not for today: this
+    /// pins the row-level fix `main.rs` module docs describe, independent
+    /// of whatever the real current date happens to be when the test runs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn upsert_expense_reports_the_rate_resolved_for_its_own_date() {
+        let _temp = with_temp_env_offline();
+        seed_fx_cache(&[("2026-09-04", &[("USD", 1.20)])]);
+
+        let response = upsert_expense_handler(Json(ExpenseJson {
+            id: String::new(),
+            year: 2026,
+            month: 9,
+            day: 4,
+            name: "Groceries".to_string(),
+            amount: 100.0,
+            currency: "USD".to_string(),
+            primary: "Groceries".to_string(),
+            secondary: "OtherGroceries".to_string(),
+            fx_rate: 0.0,
+            rate_date: String::new(),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("upsert succeeds: {err}"));
+
+        assert_eq!(response.0.fx_rate, 1.0 / 1.20);
+        assert_eq!(response.0.rate_date, "2026-09-04");
+    }
+
+    /// `GET /api/expenses` must resolve every row's rate itself at read time
+    /// (no `fx_rate`/`fx_date` is stored), reusing the same rate for two
+    /// rows sharing a `(date, currency)` pair.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn get_expenses_resolves_rates_at_read_time() {
+        let _temp = with_temp_env_offline();
+        seed_fx_cache(&[("2026-09-04", &[("USD", 1.20)])]);
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row("Rent", 4, 1_000.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add EUR row");
+        de.add_row(
+            "Groceries",
+            4,
+            100.0,
+            Some("Groceries"),
+            "USD",
+            Some("OtherGroceries"),
+        )
+        .expect("add USD row");
+
+        let expenses = get_expenses_handler(Query(GetExpensesQuery {
+            year: 2026,
+            month: Some(9),
+            name: None,
+            category: None,
+            min: None,
+            max: None,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("get succeeds: {err}"))
+        .0;
+
+        let eur_row = expenses.iter().find(|e| e.currency == "EUR").unwrap();
+        assert_eq!(eur_row.fx_rate, 1.0);
+        let usd_row = expenses.iter().find(|e| e.currency == "USD").unwrap();
+        assert_eq!(usd_row.fx_rate, 1.0 / 1.20);
+        assert_eq!(usd_row.rate_date, "2026-09-04");
+    }
+
+    /// Category totals summed across a mix of currencies must weight each
+    /// row by its own date's rate rather than summing raw amounts, so a
+    /// `100` EUR row plus a `100` USD row at `0.80` totals `180`, not `200`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn category_totals_weight_each_row_by_its_own_currency() {
+        let _temp = with_temp_env_offline();
+        seed_fx_cache(&[("2026-09-04", &[("USD", 1.0 / 0.80)])]);
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row("Rent", 4, 100.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add EUR row");
+        de.add_row("Groceries", 4, 100.0, Some("Housing"), "USD", Some("Rent"))
+            .expect("add USD row");
+
+        let totals = category_totals_across_all_years("primary")
             .await
-            .expect("resolve at entry time");
-        let entry_rate_date = entry_resolved
-            .rate_date
-            .expect("USD always has a rate date");
-        assert_eq!(
-            entry_rate_date,
-            chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-            "must fall back to the only cached date"
-        );
+            .unwrap_or_else(|AppError(err)| panic!("category totals succeed: {err}"));
+        assert_eq!(totals.get("Housing").copied(), Some(180.0));
+    }
+
+    /// Changing the reference currency must change the reported category
+    /// total immediately, with no rewrite of any stored expense row: this is
+    /// the entire point of deriving reference-currency amounts at read time
+    /// instead of storing them.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn changing_reference_currency_changes_totals_with_no_data_rewrite() {
+        let _temp = with_temp_env_offline();
+        // EUR -> USD at 1.20, and (for the later GBP switch) EUR -> GBP at 0.85.
+        seed_fx_cache(&[("2026-09-04", &[("USD", 1.20), ("GBP", 0.85)])]);
 
         let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
         de.add_row(
-            "Future Purchase",
+            "Groceries",
             4,
             100.0,
-            Some("Housing"),
-            "USD",
-            Some("Rent"),
-            entry_resolved.rate,
-            entry_rate_date,
+            Some("Groceries"),
+            "EUR",
+            Some("OtherGroceries"),
         )
-        .expect("add row with the entry-time rate");
+        .expect("add EUR row");
+        let stored_amount_before = de
+            .expense_df
+            .column("expense_amount")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .get(0);
 
-        // The real date's rate is later published.
-        seed_fx_cache(&[
-            ("2026-09-01", &[("USD", 1.10)]),
-            ("2026-09-04", &[("USD", 1.20)]),
-        ]);
+        let eur_totals = category_totals_across_all_years("primary")
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("EUR totals succeed: {err}"));
+        assert_eq!(eur_totals.get("Groceries").copied(), Some(100.0));
 
-        let updated = refresh_expense_rates_handler(Json(RefreshRatesPayload {
-            year: 2026,
-            month: Some(9),
-        }))
-        .await
-        // `AppError` does not implement `Debug` (see `http_error.rs`), so
-        // `.expect` cannot be used directly; unwrap through its `Display`.
-        .unwrap_or_else(|AppError(err)| panic!("refresh succeeds: {err}"));
-        assert_eq!(updated.0, 1, "the superseded row must be rewritten");
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "GBP".to_string(),
+            current_month_rate_mode: Default::default(),
+        })
+        .expect("switch reference currency to GBP");
 
+        let gbp_totals = category_totals_across_all_years("primary")
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("GBP totals succeed: {err}"));
+        assert_eq!(gbp_totals.get("Groceries").copied(), Some(85.0));
+
+        // The stored row itself must be byte-for-byte unchanged by the
+        // settings switch: no write happened, only the read-time conversion.
         let reloaded = DetailedExpenses::new(2026, 9).expect("reload detailed expenses");
         assert_eq!(
             reloaded
                 .expense_df
-                .column("rate_date")
+                .column("expense_amount")
                 .unwrap()
-                .cast(&polars::prelude::DataType::Int32)
-                .unwrap()
-                .i32()
+                .f64()
                 .unwrap()
                 .get(0),
-            Some(
-                (chrono::NaiveDate::from_ymd_opt(2026, 9, 4).unwrap()
-                    - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                .num_days() as i32
-            ),
-            "rate_date must move to the newly published date"
+            stored_amount_before
         );
-        let new_rate = column_f64(&reloaded.expense_df, "fx_rate")[0];
-        assert_eq!(new_rate, 1.0 / 1.20);
-        let ref_amount = column_f64(&reloaded.expense_df, "expense_in_ref_currency")[0];
-        assert_eq!(ref_amount, 100.0 * new_rate);
-    }
-
-    /// A weekend expense resolves to the nearest earlier (Friday) rate, which
-    /// is final: the ECB never later republishes an earlier date. Refreshing
-    /// must leave it untouched, and a second refresh must change nothing
-    /// either, proving the endpoint is idempotent.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial_test::serial]
-    async fn refresh_leaves_a_weekend_row_alone_on_a_second_run() {
-        let _temp = with_temp_env_offline();
-        // Only Friday 2026-09-04 is cached; Saturday 2026-09-05 falls back to it.
-        seed_fx_cache(&[("2026-09-04", &[("USD", 1.15)])]);
-
-        let expense_date = chrono::NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
-        let resolved = fx::rate_on(expense_date, "USD")
-            .await
-            .expect("resolve for the weekend expense");
-        let rate_date = resolved.rate_date.expect("USD always has a rate date");
-        assert_eq!(
-            rate_date,
-            chrono::NaiveDate::from_ymd_opt(2026, 9, 4).unwrap()
-        );
-
-        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
-        de.add_row(
-            "Weekend Purchase",
-            5,
-            50.0,
-            Some("Leisure"),
-            "USD",
-            Some("Out"),
-            resolved.rate,
-            rate_date,
-        )
-        .expect("add the weekend row");
-
-        for _ in 0..2 {
-            let updated = refresh_expense_rates_handler(Json(RefreshRatesPayload {
-                year: 2026,
-                month: Some(9),
-            }))
-            .await
-            // `AppError` does not implement `Debug` (see `http_error.rs`), so
-            // `.expect` cannot be used directly; unwrap through its `Display`.
-            .unwrap_or_else(|AppError(err)| panic!("refresh succeeds: {err}"));
-            assert_eq!(updated.0, 0, "a Friday-resolved weekend row is never stale");
-        }
-
-        let reloaded = DetailedExpenses::new(2026, 9).expect("reload detailed expenses");
-        let fx_rate = column_f64(&reloaded.expense_df, "fx_rate")[0];
-        assert_eq!(fx_rate, resolved.rate);
     }
 
     /// `PUT /api/investments/:id` must update the stored currency when the
@@ -2068,27 +2045,6 @@ mod tests {
             str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
             vec!["USD".to_string()]
         );
-    }
-
-    /// A null `fx_rate` cell must default to `1.0`, matching the value the
-    /// pre-FX-migration backfill uses (see `df_operations`'s
-    /// `load_migrates_a_file_missing_fx_columns`), not `column_f64`'s usual
-    /// `0.0`. `0.0` would silently zero out a monetary amount instead of
-    /// leaving it unconverted.
-    #[test]
-    fn column_f64_or_defaults_a_null_cell_to_the_given_default() {
-        use polars::prelude::{Column, DataFrame};
-        let df = DataFrame::new_infer_height(vec![Column::new(
-            "fx_rate".into(),
-            &[Some(1.5), None, Some(2.0)],
-        )])
-        .expect("build a df with a null fx_rate cell");
-
-        assert_eq!(column_f64_or(&df, "fx_rate", 1.0), vec![1.5, 1.0, 2.0]);
-        // `column_f64` itself is untouched: it still maps the null to `0.0`,
-        // which is exactly the value this endpoint must no longer serve for
-        // `fx_rate`.
-        assert_eq!(column_f64(&df, "fx_rate"), vec![1.5, 0.0, 2.0]);
     }
 
     /// `GET` then `PUT` then `GET` again on `/api/settings/currency` must
