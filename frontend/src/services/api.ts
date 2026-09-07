@@ -528,20 +528,6 @@ export async function getNetworthAllocation(
   return apiFetch(`/api/networth/allocation?year=${year}&month=${month}`);
 }
 
-/**
- * POST /api/expenses/refresh-rates. Re-resolves the fx rate for every stale
- * expense in `year` (every month when `month` is omitted) and returns the
- * count of rows actually changed. Safe to call repeatedly: a row already
- * resolved on its own date is never touched again.
- */
-export async function refreshExpenseRates(year: number, month?: number): Promise<number> {
-  return apiFetch("/api/expenses/refresh-rates", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ year, month }),
-  });
-}
-
 // Full and abbreviated month labels, indexed 0 (January) to 11 (December).
 // Backend month numbers are 1-based, so callers index these with `month - 1`.
 export const MONTHS = [

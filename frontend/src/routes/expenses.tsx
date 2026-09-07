@@ -58,6 +58,26 @@ import { useTheme } from "@/context/ThemeContext";
 // - RecurringTab: recurring expense templates and the "apply to this
 //   month" action.
 // - MappingsTab: name-substring-to-category mapping rules.
+
+/** Extracts a readable message from a caught value. A rejected fetch can throw anything, not only an `Error`. */
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback;
+}
+
+/**
+ * This page's one visual treatment for "a request failed", so a genuine
+ * fetch failure never renders as the empty-data state it would otherwise be
+ * indistinguishable from. Every tab below reuses it instead of inventing its
+ * own error styling.
+ */
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+      {message}
+    </div>
+  );
+}
+
 export const Route = createFileRoute("/expenses")({
   head: () => ({ meta: [{ title: "Expenses · Finguard" }] }),
   component: ExpensesPage,
@@ -113,12 +133,21 @@ function DetailedTab() {
   const [editing, setEditing] = useState<Expense | null>(null);
   const [adding, setAdding] = useState(false);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  // Distinct from `rows` staying empty: a fetch failure must not render as
+  // "No expenses match.", since that reads as "this filter has no results",
+  // not "the request failed".
+  const [rowsError, setRowsError] = useState<string | null>(null);
+  // Categories and mappings only feed the filter/form controls, so a
+  // failure here is reported without blocking the rest of the tab.
+  const [supportError, setSupportError] = useState<string | null>(null);
 
   // Reload categories and mappings whenever a mutation elsewhere bumps
   // refreshTick (e.g. adding a category or mapping rule from another tab).
   useEffect(() => {
-    api.getCategories().then(setCats);
-    api.getMappings().then(setMappings);
+    setSupportError(null);
+    Promise.all([api.getCategories().then(setCats), api.getMappings().then(setMappings)]).catch(
+      (err) => setSupportError(errorMessage(err, "Failed to load categories or mappings")),
+    );
   }, [refreshTick]);
 
   // Refetch the row list on every change to year, month, the active
@@ -126,6 +155,7 @@ function DetailedTab() {
   // the backend does not apply that filter at all, rather than filtering
   // on an empty string.
   useEffect(() => {
+    setRowsError(null);
     api
       .getExpenses(year, month, {
         name: filter.name || undefined,
@@ -133,7 +163,8 @@ function DetailedTab() {
         min: filter.min ? Number(filter.min) : undefined,
         max: filter.max ? Number(filter.max) : undefined,
       })
-      .then(setRows);
+      .then(setRows)
+      .catch((err) => setRowsError(errorMessage(err, "Failed to load expenses")));
   }, [year, month, filter, refreshTick]);
 
   // Sort is applied client-side to the already-filtered rows; the backend
@@ -152,26 +183,18 @@ function DetailedTab() {
   // services/types.ts).
   const totalRef = useMemo(() => rows.reduce((s, e) => s + e.amount * e.fx_rate, 0), [rows]);
 
-  const refreshRates = async () => {
-    notify("loading", "Refreshing fx rates…");
-    const n = await api.refreshExpenseRates(year);
-    notify("success", n === 1 ? "Refreshed 1 superseded rate" : `Refreshed ${n} superseded rates`);
-    refresh();
-  };
-
   return (
     <div className="grid gap-5 lg:grid-cols-[1fr_360px]">
+      <div className="space-y-3 lg:col-span-2">
+        {rowsError && <ErrorBanner message={`Could not load expenses: ${rowsError}`} />}
+        {supportError && (
+          <ErrorBanner message={`Could not load categories or mappings: ${supportError}`} />
+        )}
+      </div>
       <GlassCard
         title={`${MONTHS[month - 1]} ${year} · ${rows.length} entries`}
         action={
           <div className="flex items-center gap-3 text-sm">
-            <button
-              onClick={refreshRates}
-              className="text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
-              title={`Re-resolve any ${year} expense whose stored fx rate has been superseded`}
-            >
-              Refresh fx rates
-            </button>
             <span className="text-muted-foreground">Total</span>
             <span className="font-semibold text-gradient">{formatRef(totalRef, refCurrency)}</span>
           </div>
@@ -233,7 +256,7 @@ function DetailedTab() {
               </tr>
             </thead>
             <tbody className="divide-y divide-border/40">
-              {sortedRows.length === 0 && (
+              {sortedRows.length === 0 && !rowsError && (
                 <tr>
                   <td colSpan={8} className="px-3 py-8 text-center text-muted-foreground">
                     No expenses match.
@@ -516,12 +539,20 @@ function SummaryTab() {
   const [selCats, setSelCats] = useState<string[]>([]);
   const { theme } = useTheme();
   const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
+  // Distinct from `yearExpenses` staying empty: a fetch failure must not
+  // render as "No data" for every chart and table below, since that reads
+  // as "nothing was spent this year" rather than "the request failed".
+  const [yearExpensesError, setYearExpensesError] = useState<string | null>(null);
 
   // Loads every expense for the whole year once (not per-month); every
   // derived table and chart below slices this same list client-side
   // instead of making a separate request per view.
   useEffect(() => {
-    api.getExpenses(year).then(setYearExpenses);
+    setYearExpensesError(null);
+    api
+      .getExpenses(year)
+      .then(setYearExpenses)
+      .catch((err) => setYearExpensesError(errorMessage(err, "Failed to load expenses")));
   }, [year, refreshTick]);
 
   const catOf = (e: Expense) => (kind === "primary" ? e.primary : e.secondary) || "Uncategorized";
@@ -646,6 +677,9 @@ function SummaryTab() {
 
   return (
     <div className="space-y-5">
+      {yearExpensesError && (
+        <ErrorBanner message={`Could not load expenses: ${yearExpensesError}`} />
+      )}
       <div className="flex items-center gap-3">
         <span className="text-sm text-muted-foreground">Group by</span>
         <SubTabs
@@ -928,10 +962,25 @@ function RecurringTab() {
     primary: "",
     secondary: "",
   });
+  // Distinct from `items` staying empty: a fetch failure must not render as
+  // "No recurring templates yet.", since that reads as "you have none set
+  // up", not "the request failed".
+  const [itemsError, setItemsError] = useState<string | null>(null);
+  // Categories only feed the add-template form, so a failure here is
+  // reported without blocking the rest of the tab.
+  const [catsError, setCatsError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.getRecurring(year).then(setItems);
-    api.getCategories().then(setCats);
+    setItemsError(null);
+    setCatsError(null);
+    api
+      .getRecurring(year)
+      .then(setItems)
+      .catch((err) => setItemsError(errorMessage(err, "Failed to load recurring templates")));
+    api
+      .getCategories()
+      .then(setCats)
+      .catch((err) => setCatsError(errorMessage(err, "Failed to load categories")));
   }, [refreshTick]);
 
   const submit = async () => {
@@ -968,6 +1017,12 @@ function RecurringTab() {
 
   return (
     <div className="grid gap-5 lg:grid-cols-[1fr_360px]">
+      <div className="space-y-3 lg:col-span-2">
+        {itemsError && (
+          <ErrorBanner message={`Could not load recurring templates: ${itemsError}`} />
+        )}
+        {catsError && <ErrorBanner message={`Could not load categories: ${catsError}`} />}
+      </div>
       <GlassCard
         title={`${items.length} recurring templates`}
         action={
@@ -1016,7 +1071,7 @@ function RecurringTab() {
                   </td>
                 </tr>
               ))}
-              {items.length === 0 && (
+              {items.length === 0 && !itemsError && (
                 <tr>
                   <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
                     No recurring templates yet.
@@ -1101,10 +1156,25 @@ function MappingsTab() {
   const [items, setItems] = useState<MappingRule[]>([]);
   const [cats, setCats] = useState<Categories>({ primary: [], secondary: [] });
   const [form, setForm] = useState({ match: "", primary: "", secondary: "" });
+  // Distinct from `items` staying empty: a fetch failure must not render as
+  // "No mapping rules yet.", since that reads as "you have none set up",
+  // not "the request failed".
+  const [itemsError, setItemsError] = useState<string | null>(null);
+  // Categories only feed the add-rule form, so a failure here is reported
+  // without blocking the rest of the tab.
+  const [catsError, setCatsError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.getMappings().then(setItems);
-    api.getCategories().then(setCats);
+    setItemsError(null);
+    setCatsError(null);
+    api
+      .getMappings()
+      .then(setItems)
+      .catch((err) => setItemsError(errorMessage(err, "Failed to load mapping rules")));
+    api
+      .getCategories()
+      .then(setCats)
+      .catch((err) => setCatsError(errorMessage(err, "Failed to load categories")));
   }, [refreshTick]);
 
   const submit = async () => {
@@ -1124,6 +1194,10 @@ function MappingsTab() {
 
   return (
     <div className="grid gap-5 lg:grid-cols-[1fr_360px]">
+      <div className="space-y-3 lg:col-span-2">
+        {itemsError && <ErrorBanner message={`Could not load mapping rules: ${itemsError}`} />}
+        {catsError && <ErrorBanner message={`Could not load categories: ${catsError}`} />}
+      </div>
       <GlassCard title={`${items.length} mapping rules`}>
         <div className="scrollbar-thin overflow-x-auto">
           <table className="w-full min-w-[520px] text-sm">
@@ -1156,7 +1230,7 @@ function MappingsTab() {
                   </td>
                 </tr>
               ))}
-              {items.length === 0 && (
+              {items.length === 0 && !itemsError && (
                 <tr>
                   <td colSpan={4} className="px-3 py-8 text-center text-muted-foreground">
                     No mapping rules yet.
