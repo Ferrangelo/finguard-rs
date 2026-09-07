@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::NaiveDate;
+use chrono::{Datelike, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
@@ -337,6 +337,164 @@ pub async fn live_rate(currency: &str) -> Result<ResolvedRate> {
     resolve(currency, &reference_currency, resolve_latest_eur_rates).await
 }
 
+/// One resolved rate per currency for a single month, keyed by uppercase ISO
+/// currency code.
+type MonthRates = BTreeMap<String, f64>;
+
+/// A rate to convert every currency actually present in a year's net-worth
+/// data into the reference currency, one rate per calendar month.
+///
+/// Built once per chart request by [`monthly_rates`] so a chart function can
+/// convert many rows without an async lookup per row; see that function for
+/// the month-selection rule. [`MonthlyRates::rate`] is the lookup used by the
+/// caller.
+#[derive(Debug, Clone, Default)]
+pub struct MonthlyRates {
+    reference_currency: String,
+    /// Keyed by month (1..=12). Never holds the reference currency, since
+    /// that case is always the 1.0 identity handled directly by `rate`.
+    rates: BTreeMap<u32, MonthRates>,
+}
+
+impl MonthlyRates {
+    /// Return the rate to convert an amount in `currency` for `month`
+    /// (1..=12) into the reference currency.
+    ///
+    /// The reference currency always returns `1.0` with no lookup. Any other
+    /// currency must have been included in the `currencies` argument to
+    /// [`monthly_rates`] that built this table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] for a currency that was not resolved for
+    /// `month`, rather than silently substituting `1.0`: that substitution is
+    /// exactly the conversion bug this table exists to prevent.
+    pub fn rate(&self, month: u32, currency: &str) -> Result<f64> {
+        let currency = currency.trim().to_uppercase();
+        if currency == self.reference_currency {
+            return Ok(1.0);
+        }
+        self.rates
+            .get(&month)
+            .and_then(|month_rates| month_rates.get(&currency))
+            .copied()
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "no resolved FX rate for '{currency}' in month {month:02}; it was not \
+                     included in the currencies passed to monthly_rates"
+                ))
+            })
+    }
+
+    /// Build a table directly from already-resolved rates, bypassing the
+    /// cache and the network entirely.
+    ///
+    /// `#[cfg(test)]` compiles this into every unit test binary in the crate
+    /// (not just this module's own), which is what lets another module's
+    /// tests, such as `plots`'s currency-conversion tests, hand-build a
+    /// deterministic table without seeding `fx`'s own disk cache.
+    #[cfg(test)]
+    pub(crate) fn for_test(reference_currency: &str, rates: BTreeMap<u32, MonthRates>) -> Self {
+        Self {
+            reference_currency: reference_currency.trim().to_uppercase(),
+            rates,
+        }
+    }
+}
+
+/// Resolve one rate per currency in `currencies` for every month of `year`,
+/// given an explicit `today` so the completed/in-progress/future rule (see
+/// [`monthly_rates`]) is testable without depending on the real date.
+async fn monthly_rates_core(
+    today: NaiveDate,
+    year: i32,
+    currencies: &[String],
+) -> Result<MonthlyRates> {
+    let settings = config::get_currency_settings()?;
+    let reference_currency = settings.reference_currency.trim().to_uppercase();
+
+    let mut needed: Vec<String> = currencies
+        .iter()
+        .map(|c| c.trim().to_uppercase())
+        .filter(|c| *c != reference_currency)
+        .collect();
+    needed.sort();
+    needed.dedup();
+
+    let mut rates: BTreeMap<u32, MonthRates> = BTreeMap::new();
+    if needed.is_empty() {
+        return Ok(MonthlyRates {
+            reference_currency,
+            rates,
+        });
+    }
+
+    let today_year = today.year();
+    let today_month = today.month();
+
+    // The in-progress month and every later month share one rate per
+    // currency (a future month tracks the in-progress month so the series has
+    // no discontinuity), so resolve it once here instead of once per month.
+    // Skipped entirely when `year` is fully in the past, so an old year never
+    // triggers a live-rate network call it does not need.
+    let mut current_period: MonthRates = BTreeMap::new();
+    if (year, 12u32) >= (today_year, today_month) {
+        for currency in &needed {
+            let resolved = match settings.current_month_rate_mode {
+                config::CurrentMonthRateMode::PreviousMonthEnd => {
+                    let (prev_year, prev_month) = if today_month == 1 {
+                        (today_year - 1, 12)
+                    } else {
+                        (today_year, today_month - 1)
+                    };
+                    month_end_rate(prev_year, prev_month, currency).await?
+                }
+                config::CurrentMonthRateMode::Live => live_rate(currency).await?,
+            };
+            current_period.insert(currency.clone(), resolved.rate);
+        }
+    }
+
+    for month in 1..=12u32 {
+        // Every month before the in-progress one is a completed month, and
+        // keeps its own frozen month-end rate rather than the current one.
+        let is_completed = (year, month) < (today_year, today_month);
+        let mut month_rates = MonthRates::new();
+        for currency in &needed {
+            let rate = if is_completed {
+                month_end_rate(year, month, currency).await?.rate
+            } else {
+                current_period[currency]
+            };
+            month_rates.insert(currency.clone(), rate);
+        }
+        rates.insert(month, month_rates);
+    }
+
+    Ok(MonthlyRates {
+        reference_currency,
+        rates,
+    })
+}
+
+/// Resolve one rate per currency in `currencies` for every month of `year`,
+/// for converting net-worth rows into the reference currency.
+///
+/// A completed month uses its own frozen month-end rate
+/// ([`month_end_rate`]). The in-progress month (the real current calendar
+/// month) follows [`config::CurrentMonthRateMode`]: `PreviousMonthEnd` uses
+/// the preceding month's month-end rate (December of the prior year for
+/// January), `Live` uses [`live_rate`]. A future month uses the same rate as
+/// the in-progress month, so the series has no discontinuity; those months
+/// hold no data anyway.
+///
+/// Resolves only the currencies actually present in `currencies`, and never
+/// looks up the reference currency, so a user whose net worth is entirely in
+/// the reference currency triggers no cache lookup and no network call.
+pub async fn monthly_rates(year: i32, currencies: &[String]) -> Result<MonthlyRates> {
+    monthly_rates_core(Local::now().date_naive(), year, currencies).await
+}
+
 /// Return the last calendar day of `year`-`month`.
 ///
 /// # Errors
@@ -513,6 +671,138 @@ mod tests {
             resolved.rate_date,
             Some(NaiveDate::from_ymd_opt(2026, 9, 4).unwrap())
         );
+    }
+
+    /// Seed a month-end rate for every completed month of 2026 (January
+    /// through August, ahead of the `2026-09-15` "today" used throughout this
+    /// test group), so resolving any of them succeeds. June and August carry
+    /// distinct rates so a test can prove which one a lookup actually used;
+    /// the rest carry an arbitrary filler rate.
+    fn seed_completed_2026_months() {
+        seed_cache(&[
+            ("2026-01-31", &[("USD", 1.00)]),
+            ("2026-02-28", &[("USD", 1.00)]),
+            ("2026-03-31", &[("USD", 1.00)]),
+            ("2026-04-30", &[("USD", 1.00)]),
+            ("2026-05-31", &[("USD", 1.00)]),
+            ("2026-06-30", &[("USD", 1.10)]),
+            ("2026-07-31", &[("USD", 1.00)]),
+            ("2026-08-31", &[("USD", 1.20)]),
+        ]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_completed_month_uses_its_own_month_end_rate() {
+        let _temp = with_temp_env_offline();
+        // June's own month-end rate differs from every other completed
+        // month's, so a lookup that used the wrong one would fail the assertion.
+        seed_completed_2026_months();
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let rates = monthly_rates_core(today, 2026, &["USD".to_string()])
+            .await
+            .expect("resolve monthly rates");
+
+        assert_eq!(rates.rate(6, "USD").unwrap(), 1.0 / 1.10);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_in_progress_month_previous_month_end_uses_preceding_month() {
+        let _temp = with_temp_env_offline();
+        seed_completed_2026_months();
+
+        // Default settings already use `PreviousMonthEnd`.
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let rates = monthly_rates_core(today, 2026, &["USD".to_string()])
+            .await
+            .expect("resolve monthly rates");
+
+        assert_eq!(rates.rate(9, "USD").unwrap(), 1.0 / 1.20);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_january_previous_month_end_reaches_back_a_year() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-12-31", &[("USD", 1.15)])]);
+
+        let today = NaiveDate::from_ymd_opt(2027, 1, 10).unwrap();
+        let rates = monthly_rates_core(today, 2027, &["USD".to_string()])
+            .await
+            .expect("resolve monthly rates");
+
+        assert_eq!(rates.rate(1, "USD").unwrap(), 1.0 / 1.15);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_in_progress_month_live_mode_uses_live_rate() {
+        let _temp = with_temp_env_offline();
+        // `seed_cache` replaces the whole cache file, so this repeats the
+        // Jan-Aug filler from `seed_completed_2026_months` alongside the
+        // newest cached date the offline live lookup must fall back to.
+        seed_cache(&[
+            ("2026-01-31", &[("USD", 1.00)]),
+            ("2026-02-28", &[("USD", 1.00)]),
+            ("2026-03-31", &[("USD", 1.00)]),
+            ("2026-04-30", &[("USD", 1.00)]),
+            ("2026-05-31", &[("USD", 1.00)]),
+            ("2026-06-30", &[("USD", 1.10)]),
+            ("2026-07-31", &[("USD", 1.00)]),
+            ("2026-08-31", &[("USD", 1.20)]),
+            ("2026-09-10", &[("USD", 1.18)]),
+        ]);
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "EUR".to_string(),
+            current_month_rate_mode: config::CurrentMonthRateMode::Live,
+        })
+        .expect("save live mode");
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let rates = monthly_rates_core(today, 2026, &["USD".to_string()])
+            .await
+            .expect("resolve monthly rates");
+
+        // Offline live rate falls back to the newest cached date, not the
+        // month-end rate that `PreviousMonthEnd` would have used.
+        assert_eq!(rates.rate(9, "USD").unwrap(), 1.0 / 1.18);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_future_month_matches_the_in_progress_month() {
+        let _temp = with_temp_env_offline();
+        seed_completed_2026_months();
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let rates = monthly_rates_core(today, 2026, &["USD".to_string()])
+            .await
+            .expect("resolve monthly rates");
+
+        assert_eq!(
+            rates.rate(9, "USD").unwrap(),
+            rates.rate(12, "USD").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_reference_currency_is_never_looked_up() {
+        let _temp = with_temp_env_offline();
+        // No cache seeded at all: a lookup attempt for the reference currency
+        // would hit the "nothing cached, network disabled" error path.
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let rates = monthly_rates_core(today, 2026, &["EUR".to_string()])
+            .await
+            .expect("reference currency never fails");
+
+        assert_eq!(rates.rate(1, "EUR").unwrap(), 1.0);
+        assert_eq!(rates.rate(9, "EUR").unwrap(), 1.0);
+        // No month was ever populated, proving no lookup was attempted.
+        assert!(rates.rates.is_empty());
     }
 
     #[test]
