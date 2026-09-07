@@ -164,7 +164,10 @@ function CashflowPage() {
                 <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
                 <XAxis dataKey="month" tick={{ fontSize: 14, fill: tickColor }} />
                 <YAxis tick={{ fontSize: 14, fill: tickColor }} />
-                <Tooltip content={<DarkTooltip currency={refCurrency} />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
+                <Tooltip
+                  content={<DarkTooltip currency={refCurrency} />}
+                  cursor={{ fill: "oklch(1 0 0 / 4%)" }}
+                />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 <Bar dataKey="Income" fill={colorAt(0)} radius={[4, 4, 0, 0]} />
                 <Bar dataKey="Spending" fill={colorAt(4)} radius={[4, 4, 0, 0]} />

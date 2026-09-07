@@ -105,7 +105,7 @@ function NetWorthPage() {
         </div>
         <SubTabs value={sub} onChange={setSub} options={SUB_OPTIONS} />
       </div>
-      {sub === "investments" && <InvestmentsTab />}
+      {sub === "investments" && <InvestmentsTab refCurrency={refCurrency} />}
       {sub === "liquidity" && <LiquidityTab refCurrency={refCurrency} />}
       {sub === "total" && <TotalTab currencySettings={currencySettings} />}
     </div>
@@ -116,7 +116,7 @@ const INV_CATS: InvestmentCategory[] = ["Stocks/ETF", "Commodities", "Bonds"];
 const LIQ_CATS = ["Bank/Broker account", "Cash", "Other"] as const;
 
 // ────────────────────────────────────────────────────────────── Investments
-function InvestmentsTab() {
+function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
   const colorAt = useChartColors();
   const { year, notify, refresh, refreshTick } = useApp();
   const [assets, setAssets] = useState<InvestmentAsset[]>([]);
@@ -171,6 +171,7 @@ function InvestmentsTab() {
 
       {adding && (
         <AddInvestmentForm
+          refCurrency={refCurrency}
           onCancel={() => setAdding(false)}
           onCreate={async (name, cat, link, currency) => {
             await api.addInvestment(name, cat, link, year, currency);
@@ -350,9 +351,11 @@ function InvestmentsTab() {
 }
 
 function AddInvestmentForm({
+  refCurrency,
   onCreate,
   onCancel,
 }: {
+  refCurrency: Currency;
   onCreate: (
     name: string,
     cat: InvestmentCategory,
@@ -364,7 +367,7 @@ function AddInvestmentForm({
   const [name, setName] = useState("");
   const [cat, setCat] = useState<InvestmentCategory>("Stocks/ETF");
   const [link, setLink] = useState("");
-  const [currency, setCurrency] = useState<Currency>("EUR");
+  const [currency, setCurrency] = useState<Currency>(refCurrency);
   return (
     <GlassCard title="New investment asset">
       <div className="grid gap-3 md:grid-cols-[2fr_1fr_1fr_2fr_auto]">
@@ -494,6 +497,7 @@ function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
         onCellCommit={setLiqCell}
         renderAddForm={() => (
           <AddLiquidityForm
+            refCurrency={refCurrency}
             onCreate={async (n, c, cur) => {
               await api.addLiquidity(n, c, cur, year);
               notify("success", `Added ${n}`);
@@ -573,6 +577,7 @@ function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
         onCellCommit={setCdCell}
         renderAddForm={() => (
           <AddCreditDebtForm
+            refCurrency={refCurrency}
             onCreate={async (n, cur) => {
               await api.addCreditDebt(n, cur, year);
               notify("success", `Added ${n}`);
@@ -741,13 +746,15 @@ function LiquiditySection<R extends BaseRow>({
 }
 
 function AddLiquidityForm({
+  refCurrency,
   onCreate,
 }: {
+  refCurrency: Currency;
   onCreate: (n: string, c: LiquidityRow["category"], cur: Currency) => Promise<void>;
 }) {
   const [name, setName] = useState("");
   const [cat, setCat] = useState<LiquidityRow["category"]>("Bank/Broker account");
-  const [cur, setCur] = useState<Currency>("EUR");
+  const [cur, setCur] = useState<Currency>(refCurrency);
   return (
     <div className="flex flex-wrap items-center gap-2">
       <input
@@ -789,12 +796,14 @@ function AddLiquidityForm({
 }
 
 function AddCreditDebtForm({
+  refCurrency,
   onCreate,
 }: {
+  refCurrency: Currency;
   onCreate: (n: string, cur: Currency) => Promise<void>;
 }) {
   const [name, setName] = useState("");
-  const [cur, setCur] = useState<Currency>("EUR");
+  const [cur, setCur] = useState<Currency>(refCurrency);
   return (
     <div className="flex flex-wrap items-center gap-2">
       <input

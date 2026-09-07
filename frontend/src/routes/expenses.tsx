@@ -729,7 +729,10 @@ function SummaryTab() {
                     width={120}
                     tick={{ fontSize: 14, fill: tickColor }}
                   />
-                  <Tooltip content={<DarkTooltip currency={refCurrency} />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
+                  <Tooltip
+                    content={<DarkTooltip currency={refCurrency} />}
+                    cursor={{ fill: "oklch(1 0 0 / 4%)" }}
+                  />
                   <Bar dataKey="value" radius={[0, 4, 4, 0]}>
                     {yearBarData.map((entry, i) => (
                       <Cell
@@ -841,7 +844,10 @@ function SummaryTab() {
                   height={60}
                 />
                 <YAxis tick={{ fontSize: 14, fill: tickColor }} />
-                <Tooltip content={<DarkTooltip total currency={refCurrency} />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
+                <Tooltip
+                  content={<DarkTooltip total currency={refCurrency} />}
+                  cursor={{ fill: "oklch(1 0 0 / 4%)" }}
+                />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 {selMonths.map((m, i) => (
                   <Bar
@@ -884,7 +890,10 @@ function SummaryTab() {
                 <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
                 <XAxis dataKey="month" tick={{ fontSize: 14, fill: tickColor }} />
                 <YAxis tick={{ fontSize: 14, fill: tickColor }} />
-                <Tooltip content={<DarkTooltip currency={refCurrency} />} cursor={{ stroke: "oklch(1 0 0 / 10%)" }} />
+                <Tooltip
+                  content={<DarkTooltip currency={refCurrency} />}
+                  cursor={{ stroke: "oklch(1 0 0 / 10%)" }}
+                />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 {selCats.map((c, i) => (
                   <Line
