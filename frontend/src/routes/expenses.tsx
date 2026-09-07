@@ -49,6 +49,12 @@ import { useTheme } from "@/context/ThemeContext";
 // one `refresh()` call re-runs every tab's fetch the next time it renders,
 // including tabs that are not currently visible.
 //
+// Every fetch effect guards its `setState` calls with a per-run `active`
+// flag, flipped to `false` in the cleanup function. Without it, switching
+// year/month/filter fast enough lets an older request's response resolve
+// after a newer one and overwrite it, showing stale data with no way to
+// tell it apart from current data.
+//
 // Sub-tabs:
 // - DetailedTab: the current month's expense list, with inline filtering,
 //   add/edit form, and delete.
@@ -144,10 +150,17 @@ function DetailedTab() {
   // Reload categories and mappings whenever a mutation elsewhere bumps
   // refreshTick (e.g. adding a category or mapping rule from another tab).
   useEffect(() => {
+    let active = true;
     setSupportError(null);
-    Promise.all([api.getCategories().then(setCats), api.getMappings().then(setMappings)]).catch(
-      (err) => setSupportError(errorMessage(err, "Failed to load categories or mappings")),
-    );
+    Promise.all([
+      api.getCategories().then((c) => active && setCats(c)),
+      api.getMappings().then((m) => active && setMappings(m)),
+    ]).catch((err) => {
+      if (active) setSupportError(errorMessage(err, "Failed to load categories or mappings"));
+    });
+    return () => {
+      active = false;
+    };
   }, [refreshTick]);
 
   // Refetch the row list on every change to year, month, the active
@@ -155,6 +168,7 @@ function DetailedTab() {
   // the backend does not apply that filter at all, rather than filtering
   // on an empty string.
   useEffect(() => {
+    let active = true;
     setRowsError(null);
     api
       .getExpenses(year, month, {
@@ -163,8 +177,13 @@ function DetailedTab() {
         min: filter.min ? Number(filter.min) : undefined,
         max: filter.max ? Number(filter.max) : undefined,
       })
-      .then(setRows)
-      .catch((err) => setRowsError(errorMessage(err, "Failed to load expenses")));
+      .then((rows) => active && setRows(rows))
+      .catch((err) => {
+        if (active) setRowsError(errorMessage(err, "Failed to load expenses"));
+      });
+    return () => {
+      active = false;
+    };
   }, [year, month, filter, refreshTick]);
 
   // Sort is applied client-side to the already-filtered rows; the backend
@@ -548,11 +567,17 @@ function SummaryTab() {
   // derived table and chart below slices this same list client-side
   // instead of making a separate request per view.
   useEffect(() => {
+    let active = true;
     setYearExpensesError(null);
     api
       .getExpenses(year)
-      .then(setYearExpenses)
-      .catch((err) => setYearExpensesError(errorMessage(err, "Failed to load expenses")));
+      .then((rows) => active && setYearExpenses(rows))
+      .catch((err) => {
+        if (active) setYearExpensesError(errorMessage(err, "Failed to load expenses"));
+      });
+    return () => {
+      active = false;
+    };
   }, [year, refreshTick]);
 
   const catOf = (e: Expense) => (kind === "primary" ? e.primary : e.secondary) || "Uncategorized";
@@ -971,16 +996,24 @@ function RecurringTab() {
   const [catsError, setCatsError] = useState<string | null>(null);
 
   useEffect(() => {
+    let active = true;
     setItemsError(null);
     setCatsError(null);
     api
       .getRecurring(year)
-      .then(setItems)
-      .catch((err) => setItemsError(errorMessage(err, "Failed to load recurring templates")));
+      .then((items) => active && setItems(items))
+      .catch((err) => {
+        if (active) setItemsError(errorMessage(err, "Failed to load recurring templates"));
+      });
     api
       .getCategories()
-      .then(setCats)
-      .catch((err) => setCatsError(errorMessage(err, "Failed to load categories")));
+      .then((cats) => active && setCats(cats))
+      .catch((err) => {
+        if (active) setCatsError(errorMessage(err, "Failed to load categories"));
+      });
+    return () => {
+      active = false;
+    };
   }, [refreshTick]);
 
   const submit = async () => {
@@ -1165,16 +1198,24 @@ function MappingsTab() {
   const [catsError, setCatsError] = useState<string | null>(null);
 
   useEffect(() => {
+    let active = true;
     setItemsError(null);
     setCatsError(null);
     api
       .getMappings()
-      .then(setItems)
-      .catch((err) => setItemsError(errorMessage(err, "Failed to load mapping rules")));
+      .then((items) => active && setItems(items))
+      .catch((err) => {
+        if (active) setItemsError(errorMessage(err, "Failed to load mapping rules"));
+      });
     api
       .getCategories()
-      .then(setCats)
-      .catch((err) => setCatsError(errorMessage(err, "Failed to load categories")));
+      .then((cats) => active && setCats(cats))
+      .catch((err) => {
+        if (active) setCatsError(errorMessage(err, "Failed to load categories"));
+      });
+    return () => {
+      active = false;
+    };
   }, [refreshTick]);
 
   const submit = async () => {

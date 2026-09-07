@@ -51,6 +51,12 @@ import { useTheme } from "@/context/ThemeContext";
 // `api.ensureYear(year)`, a no-op kept for readability at each call site,
 // since the backend auto-creates a year's data files on first access.
 //
+// Every fetch effect guards its `setState` calls with a per-run `active`
+// flag, flipped to `false` in the cleanup function. Without it, switching
+// the year (or, on TotalTab, the display currency) fast enough lets an
+// older request's response resolve after a newer one and overwrite it,
+// showing stale figures with no way to tell them apart from current ones.
+//
 // Optimistic cell edits: `InvestmentsTab.setCell`, `LiquidityTab.setLiqCell`,
 // and `LiquidityTab.setCdCell` update local state immediately (so the input
 // reflects the typed value with no round trip latency), then call the
@@ -173,12 +179,18 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
+    let active = true;
     setLoadError(null);
     api
       .ensureYear(year)
       .then(() => api.getInvestments(year))
-      .then(setAssets)
-      .catch((err) => setLoadError(errorMessage(err, "Failed to load investments")));
+      .then((assets) => active && setAssets(assets))
+      .catch((err) => {
+        if (active) setLoadError(errorMessage(err, "Failed to load investments"));
+      });
+    return () => {
+      active = false;
+    };
   }, [year, refreshTick]);
 
   // Optimistic update: see the file-level comment on cell edits above.
@@ -498,23 +510,33 @@ function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
   const [ratesError, setRatesError] = useState<string | null>(null);
 
   useEffect(() => {
+    let active = true;
     setLiqError(null);
     setCdError(null);
     setRatesError(null);
     api.ensureYear(year).then(() => {
       api
         .getLiquidity(year)
-        .then(setLiq)
-        .catch((err) => setLiqError(errorMessage(err, "Failed to load liquidity rows")));
+        .then((rows) => active && setLiq(rows))
+        .catch((err) => {
+          if (active) setLiqError(errorMessage(err, "Failed to load liquidity rows"));
+        });
       api
         .getCreditsDebts(year)
-        .then(setCd)
-        .catch((err) => setCdError(errorMessage(err, "Failed to load credit/debt rows")));
+        .then((rows) => active && setCd(rows))
+        .catch((err) => {
+          if (active) setCdError(errorMessage(err, "Failed to load credit/debt rows"));
+        });
       api
         .getMonthlyFxRates(year)
-        .then(setRates)
-        .catch((err) => setRatesError(errorMessage(err, "Failed to load exchange rates")));
+        .then((rates) => active && setRates(rates))
+        .catch((err) => {
+          if (active) setRatesError(errorMessage(err, "Failed to load exchange rates"));
+        });
     });
+    return () => {
+      active = false;
+    };
   }, [year, refreshTick]);
 
   // Converts a row's own balance into the reference currency at month `m`'s
@@ -980,20 +1002,26 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   const [allocationError, setAllocationError] = useState<string | null>(null);
 
   useEffect(() => {
+    let active = true;
     setEvolutionError(null);
     setAllocationError(null);
     api.ensureYear(year).then(() => {
       api
         .getNetworthEvolution(year)
-        .then(setEvolution)
-        .catch((err) => setEvolutionError(errorMessage(err, "Failed to load net worth evolution")));
+        .then((e) => active && setEvolution(e))
+        .catch((err) => {
+          if (active) setEvolutionError(errorMessage(err, "Failed to load net worth evolution"));
+        });
       api
         .getNetworthAllocation(year, month)
-        .then(setAllocation)
-        .catch((err) =>
-          setAllocationError(errorMessage(err, "Failed to load net worth allocation")),
-        );
+        .then((a) => active && setAllocation(a))
+        .catch((err) => {
+          if (active) setAllocationError(errorMessage(err, "Failed to load net worth allocation"));
+        });
     });
+    return () => {
+      active = false;
+    };
   }, [year, month, refreshTick]);
 
   // December of the prior year's net worth (reference currency), the
@@ -1008,13 +1036,20 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   const [prevDecNetWorth, setPrevDecNetWorth] = useState(0);
   const [prevDecError, setPrevDecError] = useState<string | null>(null);
   useEffect(() => {
+    let active = true;
     setPrevDecError(null);
     api
       .getNetworthEvolution(year - 1)
-      .then((e) => setPrevDecNetWorth(e ? e.net_worth[11] : 0))
-      .catch((err) =>
-        setPrevDecError(errorMessage(err, "Failed to load last year's December net worth")),
-      );
+      .then((e) => {
+        if (active) setPrevDecNetWorth(e ? e.net_worth[11] : 0);
+      })
+      .catch((err) => {
+        if (active)
+          setPrevDecError(errorMessage(err, "Failed to load last year's December net worth"));
+      });
+    return () => {
+      active = false;
+    };
   }, [year, refreshTick]);
 
   // Display currency: defaults to the reference currency until the user
@@ -1035,25 +1070,34 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   const [displayRatesError, setDisplayRatesError] = useState<string | null>(null);
   const [prevDisplayRatesError, setPrevDisplayRatesError] = useState<string | null>(null);
   useEffect(() => {
+    let active = true;
     setDisplayRates(null);
     setPrevDisplayRates(null);
     setDisplayRatesError(null);
     setPrevDisplayRatesError(null);
-    if (displayCurrency === refCurrency) return;
-    api
-      .getMonthlyFxRates(year, [displayCurrency])
-      .then(setDisplayRates)
-      .catch((err) =>
-        setDisplayRatesError(errorMessage(err, "Failed to load display-currency exchange rates")),
-      );
-    api
-      .getMonthlyFxRates(year - 1, [displayCurrency])
-      .then(setPrevDisplayRates)
-      .catch((err) =>
-        setPrevDisplayRatesError(
-          errorMessage(err, "Failed to load prior-year display-currency exchange rates"),
-        ),
-      );
+    if (displayCurrency !== refCurrency) {
+      api
+        .getMonthlyFxRates(year, [displayCurrency])
+        .then((r) => active && setDisplayRates(r))
+        .catch((err) => {
+          if (active)
+            setDisplayRatesError(
+              errorMessage(err, "Failed to load display-currency exchange rates"),
+            );
+        });
+      api
+        .getMonthlyFxRates(year - 1, [displayCurrency])
+        .then((r) => active && setPrevDisplayRates(r))
+        .catch((err) => {
+          if (active)
+            setPrevDisplayRatesError(
+              errorMessage(err, "Failed to load prior-year display-currency exchange rates"),
+            );
+        });
+    }
+    return () => {
+      active = false;
+    };
   }, [year, displayCurrency, refCurrency, refreshTick]);
 
   // A fetch failure is treated the same as the backend reporting the
