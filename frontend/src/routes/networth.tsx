@@ -1112,6 +1112,22 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
     refresh();
   };
 
+  // Sends both settings fields, since `updateCurrencySettings` replaces the
+  // whole object and would otherwise reset `current_month_rate_mode` to
+  // whatever this closure captured. `refresh()` re-fetches `currencySettings`
+  // from `AppContext`, so a rejected change (e.g. an unsupported code)
+  // reverts the select to server truth instead of leaving it showing a value
+  // the backend never saved.
+  const updateReferenceCurrency = async (currency: Currency) => {
+    try {
+      await api.updateCurrencySettings({ ...currencySettings, reference_currency: currency });
+      notify("success", "Updated reference currency");
+    } catch (err) {
+      notify("error", err instanceof Error ? err.message : "Update failed");
+    }
+    refresh();
+  };
+
   const months = Array.from({ length: 12 }, (_, i) => i + 1);
   const zeros = (): number[] => Array(12).fill(0);
 
@@ -1208,11 +1224,31 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
           {shownCurrency !== refCurrency ? ", each month at that month's own rate" : ""}.
         </p>
         <div className="flex flex-wrap items-center gap-4">
-          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <label
+            className="flex items-center gap-2 text-xs text-muted-foreground"
+            title="Only re-converts the figures below for viewing here. It does not change the reference currency the app's totals are computed in."
+          >
             Display currency
             <select
               value={displayCurrency}
               onChange={(e) => setDisplayCurrencyChoice(e.target.value as Currency)}
+              className="rounded-md border border-border bg-surface/60 px-2 py-1 text-sm text-foreground"
+            >
+              {CURRENCIES.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label
+            className="flex items-center gap-2 text-xs text-muted-foreground"
+            title="The currency every total on this page is computed in. Changing it re-expresses every figure at read time and rewrites nothing on disk."
+          >
+            Reference currency
+            <select
+              value={refCurrency}
+              onChange={(e) => updateReferenceCurrency(e.target.value as Currency)}
               className="rounded-md border border-border bg-surface/60 px-2 py-1 text-sm text-foreground"
             >
               {CURRENCIES.map((c) => (
