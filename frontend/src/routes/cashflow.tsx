@@ -47,8 +47,12 @@ function CashflowPage() {
   const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
 
   useEffect(() => {
-    api.getIncome(year).then(setIncome);
-    api.getMonthlySpendingByPrimary(year).then(setSpending);
+    let active = true;
+    api.getIncome(year).then((income) => active && setIncome(income));
+    api.getMonthlySpendingByPrimary(year).then((spending) => active && setSpending(spending));
+    return () => {
+      active = false;
+    };
   }, [year, refreshTick]);
 
   const months = useMemo(() => Array.from({ length: 12 }, (_, i) => i + 1), []);

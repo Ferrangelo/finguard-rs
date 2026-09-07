@@ -25,9 +25,13 @@ function CategoriesPage() {
   const [sec, setSec] = useState<Record<string, number>>({});
 
   useEffect(() => {
-    api.getCategories().then(setCats);
-    api.getCategoryTotals("primary").then(setPri);
-    api.getCategoryTotals("secondary").then(setSec);
+    let active = true;
+    api.getCategories().then((cats) => active && setCats(cats));
+    api.getCategoryTotals("primary").then((pri) => active && setPri(pri));
+    api.getCategoryTotals("secondary").then((sec) => active && setSec(sec));
+    return () => {
+      active = false;
+    };
   }, [refreshTick]);
 
   return (
