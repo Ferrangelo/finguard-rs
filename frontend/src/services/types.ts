@@ -196,6 +196,16 @@ export interface NetworthEvolution {
   months: string[];
   components: NetworthSeries[];
   net_worth: number[];
+  /**
+   * Currencies used by the year's investment, liquidity, or credit/debt
+   * rows that could not be resolved into the reference currency; the
+   * backend excludes them from every component series and `net_worth`
+   * rather than failing the whole request. Empty when everything resolved,
+   * and the reference currency itself never appears here. Optional because
+   * older backend responses may not send it yet: a caller must treat an
+   * absent field the same as an empty array, not as "everything resolved."
+   */
+  unavailable_currencies?: string[];
 }
 
 /** One slice of `NetworthAllocation`, mirroring `NetworthPieSliceJson` in backend/src/main.rs. */
@@ -211,6 +221,8 @@ export interface NetworthPieSlice {
  */
 export interface NetworthAllocation {
   slices: NetworthPieSlice[];
+  /** Same meaning and same optionality caveat as `NetworthEvolution.unavailable_currencies`. */
+  unavailable_currencies?: string[];
 }
 
 // StatusKind and StatusMessage are frontend-only UI state (shown in the

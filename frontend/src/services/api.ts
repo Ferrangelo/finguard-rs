@@ -507,6 +507,8 @@ export async function getMonthlyFxRates(
  * GET /api/networth/evolution. The net-worth evolution line chart for
  * `year`, with every row already converted into the reference currency
  * month by month. Resolves to `null` when every net-worth value is zero.
+ * See `NetworthEvolution.unavailable_currencies` for currencies the backend
+ * had to drop from the figures because they would not convert.
  */
 export async function getNetworthEvolution(year: number): Promise<NetworthEvolution | null> {
   return apiFetch(`/api/networth/evolution?year=${year}`);
@@ -515,7 +517,9 @@ export async function getNetworthEvolution(year: number): Promise<NetworthEvolut
 /**
  * GET /api/networth/allocation. The net-worth allocation pie chart for
  * `year`/`month`, with every row already converted into the reference
- * currency. Resolves to `null` when no slice qualifies.
+ * currency. Resolves to `null` when no slice qualifies. See
+ * `NetworthAllocation.unavailable_currencies` for currencies the backend
+ * had to drop from the slices because they would not convert.
  */
 export async function getNetworthAllocation(
   year: number,
