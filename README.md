@@ -196,7 +196,7 @@ finguard-rs/
 
 ## References
 
-- **Original Python Project**: `/home/anferrar/Projects/finguard`
+- **Original Python Project**: [finguard](https://github.com/Ferrangelo/finguard)
 - **Frontend Framework**: [TanStack Start](https://tanstack.com/start/latest)
 - **Web Framework**: [Axum](https://github.com/tokio-rs/axum)
 - **Data Processing**: [Polars](https://pola.rs/)
