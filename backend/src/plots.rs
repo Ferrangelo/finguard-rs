@@ -196,11 +196,18 @@ fn f64_col(df: &DataFrame, name: &str) -> Result<Vec<f64>> {
 /// Net-worth rows are not all in the same currency (a holding, a liquidity
 /// asset, or a credit/debt can each carry its own), so summing raw values
 /// directly would add unlike units together. Returns `0.0` for an empty `df`.
+///
+/// A row whose currency is listed in `unavailable_currencies` is dropped from
+/// the sum instead of being looked up in `rates`: that list names currencies
+/// the caller already knows it could not resolve, so this is an intentional
+/// exclusion, not the "missing from `rates`" bug case, which still fails via
+/// `rates.rate`'s own error below.
 fn sum_col_converted(
     df: &DataFrame,
     col_name: &str,
     month: u32,
     rates: &MonthlyRates,
+    unavailable_currencies: &[String],
 ) -> Result<f64> {
     if df.height() == 0 {
         return Ok(0.0);
@@ -209,6 +216,12 @@ fn sum_col_converted(
     let values = f64_col(df, col_name)?;
     let mut total = 0.0;
     for (currency, value) in currencies.iter().zip(values.iter()) {
+        if unavailable_currencies
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(currency.trim()))
+        {
+            continue;
+        }
         total += value * rates.rate(month, currency)?;
     }
     Ok(total)
@@ -514,14 +527,21 @@ pub fn income_pie_chart(year: i32) -> Result<Option<PieChart>> {
 ///
 /// Every row is converted into the reference currency via `rates` (see
 /// [`crate::fx::monthly_rates`]) before being summed, using its own
-/// `currency` column; a currency present in the data but missing from
-/// `rates` is an error rather than a silent skip.
+/// `currency` column. A row whose currency is listed in
+/// `unavailable_currencies` is excluded from every total instead of being
+/// summed at all; a currency present in the data but missing from `rates`
+/// for any other reason is still an error rather than a silent skip.
 ///
-/// Returns `Ok(None)` when no slice qualifies.
+/// Returns `Ok(None)` only when no slice qualifies *and* `unavailable_currencies`
+/// is empty. A non-empty `unavailable_currencies` with no qualifying slice
+/// still returns `Ok(Some(PieChart { slices: vec![] }))`, so a caller can
+/// tell "nothing to show because these currencies could not be converted"
+/// apart from "this month genuinely has no data".
 pub fn networth_allocation_pie(
     year: i32,
     month: u32,
     rates: &MonthlyRates,
+    unavailable_currencies: &[String],
 ) -> Result<Option<PieChart>> {
     let inv = InvestmentHoldings::new(year)?;
     let liq = Liquidity::new(year)?;
@@ -538,7 +558,7 @@ pub fn networth_allocation_pie(
             .filter(col("category").eq(lit(*cat)))
             .collect()?;
         let val = if cat_df.height() > 0 {
-            sum_col_converted(&cat_df, &col_name, month, rates)?
+            sum_col_converted(&cat_df, &col_name, month, rates, unavailable_currencies)?
         } else {
             0.0
         };
@@ -551,7 +571,7 @@ pub fn networth_allocation_pie(
     }
 
     let liq_val = if liq.df.height() > 0 {
-        sum_col_converted(&liq.df, &col_name, month, rates)?
+        sum_col_converted(&liq.df, &col_name, month, rates, unavailable_currencies)?
     } else {
         0.0
     };
@@ -563,7 +583,7 @@ pub fn networth_allocation_pie(
     }
 
     let cd_val = if cd.df.height() > 0 {
-        sum_col_converted(&cd.df, &col_name, month, rates)?
+        sum_col_converted(&cd.df, &col_name, month, rates, unavailable_currencies)?
     } else {
         0.0
     };
@@ -579,7 +599,7 @@ pub fn networth_allocation_pie(
         });
     }
 
-    if slices.is_empty() {
+    if slices.is_empty() && unavailable_currencies.is_empty() {
         return Ok(None);
     }
 
@@ -595,13 +615,22 @@ pub fn networth_allocation_pie(
 ///
 /// Every row is converted into the reference currency via `rates` (see
 /// [`crate::fx::monthly_rates`]) before being summed, using its own
-/// `currency` column; a currency present in the data but missing from
-/// `rates` is an error rather than a silent skip.
+/// `currency` column. A row whose currency is listed in
+/// `unavailable_currencies` is excluded from every component series and the
+/// total instead of being summed at all; a currency present in the data but
+/// missing from `rates` for any other reason is still an error rather than a
+/// silent skip.
 ///
-/// Returns `Ok(None)` when every net-worth value is zero.
+/// Returns `Ok(None)` only when every net-worth value is zero *and*
+/// `unavailable_currencies` is empty. A non-empty `unavailable_currencies`
+/// with an all-zero total still returns `Ok(Some(...))`, with `months` fully
+/// populated (so a chart has an axis to render) and every component zero, so
+/// a caller can tell "nothing to show because these currencies could not be
+/// converted" apart from "this year genuinely has no data".
 pub fn networth_evolution_line(
     year: i32,
     rates: &MonthlyRates,
+    unavailable_currencies: &[String],
 ) -> Result<Option<NetworthEvolution>> {
     let inv = InvestmentHoldings::new(year)?;
     let liq = Liquidity::new(year)?;
@@ -626,7 +655,13 @@ pub fn networth_evolution_line(
             .enumerate()
             .map(|(i, c)| -> Result<f64> {
                 Ok(if has_rows {
-                    round2_half_even(sum_col_converted(&cat_df, c, (i + 1) as u32, rates)?)
+                    round2_half_even(sum_col_converted(
+                        &cat_df,
+                        c,
+                        (i + 1) as u32,
+                        rates,
+                        unavailable_currencies,
+                    )?)
                 } else {
                     0.0
                 })
@@ -644,7 +679,13 @@ pub fn networth_evolution_line(
         .enumerate()
         .map(|(i, c)| -> Result<f64> {
             Ok(if liq_has {
-                round2_half_even(sum_col_converted(&liq.df, c, (i + 1) as u32, rates)?)
+                round2_half_even(sum_col_converted(
+                    &liq.df,
+                    c,
+                    (i + 1) as u32,
+                    rates,
+                    unavailable_currencies,
+                )?)
             } else {
                 0.0
             })
@@ -661,7 +702,13 @@ pub fn networth_evolution_line(
         .enumerate()
         .map(|(i, c)| -> Result<f64> {
             Ok(if cd_has {
-                round2_half_even(sum_col_converted(&cd.df, c, (i + 1) as u32, rates)?)
+                round2_half_even(sum_col_converted(
+                    &cd.df,
+                    c,
+                    (i + 1) as u32,
+                    rates,
+                    unavailable_currencies,
+                )?)
             } else {
                 0.0
             })
@@ -676,7 +723,7 @@ pub fn networth_evolution_line(
         .map(|i| components.iter().map(|c| c.values[i]).sum())
         .collect();
 
-    if net_worth.iter().all(|&v| v == 0.0) {
+    if net_worth.iter().all(|&v| v == 0.0) && unavailable_currencies.is_empty() {
         return Ok(None);
     }
 
@@ -829,7 +876,7 @@ mod tests {
         // No currency needs resolving, so an empty rate table is enough.
         let rates = MonthlyRates::for_test("EUR", BTreeMap::new());
 
-        let evolution = networth_evolution_line(year, &rates)
+        let evolution = networth_evolution_line(year, &rates, &[])
             .expect("compute evolution")
             .expect("non-zero net worth");
         let component = |name: &str| {
@@ -844,7 +891,7 @@ mod tests {
         assert_eq!(component("Credits/Debts").values[0], -200.0);
         assert_eq!(evolution.net_worth[0], 1300.0);
 
-        let pie = networth_allocation_pie(year, 1, &rates)
+        let pie = networth_allocation_pie(year, 1, &rates, &[])
             .expect("compute allocation")
             .expect("non-empty allocation");
         assert_eq!(
@@ -897,7 +944,7 @@ mod tests {
             .collect();
         let rates = MonthlyRates::for_test("EUR", rates_by_month);
 
-        let evolution = networth_evolution_line(year, &rates)
+        let evolution = networth_evolution_line(year, &rates, &[])
             .expect("compute evolution")
             .expect("non-zero net worth");
         let liquidity = evolution
@@ -907,7 +954,7 @@ mod tests {
             .expect("liquidity component");
         assert_eq!(liquidity.values[0], 1090.0);
 
-        let pie = networth_allocation_pie(year, 1, &rates)
+        let pie = networth_allocation_pie(year, 1, &rates, &[])
             .expect("compute allocation")
             .expect("non-empty allocation");
         let liquidity_slice = pie
@@ -918,9 +965,9 @@ mod tests {
         assert_eq!(liquidity_slice.value, 1090.0);
     }
 
-    /// A currency present in the data but absent from the rate table is an
-    /// error, not a silent `1.0`: that silent fallback is the exact bug this
-    /// feature exists to remove.
+    /// A currency present in the data but absent from the rate table, and not
+    /// named in `unavailable_currencies`, is an error, not a silent `1.0`:
+    /// that silent fallback is the exact bug this feature exists to remove.
     #[test]
     #[serial_test::serial]
     fn unresolved_currency_is_an_error_not_a_silent_identity() {
@@ -930,7 +977,87 @@ mod tests {
         // No USD rate was ever added to this table.
         let rates = MonthlyRates::for_test("EUR", BTreeMap::new());
 
-        let err = networth_evolution_line(year, &rates).expect_err("USD was never resolved");
+        let err = networth_evolution_line(year, &rates, &[]).expect_err("USD was never resolved");
         assert!(matches!(err, crate::error::Error::NotFound(_)));
+    }
+
+    /// A currency named in `unavailable_currencies` is dropped from every
+    /// total instead of erroring: the USD holding and USD liquidity balance
+    /// disappear from the sums, leaving only the EUR credit/debt entry.
+    #[test]
+    #[serial_test::serial]
+    fn unavailable_currency_rows_are_excluded_from_every_total() {
+        let _temp = with_temp_data_home();
+        let year = 2026;
+        seed_single_month_networth(year, "USD", "Usd");
+        seed_single_month_networth(year, "EUR", "Eur");
+        // No USD rate is resolved; the caller reports it as unavailable
+        // instead of leaving it out of the table by mistake.
+        let rates = MonthlyRates::for_test("EUR", BTreeMap::new());
+        let unavailable = vec!["USD".to_string()];
+
+        let evolution = networth_evolution_line(year, &rates, &unavailable)
+            .expect("USD rows are excluded, not looked up")
+            .expect("the EUR rows still produce a non-zero net worth");
+        let component = |name: &str| {
+            evolution
+                .components
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' component"))
+        };
+        assert_eq!(component("Stocks/ETF").values[0], 500.0);
+        assert_eq!(component("Liquidity").values[0], 1000.0);
+        assert_eq!(component("Credits/Debts").values[0], -200.0);
+        assert_eq!(evolution.net_worth[0], 1300.0);
+
+        let pie = networth_allocation_pie(year, 1, &rates, &unavailable)
+            .expect("USD rows are excluded, not looked up")
+            .expect("non-empty allocation");
+        assert_eq!(
+            pie.slices,
+            vec![
+                PieSlice {
+                    name: "Stocks/ETF".to_string(),
+                    value: 500.0
+                },
+                PieSlice {
+                    name: "Liquidity".to_string(),
+                    value: 1000.0
+                },
+                PieSlice {
+                    name: "Debts".to_string(),
+                    value: 200.0
+                },
+            ]
+        );
+    }
+
+    /// When every row's currency is unavailable, the total goes to zero, but
+    /// that must not collapse into `Ok(None)`: a caller needs to see the
+    /// zeroed-out result and the populated `unavailable_currencies` list to
+    /// tell "nothing to show because these currencies could not be
+    /// converted" apart from a genuinely empty year. `months` stays fully
+    /// populated so a chart still has an axis to render.
+    #[test]
+    #[serial_test::serial]
+    fn all_rows_unavailable_still_returns_zeroed_data_not_none() {
+        let _temp = with_temp_data_home();
+        let year = 2026;
+        seed_single_month_networth(year, "USD", "");
+        let rates = MonthlyRates::for_test("EUR", BTreeMap::new());
+        let unavailable = vec!["USD".to_string()];
+
+        let evolution = networth_evolution_line(year, &rates, &unavailable)
+            .expect("USD rows are excluded, not looked up")
+            .expect("must not report as 'no data'");
+        assert_eq!(evolution.months.len(), 12);
+        assert!(evolution.components.iter().all(|c| c.values[0] == 0.0));
+        assert_eq!(evolution.net_worth[0], 0.0);
+
+        let pie = networth_allocation_pie(year, 1, &rates, &unavailable)
+            .expect("USD rows are excluded, not looked up")
+            .expect("must not report as 'no data'");
+        assert!(pie.slices.is_empty());
     }
 }

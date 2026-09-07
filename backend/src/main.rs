@@ -146,6 +146,10 @@ pub struct NetworthPieSliceJson {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NetworthAllocationJson {
     pub slices: Vec<NetworthPieSliceJson>,
+    /// Currencies present in the year's data that could not be resolved into
+    /// the reference currency, and were therefore excluded from every slice
+    /// rather than failing the whole request. Empty when everything resolved.
+    pub unavailable_currencies: Vec<String>,
 }
 
 /// One stacked component of [`NetworthEvolutionJson`], mirroring
@@ -163,6 +167,11 @@ pub struct NetworthEvolutionJson {
     pub months: Vec<String>,
     pub components: Vec<NetworthSeriesJson>,
     pub net_worth: Vec<f64>,
+    /// Currencies present in the year's data that could not be resolved into
+    /// the reference currency, and were therefore excluded from every
+    /// component series and the total rather than failing the whole request.
+    /// Empty when everything resolved.
+    pub unavailable_currencies: Vec<String>,
 }
 
 /// `GET`/`PUT /api/settings/currency` request and response body, mirroring
@@ -1592,14 +1601,25 @@ fn networth_currencies(year: i32) -> finguard_rs_backend::Result<Vec<String>> {
 
 /// `GET /api/networth/evolution?year=`: the net-worth evolution line chart
 /// for `q.year` (see [`plots::networth_evolution_line`]), with every row
-/// converted into the reference currency month by month. `null` when every
-/// net-worth value is zero.
+/// converted into the reference currency month by month. `null` only when
+/// `q.year` truly has no rows: every net-worth value is zero *and* nothing
+/// was dropped for being unresolvable.
+///
+/// A currency present in `q.year`'s data that cannot be resolved (typically
+/// no network and nothing cached) does not fail the request: its rows are
+/// excluded from every component and the total instead, and the currency is
+/// named in [`NetworthEvolutionJson::unavailable_currencies`]. That case
+/// still returns a non-`null` body (`months` populated, every component
+/// zero) rather than `null`, so the client can tell "nothing to show because
+/// these currencies could not be converted" apart from a genuinely empty
+/// year. Matches [`get_monthly_fx_rates_handler`]'s degrade-per-currency
+/// behavior, since both endpoints serve the same page.
 async fn get_networth_evolution_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<Option<NetworthEvolutionJson>>, AppError> {
     let currencies = networth_currencies(q.year)?;
-    let rates = fx::monthly_rates(q.year, &currencies).await?;
-    let evolution = plots::networth_evolution_line(q.year, &rates)?;
+    let (rates, unavailable_currencies) = fx::monthly_rates_lenient(q.year, &currencies).await?;
+    let evolution = plots::networth_evolution_line(q.year, &rates, &unavailable_currencies)?;
     Ok(Json(evolution.map(|e| {
         NetworthEvolutionJson {
             months: e.months,
@@ -1612,20 +1632,27 @@ async fn get_networth_evolution_handler(
                 })
                 .collect(),
             net_worth: e.net_worth,
+            unavailable_currencies,
         }
     })))
 }
 
 /// `GET /api/networth/allocation?year=&month=`: the net-worth allocation pie
 /// chart for `q.year`/`q.month` (see [`plots::networth_allocation_pie`]),
-/// with every row converted into the reference currency. `null` when no
-/// slice qualifies.
+/// with every row converted into the reference currency. `null` only when no
+/// slice qualifies *and* nothing was dropped for being unresolvable.
+///
+/// See [`get_networth_evolution_handler`] for the same per-currency degrade
+/// behavior: an unresolvable currency's rows are excluded rather than
+/// failing the request, named in
+/// [`NetworthAllocationJson::unavailable_currencies`], and that case still
+/// returns a non-`null` body (an empty `slices` list) instead of `null`.
 async fn get_networth_allocation_handler(
     Query(q): Query<NetworthAllocationQuery>,
 ) -> Result<Json<Option<NetworthAllocationJson>>, AppError> {
     let currencies = networth_currencies(q.year)?;
-    let rates = fx::monthly_rates(q.year, &currencies).await?;
-    let pie = plots::networth_allocation_pie(q.year, q.month, &rates)?;
+    let (rates, unavailable_currencies) = fx::monthly_rates_lenient(q.year, &currencies).await?;
+    let pie = plots::networth_allocation_pie(q.year, q.month, &rates, &unavailable_currencies)?;
     Ok(Json(pie.map(|p| {
         NetworthAllocationJson {
             slices: p
@@ -1636,6 +1663,7 @@ async fn get_networth_allocation_handler(
                     value: s.value,
                 })
                 .collect(),
+            unavailable_currencies,
         }
     })))
 }
@@ -1675,33 +1703,28 @@ async fn get_monthly_fx_rates_handler(
     currencies.sort();
     currencies.dedup();
 
-    let mut months: Vec<MonthlyFxRateJson> = (1..=12u32)
-        .map(|month| MonthlyFxRateJson {
-            month,
-            rate_to_reference: std::collections::HashMap::new(),
-        })
-        .collect();
-    let mut unavailable_currencies = Vec::new();
+    let (rates, unavailable_currencies) = fx::monthly_rates_lenient(q.year, &currencies).await?;
 
-    // Resolved one currency at a time, rather than in a single
-    // `fx::monthly_rates` call across every currency, so a currency that
-    // fails to resolve (no network, nothing cached) is reported and skipped
-    // instead of failing every other currency's lookup too.
-    for currency in &currencies {
-        if currency == &reference_currency {
-            continue;
-        }
-        match fx::monthly_rates(q.year, std::slice::from_ref(currency)).await {
-            Ok(rates) => {
-                for month_json in &mut months {
-                    if let Ok(rate) = rates.rate(month_json.month, currency) {
-                        month_json.rate_to_reference.insert(currency.clone(), rate);
-                    }
+    // `fx::monthly_rates_lenient` already resolved (or skipped) every
+    // currency, so this just reshapes its per-currency table into the
+    // per-month shape the response uses.
+    let months: Vec<MonthlyFxRateJson> = (1..=12u32)
+        .map(|month| {
+            let mut rate_to_reference = std::collections::HashMap::new();
+            for currency in &currencies {
+                if currency == &reference_currency {
+                    continue;
+                }
+                if let Ok(rate) = rates.rate(month, currency) {
+                    rate_to_reference.insert(currency.clone(), rate);
                 }
             }
-            Err(_) => unavailable_currencies.push(currency.clone()),
-        }
-    }
+            MonthlyFxRateJson {
+                month,
+                rate_to_reference,
+            }
+        })
+        .collect();
 
     Ok(Json(MonthlyFxRatesJson {
         year: q.year,
@@ -2190,5 +2213,209 @@ mod tests {
                 .iter()
                 .all(|m| !m.rate_to_reference.contains_key("USD"))
         );
+    }
+
+    /// Build a one-asset, one-month net worth entirely in `currency`: an
+    /// investment (`10 * 50 = 500`), a liquidity balance (`1000`), and a
+    /// credit/debt entry (`-200`), for `year`'s month `01`. `suffix`
+    /// disambiguates asset names when called more than once for the same
+    /// year. Mirrors `plots.rs`'s test helper of the same shape.
+    fn seed_single_month_networth(year: i32, currency: &str, suffix: &str) {
+        let mut inv = InvestmentHoldings::new(year).expect("load investments");
+        let asset = format!("Asset{suffix}");
+        inv.add_asset(&asset, "Stocks/ETF", "", currency)
+            .expect("add investment asset");
+        inv.set_quantity(&asset, 1, 10.0).expect("set quantity");
+        inv.set_price(&asset, 1, 50.0).expect("set price");
+
+        let mut liq = Liquidity::new(year).expect("load liquidity");
+        let cash = format!("Cash{suffix}");
+        liq.add_asset(&cash, "Bank/Broker account", currency)
+            .expect("add liquidity asset");
+        liq.set_value(&cash, 1, 1000.0)
+            .expect("set liquidity value");
+
+        let mut cd = CreditsDebts::new(year).expect("load credits/debts");
+        let loan = format!("Loan{suffix}");
+        cd.add_entry(&loan, currency)
+            .expect("add credit/debt entry");
+        cd.set_value(&loan, 1, -200.0)
+            .expect("set credit/debt value");
+    }
+
+    /// A portfolio holding one resolvable and one unresolvable currency must
+    /// still return `200`: the unresolvable currency is reported and its
+    /// rows are excluded, leaving the resolvable rows' totals untouched
+    /// (`500` invested, `1000` liquid, `-200` credits/debts, net worth
+    /// `1300`), rather than the whole request failing.
+    ///
+    /// Year 2000 keeps every month on the `month_end_rate` "completed month"
+    /// path regardless of today's real date, so the USD lookup fails for a
+    /// reason unrelated to the current date, and the EUR rows need no
+    /// lookup at all.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn networth_endpoints_degrade_for_an_unresolvable_currency() {
+        let _temp = with_temp_env_offline();
+        let year = 2000;
+        seed_single_month_networth(year, "EUR", "Eur");
+        seed_single_month_networth(year, "USD", "Usd");
+        // No USD rate is ever cached, so every USD lookup fails offline.
+
+        let evolution = get_networth_evolution_handler(Query(YearQuery { year }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("degraded request still succeeds: {err}"))
+            .0
+            .expect("the EUR rows still produce a non-zero net worth");
+        assert_eq!(evolution.unavailable_currencies, vec!["USD".to_string()]);
+        let component = |name: &str| {
+            evolution
+                .components
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' component"))
+        };
+        assert_eq!(component("Stocks/ETF").values[0], 500.0);
+        assert_eq!(component("Liquidity").values[0], 1000.0);
+        assert_eq!(component("Credits/Debts").values[0], -200.0);
+        assert_eq!(evolution.net_worth[0], 1300.0);
+
+        let allocation =
+            get_networth_allocation_handler(Query(NetworthAllocationQuery { year, month: 1 }))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("degraded request still succeeds: {err}"))
+                .0
+                .expect("non-empty allocation");
+        assert_eq!(allocation.unavailable_currencies, vec!["USD".to_string()]);
+        let slice_value = |name: &str| {
+            allocation
+                .slices
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' slice"))
+                .value
+        };
+        assert_eq!(slice_value("Stocks/ETF"), 500.0);
+        assert_eq!(slice_value("Liquidity"), 1000.0);
+        assert_eq!(slice_value("Debts"), 200.0);
+    }
+
+    /// A portfolio held entirely in the reference currency needs no cached
+    /// rate at all, and must return `200` with an empty
+    /// `unavailable_currencies`, even offline with nothing cached.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn networth_endpoints_reference_currency_only_needs_no_cached_rate() {
+        let _temp = with_temp_env_offline();
+        let year = 2000;
+        seed_single_month_networth(year, "EUR", "");
+
+        let evolution = get_networth_evolution_handler(Query(YearQuery { year }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("reference-only request succeeds: {err}"))
+            .0
+            .expect("non-zero net worth");
+        assert!(evolution.unavailable_currencies.is_empty());
+        assert_eq!(evolution.net_worth[0], 1300.0);
+
+        let allocation =
+            get_networth_allocation_handler(Query(NetworthAllocationQuery { year, month: 1 }))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("reference-only request succeeds: {err}"))
+                .0
+                .expect("non-empty allocation");
+        assert!(allocation.unavailable_currencies.is_empty());
+    }
+
+    /// Regression guard: when every currency resolves, the totals must be
+    /// exactly what the pre-degrade code produced, and
+    /// `unavailable_currencies` must be empty. `500` EUR invested plus `500`
+    /// USD invested at a `0.90` rate is `950`, and likewise for liquidity
+    /// (`1000` EUR + `900` from `1000` USD) and credits/debts (`-200` EUR +
+    /// `-180` from `-200` USD), for a net worth of `950 + 1900 - 380 = 2470`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn networth_endpoints_all_resolvable_totals_are_unchanged() {
+        let _temp = with_temp_env_offline();
+        let year = 2000;
+        seed_single_month_networth(year, "EUR", "Eur");
+        seed_single_month_networth(year, "USD", "Usd");
+        seed_fx_cache(&[("2000-01-31", &[("USD", 1.0 / 0.90)])]);
+
+        let evolution = get_networth_evolution_handler(Query(YearQuery { year }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("fully resolvable request succeeds: {err}"))
+            .0
+            .expect("non-zero net worth");
+        assert!(evolution.unavailable_currencies.is_empty());
+        let component = |name: &str| {
+            evolution
+                .components
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' component"))
+        };
+        assert_eq!(component("Stocks/ETF").values[0], 950.0);
+        assert_eq!(component("Liquidity").values[0], 1900.0);
+        assert_eq!(component("Credits/Debts").values[0], -380.0);
+        assert_eq!(evolution.net_worth[0], 2470.0);
+
+        let allocation =
+            get_networth_allocation_handler(Query(NetworthAllocationQuery { year, month: 1 }))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("fully resolvable request succeeds: {err}"))
+                .0
+                .expect("non-empty allocation");
+        assert!(allocation.unavailable_currencies.is_empty());
+        let slice_value = |name: &str| {
+            allocation
+                .slices
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' slice"))
+                .value
+        };
+        assert_eq!(slice_value("Stocks/ETF"), 950.0);
+        assert_eq!(slice_value("Liquidity"), 1900.0);
+        // The combined credits/debts total is negative (-380), so the pie
+        // chart reports it as a "Debts" slice holding the absolute value,
+        // matching `networth_allocation_pie`'s sign convention.
+        assert_eq!(slice_value("Debts"), 380.0);
+    }
+
+    /// A portfolio held entirely in an unresolvable currency must not report
+    /// as "no data": excluding its only rows would otherwise zero out every
+    /// series and the handler would return `null`, telling the user they
+    /// have no net worth when the truth is that their money could not be
+    /// converted. The response must stay non-`null`, with `months`
+    /// populated so a chart still has an axis, every component zero, and
+    /// the currency named in `unavailable_currencies`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn networth_endpoints_report_data_when_every_currency_is_unresolvable() {
+        let _temp = with_temp_env_offline();
+        let year = 2000;
+        seed_single_month_networth(year, "USD", "");
+        // No USD rate is ever cached, so the only currency present fails to
+        // resolve.
+
+        let evolution = get_networth_evolution_handler(Query(YearQuery { year }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("degraded request still succeeds: {err}"))
+            .0
+            .expect("an unresolvable currency must not report as 'no data'");
+        assert_eq!(evolution.unavailable_currencies, vec!["USD".to_string()]);
+        assert_eq!(evolution.months.len(), 12);
+        assert!(evolution.components.iter().all(|c| c.values[0] == 0.0));
+        assert_eq!(evolution.net_worth[0], 0.0);
+
+        let allocation =
+            get_networth_allocation_handler(Query(NetworthAllocationQuery { year, month: 1 }))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("degraded request still succeeds: {err}"))
+                .0
+                .expect("an unresolvable currency must not report as 'no data'");
+        assert_eq!(allocation.unavailable_currencies, vec!["USD".to_string()]);
+        assert!(allocation.slices.is_empty());
     }
 }
