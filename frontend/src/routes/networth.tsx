@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -19,7 +19,7 @@ import { ExternalLink, Plus } from "lucide-react";
 import { useApp } from "@/context/AppContext";
 import * as api from "@/services/api";
 import { MONTHS, MONTHS_SHORT } from "@/services/api";
-import { CURRENCIES, formatRef, toRef } from "@/services/fx";
+import { CURRENCIES, formatRef, referenceToDisplay } from "@/services/fx";
 import { GlassCard } from "@/components/finguard/GlassCard";
 import { SubTabs } from "@/components/finguard/SubTabs";
 import { MathInput } from "@/components/finguard/MathInput";
@@ -27,10 +27,15 @@ import { ConfirmButton } from "@/components/finguard/ConfirmButton";
 import { DarkTooltip, useChartColors, LEGEND_STYLE } from "@/components/finguard/DarkTooltip";
 import type {
   CreditDebtRow,
+  CurrencySettings,
+  CurrentMonthRateMode,
   Currency,
   InvestmentAsset,
   InvestmentCategory,
   LiquidityRow,
+  MonthlyFxRates,
+  NetworthAllocation,
+  NetworthEvolution,
 } from "@/services/types";
 import { useTheme } from "@/context/ThemeContext";
 
@@ -58,10 +63,18 @@ import { useTheme } from "@/context/ThemeContext";
 //   (qty * price), viewed one metric at a time via the holdings/prices/value
 //   toggle.
 // - LiquidityTab: cash/bank rows and credit/debt rows, each rendered by the
-//   shared `LiquiditySection` table component.
-// - TotalTab: combines investments, liquidity, and credits/debts into one
-//   net worth grid, an allocation pie for the selected month, and a
-//   stacked-area evolution chart across the year.
+//   shared `LiquiditySection` table component. Its "Total" row converts each
+//   row into the reference currency with that row's own currency and the
+//   matching calendar month's rate, fetched once per year via
+//   `getMonthlyFxRates`.
+// - TotalTab: the net worth grid, allocation pie, and evolution chart all
+//   come pre-aggregated and pre-converted (into the reference currency) from
+//   `getNetworthEvolution`/`getNetworthAllocation`; this file no longer sums
+//   raw rows itself. A display-currency selector re-converts each month's
+//   reference-currency figure with *that month's own* rate from
+//   `getMonthlyFxRates`, rather than one current rate, so the shown curve
+//   reflects what the holdings were actually worth in that currency at that
+//   time (a deliberate product choice, not an approximation).
 export const Route = createFileRoute("/networth")({
   head: () => ({ meta: [{ title: "Net Worth · Finguard" }] }),
   component: NetWorthPage,
@@ -76,6 +89,11 @@ const SUB_OPTIONS: ReadonlyArray<{ value: Sub; label: string }> = [
 
 function NetWorthPage() {
   const [sub, setSub] = useState<Sub>("investments");
+  // Read once here and thread down explicitly, rather than each tab calling
+  // useApp() for currency settings itself, matching cashflow.tsx and
+  // categories.tsx.
+  const { currencySettings } = useApp();
+  const refCurrency = currencySettings.reference_currency;
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between">
@@ -88,8 +106,8 @@ function NetWorthPage() {
         <SubTabs value={sub} onChange={setSub} options={SUB_OPTIONS} />
       </div>
       {sub === "investments" && <InvestmentsTab />}
-      {sub === "liquidity" && <LiquidityTab />}
-      {sub === "total" && <TotalTab />}
+      {sub === "liquidity" && <LiquidityTab refCurrency={refCurrency} />}
+      {sub === "total" && <TotalTab currencySettings={currencySettings} />}
     </div>
   );
 }
@@ -154,8 +172,8 @@ function InvestmentsTab() {
       {adding && (
         <AddInvestmentForm
           onCancel={() => setAdding(false)}
-          onCreate={async (name, cat, link) => {
-            await api.addInvestment(name, cat, link, year);
+          onCreate={async (name, cat, link, currency) => {
+            await api.addInvestment(name, cat, link, year, currency);
             notify("success", `Added "${name}"`);
             setAdding(false);
             refresh();
@@ -170,6 +188,7 @@ function InvestmentsTab() {
               <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
                 <th className="px-3 py-2 font-medium">Asset</th>
                 <th className="px-3 py-2 font-medium">Category</th>
+                <th className="px-3 py-2 font-medium">Currency</th>
                 <th className="px-3 py-2 font-medium">Link</th>
                 {MONTHS_SHORT.map((m) => (
                   <th key={m} className="px-2 py-2 text-right font-medium">
@@ -224,6 +243,31 @@ function InvestmentsTab() {
                         <span className="inline-flex items-center rounded-md border border-border bg-muted/30 px-2 py-0.5 text-xs">
                           {a.category}
                         </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      {isEdit ? (
+                        <select
+                          defaultValue={a.currency}
+                          onChange={(e) =>
+                            api
+                              .updateInvestmentMeta(
+                                a.id,
+                                { currency: e.target.value as Currency },
+                                year,
+                              )
+                              .then(refresh)
+                          }
+                          className="rounded border border-border bg-surface/60 px-2 py-0.5 text-xs"
+                        >
+                          {CURRENCIES.map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">{a.currency}</span>
                       )}
                     </td>
                     <td className="px-3 py-1.5">
@@ -292,7 +336,7 @@ function InvestmentsTab() {
               })}
               {assets.length === 0 && (
                 <tr>
-                  <td colSpan={16} className="px-3 py-8 text-center text-muted-foreground">
+                  <td colSpan={17} className="px-3 py-8 text-center text-muted-foreground">
                     No investments yet.
                   </td>
                 </tr>
@@ -309,15 +353,21 @@ function AddInvestmentForm({
   onCreate,
   onCancel,
 }: {
-  onCreate: (name: string, cat: InvestmentCategory, link?: string) => Promise<void>;
+  onCreate: (
+    name: string,
+    cat: InvestmentCategory,
+    link: string | undefined,
+    currency: Currency,
+  ) => Promise<void>;
   onCancel: () => void;
 }) {
   const [name, setName] = useState("");
   const [cat, setCat] = useState<InvestmentCategory>("Stocks/ETF");
   const [link, setLink] = useState("");
+  const [currency, setCurrency] = useState<Currency>("EUR");
   return (
     <GlassCard title="New investment asset">
-      <div className="grid gap-3 md:grid-cols-[2fr_1fr_2fr_auto]">
+      <div className="grid gap-3 md:grid-cols-[2fr_1fr_1fr_2fr_auto]">
         <input
           placeholder="Asset name"
           value={name}
@@ -335,6 +385,17 @@ function AddInvestmentForm({
             </option>
           ))}
         </select>
+        <select
+          value={currency}
+          onChange={(e) => setCurrency(e.target.value as Currency)}
+          className="rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-sm"
+        >
+          {CURRENCIES.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
         <input
           placeholder="Link (optional)"
           value={link}
@@ -343,7 +404,7 @@ function AddInvestmentForm({
         />
         <div className="flex gap-2">
           <button
-            onClick={() => name.trim() && onCreate(name.trim(), cat, link || undefined)}
+            onClick={() => name.trim() && onCreate(name.trim(), cat, link || undefined, currency)}
             className="rounded-md bg-gradient-brand px-3 py-1.5 text-sm font-semibold text-background"
           >
             Create
@@ -361,17 +422,32 @@ function AddInvestmentForm({
 }
 
 // ────────────────────────────────────────────────────────────── Liquidity & Credits/Debts
-function LiquidityTab() {
+function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
   const { year, notify, refresh, refreshTick } = useApp();
   const [liq, setLiq] = useState<LiquidityRow[]>([]);
   const [cd, setCd] = useState<CreditDebtRow[]>([]);
+  // Rates for every currency already used by this year's liquidity and
+  // credits/debts rows (the default `getMonthlyFxRates` currency set), used
+  // to convert each row's own balance into the reference currency for the
+  // section totals below.
+  const [rates, setRates] = useState<MonthlyFxRates | null>(null);
 
   useEffect(() => {
     api.ensureYear(year).then(() => {
       api.getLiquidity(year).then(setLiq);
       api.getCreditsDebts(year).then(setCd);
+      api.getMonthlyFxRates(year).then(setRates);
     });
   }, [year, refreshTick]);
+
+  // Converts a row's own balance into the reference currency at month `m`'s
+  // own rate. Returns 0, rather than a wrong figure, when the row's
+  // currency has no resolved rate for that month.
+  const toRefAmount = (amount: number, currency: Currency, m: number): number => {
+    if (currency === refCurrency) return amount;
+    const rate = rates?.months.find((r) => r.month === m)?.rate_to_reference[currency];
+    return rate ? amount * rate : 0;
+  };
 
   // Optimistic updates: see the file-level comment on cell edits above.
   const setLiqCell = async (id: string, m: number, v: number) => {
@@ -413,7 +489,8 @@ function LiquidityTab() {
         title="Liquidity"
         rows={liq}
         year={year}
-        valueFor={(r, m) => toRef(r.data[year]?.[m] ?? 0, r.currency)}
+        refCurrency={refCurrency}
+        valueFor={(r, m) => toRefAmount(r.data[year]?.[m] ?? 0, r.currency, m)}
         onCellCommit={setLiqCell}
         renderAddForm={() => (
           <AddLiquidityForm
@@ -491,7 +568,8 @@ function LiquidityTab() {
         title="Credits & Debts"
         rows={cd}
         year={year}
-        valueFor={(r, m) => toRef(r.data[year]?.[m] ?? 0, r.currency)}
+        refCurrency={refCurrency}
+        valueFor={(r, m) => toRefAmount(r.data[year]?.[m] ?? 0, r.currency, m)}
         onCellCommit={setCdCell}
         renderAddForm={() => (
           <AddCreditDebtForm
@@ -556,17 +634,18 @@ interface BaseRow {
 /**
  * Generic monthly editable table shared by the Liquidity and Credits/Debts
  * sections. `R` is the row type (`LiquidityRow` or `CreditDebtRow`); the
- * caller supplies `valueFor` to read a cell (already converted to the
- * reference currency via `toRef`) and the `render*` props to customize the
- * name cell, per-row metadata columns, and row actions without this
- * component needing to know about categories or currencies directly. Set
- * `signed` to color negative and positive values (used for Credits/Debts,
- * where a row can be a debt or a credit).
+ * caller supplies `valueFor` to read a cell already converted into
+ * `refCurrency` and the `render*` props to customize the name cell, per-row
+ * metadata columns, and row actions without this component needing to know
+ * about categories or currencies directly. Set `signed` to color negative
+ * and positive values (used for Credits/Debts, where a row can be a debt or
+ * a credit).
  */
 function LiquiditySection<R extends BaseRow>({
   title,
   rows,
   year,
+  refCurrency,
   valueFor,
   onCellCommit,
   renderAddForm,
@@ -579,6 +658,7 @@ function LiquiditySection<R extends BaseRow>({
   title: string;
   rows: R[];
   year: number;
+  refCurrency: Currency;
   valueFor: (r: R, m: number) => number;
   onCellCommit: (id: string, m: number, v: number) => void;
   renderAddForm: () => React.ReactNode;
@@ -639,7 +719,7 @@ function LiquiditySection<R extends BaseRow>({
               </tr>
             ))}
             <tr className="bg-muted/30 font-semibold">
-              <td className="px-3 py-2">Total (€)</td>
+              <td className="px-3 py-2">Total ({refCurrency})</td>
               {metaHeaders.map((h) => (
                 <td key={h} />
               ))}
@@ -648,7 +728,7 @@ function LiquiditySection<R extends BaseRow>({
                   key={i}
                   className={`px-2 py-2 text-right tabular-nums ${signed && t < 0 ? "text-destructive" : ""}`}
                 >
-                  {formatRef(t)}
+                  {formatRef(t, refCurrency)}
                 </td>
               ))}
               <td />
@@ -745,99 +825,143 @@ function AddCreditDebtForm({
 }
 
 // ────────────────────────────────────────────────────────────── Total Net Worth
-function TotalTab() {
+function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) {
   const colorAt = useChartColors();
-  const { year, month, refreshTick } = useApp();
-  const [assets, setAssets] = useState<InvestmentAsset[]>([]);
-  const [liq, setLiq] = useState<LiquidityRow[]>([]);
-  const [cd, setCd] = useState<CreditDebtRow[]>([]);
+  const { year, month, refreshTick, notify, refresh } = useApp();
   const { theme } = useTheme();
   const totalStroke = theme === "arctic" ? "oklch(0.30 0.10 260)" : "oklch(0.95 0.02 260)";
   const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
+  const refCurrency = currencySettings.reference_currency;
+
+  // The grid, pie, and evolution chart all come pre-aggregated and
+  // pre-converted into `refCurrency` from the backend; this tab no longer
+  // sums raw investment/liquidity/credits-debts rows itself. `null` means
+  // the backend found nothing to report (every value zero) for that
+  // year/month, not that the request is still in flight; see the file-level
+  // comment for why this file skips a separate loading state, matching the
+  // rest of this page.
+  const [evolution, setEvolution] = useState<NetworthEvolution | null>(null);
+  const [allocation, setAllocation] = useState<NetworthAllocation | null>(null);
 
   useEffect(() => {
     api.ensureYear(year).then(() => {
-      api.getInvestments(year).then(setAssets);
-      api.getLiquidity(year).then(setLiq);
-      api.getCreditsDebts(year).then(setCd);
+      api.getNetworthEvolution(year).then(setEvolution);
+      api.getNetworthAllocation(year, month).then(setAllocation);
     });
+  }, [year, month, refreshTick]);
+
+  // December of the prior year's net worth (reference currency), the
+  // baseline for January's month-over-month delta. `getNetworthEvolution`
+  // only ever returns `year`'s own 12 months, so the prior December figure
+  // needs its own request against `year - 1`. A `null` response there means
+  // no prior-year data at all, which this treats as a baseline of 0, the
+  // same value the row cells themselves default to when unset.
+  const [prevDecNetWorth, setPrevDecNetWorth] = useState(0);
+  useEffect(() => {
+    api.getNetworthEvolution(year - 1).then((e) => setPrevDecNetWorth(e ? e.net_worth[11] : 0));
   }, [year, refreshTick]);
 
-  const months = Array.from({ length: 12 }, (_, i) => i + 1);
+  // Display currency: defaults to the reference currency until the user
+  // explicitly picks another one.
+  const [displayCurrencyChoice, setDisplayCurrencyChoice] = useState<Currency | null>(null);
+  const displayCurrency = displayCurrencyChoice ?? refCurrency;
 
-  // Sums each investment category's value (qty * price) into a 12-slot
-  // array per category. Unlike liquidity and credits/debts below,
-  // `InvestmentAsset` has no `currency` field, so this total is not passed
-  // through `toRef`.
-  const invByCatMonthly = useMemo(() => {
-    const out: Record<string, number[]> = {};
-    for (const c of INV_CATS) out[c] = Array(12).fill(0);
-    for (const a of assets) {
-      for (const m of months) {
-        const cell = a.data[year]?.[m] ?? { qty: 0, price: 0 };
-        out[a.category][m - 1] += cell.qty * cell.price;
-      }
+  // Rates for the display currency, one per calendar month of `year` plus
+  // December of `year - 1` for the January baseline. Fetched only when the
+  // display currency differs from the reference currency, since the
+  // reference currency needs no conversion at all.
+  const [displayRates, setDisplayRates] = useState<MonthlyFxRates | null>(null);
+  const [prevDisplayRates, setPrevDisplayRates] = useState<MonthlyFxRates | null>(null);
+  useEffect(() => {
+    if (displayCurrency === refCurrency) {
+      setDisplayRates(null);
+      setPrevDisplayRates(null);
+      return;
     }
-    return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [assets, year]);
+    api.getMonthlyFxRates(year, [displayCurrency]).then(setDisplayRates);
+    api.getMonthlyFxRates(year - 1, [displayCurrency]).then(setPrevDisplayRates);
+  }, [year, displayCurrency, refCurrency, refreshTick]);
 
-  const liqTotal = months.map((m) =>
-    liq.reduce((s, r) => s + toRef(r.data[year]?.[m] ?? 0, r.currency), 0),
-  );
-  const cdTotal = months.map((m) =>
-    cd.reduce((s, r) => s + toRef(r.data[year]?.[m] ?? 0, r.currency), 0),
-  );
-  const invTotal = months.map((_, i) => INV_CATS.reduce((s, c) => s + invByCatMonthly[c][i], 0));
-  const total = months.map((_, i) => invTotal[i] + liqTotal[i] + cdTotal[i]);
+  const displayUnavailable =
+    displayRates?.unavailable_currencies.includes(displayCurrency) ?? false;
+  // Falls back to the reference currency, with a warning banner below,
+  // rather than rendering a blank or wrong figure when the chosen display
+  // currency has no resolved rate at all.
+  const shownCurrency = displayUnavailable ? refCurrency : displayCurrency;
 
-  // January's month-over-month delta needs a "previous month" total, but
-  // there is no month 0 in the current year, so decPrev recomputes
-  // December of the prior year as that baseline. It re-derives the total
-  // from `assets`/`liq`/`cd` rather than reusing `invTotal`/`liqTotal`,
-  // since those arrays only hold `year`'s 12 months.
-  const prevYear = year - 1;
-  const decPrev = useMemo(() => {
-    const inv = INV_CATS.reduce((s, c) => {
-      return (
-        s +
-        assets.reduce((ss, a) => {
-          if (a.category !== c) return ss;
-          const cell = a.data[prevYear]?.[12] ?? { qty: 0, price: 0 };
-          return ss + cell.qty * cell.price;
-        }, 0)
-      );
-    }, 0);
-    const l = liq.reduce((s, r) => s + toRef(r.data[prevYear]?.[12] ?? 0, r.currency), 0);
-    const c = cd.reduce((s, r) => s + toRef(r.data[prevYear]?.[12] ?? 0, r.currency), 0);
-    return inv + l + c;
-  }, [assets, liq, cd, prevYear]);
+  // Converts a reference-currency amount into `shownCurrency` using *that
+  // calendar month's own* rate, not one current rate: the user chose this
+  // deliberately, since a single rate would hide currency movement inside
+  // the portfolio curve. `referenceToDisplay` returns `null` for a missing
+  // rate, which this reports as 0 rather than propagating `NaN`.
+  const convert = (amountInReference: number, m: number): number => {
+    if (shownCurrency === refCurrency) return amountInReference;
+    const rate = displayRates?.months.find((r) => r.month === m)?.rate_to_reference[shownCurrency];
+    return referenceToDisplay(amountInReference, rate) ?? 0;
+  };
+  const convertPrevDec = (amountInReference: number): number => {
+    if (shownCurrency === refCurrency) return amountInReference;
+    const rate = prevDisplayRates?.months.find((r) => r.month === 12)?.rate_to_reference[
+      shownCurrency
+    ];
+    return referenceToDisplay(amountInReference, rate) ?? 0;
+  };
+
+  const updateRateMode = async (mode: CurrentMonthRateMode) => {
+    try {
+      await api.updateCurrencySettings({ ...currencySettings, current_month_rate_mode: mode });
+      notify("success", "Updated current-month rate mode");
+    } catch (err) {
+      notify("error", err instanceof Error ? err.message : "Update failed");
+    }
+    refresh();
+  };
+
+  const months = Array.from({ length: 12 }, (_, i) => i + 1);
+  const zeros = () => Array(12).fill(0);
+
+  const invByCat: Record<InvestmentCategory, number[]> = {
+    "Stocks/ETF": zeros(),
+    Commodities: zeros(),
+    Bonds: zeros(),
+  };
+  let liqTotal = zeros();
+  let cdTotal = zeros();
+  if (evolution) {
+    for (const c of INV_CATS) {
+      const series = evolution.components.find((s) => s.name === c)?.values ?? zeros();
+      invByCat[c] = series.map((v, i) => convert(v, i + 1));
+    }
+    const liqSeries = evolution.components.find((s) => s.name === "Liquidity")?.values ?? zeros();
+    const cdSeries =
+      evolution.components.find((s) => s.name === "Credits/Debts")?.values ?? zeros();
+    liqTotal = liqSeries.map((v, i) => convert(v, i + 1));
+    cdTotal = cdSeries.map((v, i) => convert(v, i + 1));
+  }
+  const invTotal = months.map((_, i) => INV_CATS.reduce((s, c) => s + invByCat[c][i], 0));
+  const total = evolution ? evolution.net_worth.map((v, i) => convert(v, i + 1)) : zeros();
 
   // Each month's delta is against the prior month's total, except January,
-  // which is measured against decPrev (December of the prior year).
+  // which is measured against decPrev (December of the prior year,
+  // converted at that same December's own rate).
+  const decPrev = convertPrevDec(prevDecNetWorth);
   const delta = total.map((t, i) => t - (i === 0 ? decPrev : total[i - 1]));
   const deltaPct = total.map((t, i) => {
     const base = i === 0 ? decPrev : total[i - 1];
     return base > 0 ? (100 * (t - base)) / base : 0;
   });
 
-  // Allocation pie for active month
-  const pieData = useMemo(() => {
-    const out: { name: string; value: number }[] = [];
-    for (const c of INV_CATS) {
-      const v = invByCatMonthly[c][month - 1];
-      if (v) out.push({ name: c, value: v });
-    }
-    if (liqTotal[month - 1]) out.push({ name: "Liquidity", value: liqTotal[month - 1] });
-    if (cdTotal[month - 1] !== 0)
-      out.push({ name: "Credits/Debts", value: Math.abs(cdTotal[month - 1]) });
-    return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [invByCatMonthly, liqTotal, cdTotal, month]);
+  // Allocation pie for the active month: the backend already picks which
+  // slices qualify (only `> 0`, with "Credits"/"Debts" split by sign), so
+  // this only needs to convert each slice's value.
+  const pieData = (allocation?.slices ?? []).map((s) => ({
+    name: s.name,
+    value: convert(s.value, month),
+  }));
 
-  // Evolution data
+  const evoLabels = evolution?.months ?? MONTHS_SHORT;
   const evoData = months.map((m, i) => ({
-    month: MONTHS_SHORT[m - 1],
+    month: evoLabels[i],
     Investments: invTotal[i],
     Liquidity: liqTotal[i],
     "Credits/Debts": cdTotal[i],
@@ -846,173 +970,226 @@ function TotalTab() {
 
   return (
     <div className="space-y-5">
-      <GlassCard title={`Net Worth grid · ${year}`}>
-        <div className="scrollbar-thin overflow-x-auto">
-          <table className="w-full min-w-[1100px] text-sm">
-            <thead>
-              <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
-                <th className="px-3 py-2 font-medium">Component</th>
-                {MONTHS_SHORT.map((m) => (
-                  <th key={m} className="px-2 py-2 text-right font-medium">
-                    {m}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border/40">
-              {INV_CATS.map((c, idx) => (
-                <tr key={c} className="hover:bg-muted/20">
-                  <td className="px-3 py-1.5">
-                    <span
-                      className="mr-2 inline-block h-2 w-2 rounded-full"
-                      style={{ background: colorAt(idx) }}
-                    />
-                    {c}
-                  </td>
-                  {invByCatMonthly[c].map((v, i) => (
-                    <td key={i} className="px-2 py-1.5 text-right text-xs tabular-nums">
-                      {formatRef(v)}
-                    </td>
-                  ))}
-                </tr>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">
+          Figures below are shown in {shownCurrency}
+          {shownCurrency !== refCurrency ? ", each month at that month's own rate" : ""}.
+        </p>
+        <div className="flex flex-wrap items-center gap-4">
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            Display currency
+            <select
+              value={displayCurrency}
+              onChange={(e) => setDisplayCurrencyChoice(e.target.value as Currency)}
+              className="rounded-md border border-border bg-surface/60 px-2 py-1 text-sm text-foreground"
+            >
+              {CURRENCIES.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
               ))}
-              <tr className="hover:bg-muted/20">
-                <td className="px-3 py-1.5">Liquidity total</td>
-                {liqTotal.map((v, i) => (
-                  <td key={i} className="px-2 py-1.5 text-right text-xs tabular-nums">
-                    {formatRef(v)}
-                  </td>
-                ))}
-              </tr>
-              <tr className="hover:bg-muted/20">
-                <td className="px-3 py-1.5">Credits & Debts</td>
-                {cdTotal.map((v, i) => (
-                  <td
-                    key={i}
-                    className={`px-2 py-1.5 text-right text-xs tabular-nums ${v < 0 ? "text-destructive" : ""}`}
-                  >
-                    {formatRef(v)}
-                  </td>
-                ))}
-              </tr>
-              <tr className="bg-muted/30 font-semibold">
-                <td className="px-3 py-2 text-gradient">Total Net Worth</td>
-                {total.map((v, i) => (
-                  <td key={i} className="px-2 py-2 text-right tabular-nums">
-                    {formatRef(v)}
-                  </td>
-                ))}
-              </tr>
-              <tr className="font-semibold">
-                <td className="px-3 py-1.5">Monthly Change</td>
-                {delta.map((v, i) => (
-                  <td
-                    key={i}
-                    className={`px-2 py-1.5 text-right tabular-nums ${v >= 0 ? "text-success" : "text-destructive"}`}
-                  >
-                    {v >= 0 ? "+" : ""}
-                    {formatRef(v)}
-                  </td>
-                ))}
-              </tr>
-              <tr className="font-semibold">
-                <td className="px-3 py-1.5">% Change</td>
-                {deltaPct.map((v, i) => (
-                  <td
-                    key={i}
-                    className={`px-2 py-1.5 text-right tabular-nums ${v >= 0 ? "text-success" : "text-destructive"}`}
-                  >
-                    {v >= 0 ? "+" : ""}
-                    {v.toFixed(1)}%
-                  </td>
-                ))}
-              </tr>
-            </tbody>
-          </table>
+            </select>
+          </label>
+          <label
+            className="flex items-center gap-2 text-xs text-muted-foreground"
+            title="Only changes how the in-progress month is priced. Completed months stay frozen at their own month-end rate."
+          >
+            Current-month rate
+            <select
+              value={currencySettings.current_month_rate_mode}
+              onChange={(e) => updateRateMode(e.target.value as CurrentMonthRateMode)}
+              className="rounded-md border border-border bg-surface/60 px-2 py-1 text-sm text-foreground"
+            >
+              <option value="previous_month_end">Frozen (prior month-end)</option>
+              <option value="live">Live</option>
+            </select>
+          </label>
         </div>
-      </GlassCard>
-
-      <div className="grid gap-5 lg:grid-cols-[1fr_1.4fr]">
-        <GlassCard title={`Allocation · ${MONTHS[month - 1]} ${year}`}>
-          <div className="h-80">
-            <ResponsiveContainer>
-              <PieChart>
-                <Pie
-                  data={pieData}
-                  dataKey="value"
-                  nameKey="name"
-                  innerRadius={60}
-                  outerRadius={110}
-                  paddingAngle={2}
-                >
-                  {pieData.map((_, i) => (
-                    <Cell key={i} fill={colorAt(i)} stroke="oklch(0.16 0.02 265)" />
-                  ))}
-                </Pie>
-                <Tooltip content={<DarkTooltip />} />
-                <Legend verticalAlign="bottom" wrapperStyle={LEGEND_STYLE} />
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-        </GlassCard>
-
-        <GlassCard title={`Evolution · ${year}`}>
-          <div className="h-80">
-            <ResponsiveContainer>
-              <ComposedChart data={evoData}>
-                <defs>
-                  <linearGradient id="g-inv" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={colorAt(0)} stopOpacity={0.6} />
-                    <stop offset="100%" stopColor={colorAt(0)} stopOpacity={0.05} />
-                  </linearGradient>
-                  <linearGradient id="g-liq" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={colorAt(1)} stopOpacity={0.6} />
-                    <stop offset="100%" stopColor={colorAt(1)} stopOpacity={0.05} />
-                  </linearGradient>
-                  <linearGradient id="g-cd" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={colorAt(4)} stopOpacity={0.6} />
-                    <stop offset="100%" stopColor={colorAt(4)} stopOpacity={0.05} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
-                <XAxis dataKey="month" tick={{ fontSize: 18, fill: tickColor }} />
-                <YAxis tick={{ fontSize: 18, fill: tickColor }} />
-                <Tooltip content={<DarkTooltip total />} />
-                <Legend wrapperStyle={LEGEND_STYLE} />
-                <Area
-                  type="monotone"
-                  dataKey="Investments"
-                  stackId="1"
-                  stroke={colorAt(0)}
-                  fill="url(#g-inv)"
-                />
-                <Area
-                  type="monotone"
-                  dataKey="Liquidity"
-                  stackId="1"
-                  stroke={colorAt(1)}
-                  fill="url(#g-liq)"
-                />
-                <Area
-                  type="monotone"
-                  dataKey="Credits/Debts"
-                  stackId="1"
-                  stroke={colorAt(4)}
-                  fill="url(#g-cd)"
-                />
-                <Line
-                  type="monotone"
-                  dataKey="Total"
-                  stroke={totalStroke}
-                  strokeWidth={3}
-                  dot={{ r: 4 }}
-                  activeDot={{ r: 6 }}
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </div>
-        </GlassCard>
       </div>
+
+      {displayUnavailable && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          {displayCurrency} has no available exchange rate right now, showing {refCurrency} instead.
+        </div>
+      )}
+
+      {evolution === null ? (
+        <GlassCard title={`Net Worth · ${year}`}>
+          <p className="px-3 py-8 text-center text-muted-foreground">
+            No net worth data for {year} yet.
+          </p>
+        </GlassCard>
+      ) : (
+        <>
+          <GlassCard title={`Net Worth grid · ${year} (${shownCurrency})`}>
+            <div className="scrollbar-thin overflow-x-auto">
+              <table className="w-full min-w-[1100px] text-sm">
+                <thead>
+                  <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
+                    <th className="px-3 py-2 font-medium">Component</th>
+                    {evoLabels.map((m) => (
+                      <th key={m} className="px-2 py-2 text-right font-medium">
+                        {m}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/40">
+                  {INV_CATS.map((c, idx) => (
+                    <tr key={c} className="hover:bg-muted/20">
+                      <td className="px-3 py-1.5">
+                        <span
+                          className="mr-2 inline-block h-2 w-2 rounded-full"
+                          style={{ background: colorAt(idx) }}
+                        />
+                        {c}
+                      </td>
+                      {invByCat[c].map((v, i) => (
+                        <td key={i} className="px-2 py-1.5 text-right text-xs tabular-nums">
+                          {formatRef(v, shownCurrency)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                  <tr className="hover:bg-muted/20">
+                    <td className="px-3 py-1.5">Liquidity total</td>
+                    {liqTotal.map((v, i) => (
+                      <td key={i} className="px-2 py-1.5 text-right text-xs tabular-nums">
+                        {formatRef(v, shownCurrency)}
+                      </td>
+                    ))}
+                  </tr>
+                  <tr className="hover:bg-muted/20">
+                    <td className="px-3 py-1.5">Credits & Debts</td>
+                    {cdTotal.map((v, i) => (
+                      <td
+                        key={i}
+                        className={`px-2 py-1.5 text-right text-xs tabular-nums ${v < 0 ? "text-destructive" : ""}`}
+                      >
+                        {formatRef(v, shownCurrency)}
+                      </td>
+                    ))}
+                  </tr>
+                  <tr className="bg-muted/30 font-semibold">
+                    <td className="px-3 py-2 text-gradient">Total Net Worth</td>
+                    {total.map((v, i) => (
+                      <td key={i} className="px-2 py-2 text-right tabular-nums">
+                        {formatRef(v, shownCurrency)}
+                      </td>
+                    ))}
+                  </tr>
+                  <tr className="font-semibold">
+                    <td className="px-3 py-1.5">Monthly Change</td>
+                    {delta.map((v, i) => (
+                      <td
+                        key={i}
+                        className={`px-2 py-1.5 text-right tabular-nums ${v >= 0 ? "text-success" : "text-destructive"}`}
+                      >
+                        {v >= 0 ? "+" : ""}
+                        {formatRef(v, shownCurrency)}
+                      </td>
+                    ))}
+                  </tr>
+                  <tr className="font-semibold">
+                    <td className="px-3 py-1.5">% Change</td>
+                    {deltaPct.map((v, i) => (
+                      <td
+                        key={i}
+                        className={`px-2 py-1.5 text-right tabular-nums ${v >= 0 ? "text-success" : "text-destructive"}`}
+                      >
+                        {v >= 0 ? "+" : ""}
+                        {v.toFixed(1)}%
+                      </td>
+                    ))}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </GlassCard>
+
+          <div className="grid gap-5 lg:grid-cols-[1fr_1.4fr]">
+            <GlassCard title={`Allocation · ${MONTHS[month - 1]} ${year} (${shownCurrency})`}>
+              <div className="h-80">
+                <ResponsiveContainer>
+                  <PieChart>
+                    <Pie
+                      data={pieData}
+                      dataKey="value"
+                      nameKey="name"
+                      innerRadius={60}
+                      outerRadius={110}
+                      paddingAngle={2}
+                    >
+                      {pieData.map((_, i) => (
+                        <Cell key={i} fill={colorAt(i)} stroke="oklch(0.16 0.02 265)" />
+                      ))}
+                    </Pie>
+                    <Tooltip content={<DarkTooltip currency={shownCurrency} />} />
+                    <Legend verticalAlign="bottom" wrapperStyle={LEGEND_STYLE} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+            </GlassCard>
+
+            <GlassCard title={`Evolution · ${year} (${shownCurrency})`}>
+              <div className="h-80">
+                <ResponsiveContainer>
+                  <ComposedChart data={evoData}>
+                    <defs>
+                      <linearGradient id="g-inv" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={colorAt(0)} stopOpacity={0.6} />
+                        <stop offset="100%" stopColor={colorAt(0)} stopOpacity={0.05} />
+                      </linearGradient>
+                      <linearGradient id="g-liq" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={colorAt(1)} stopOpacity={0.6} />
+                        <stop offset="100%" stopColor={colorAt(1)} stopOpacity={0.05} />
+                      </linearGradient>
+                      <linearGradient id="g-cd" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={colorAt(4)} stopOpacity={0.6} />
+                        <stop offset="100%" stopColor={colorAt(4)} stopOpacity={0.05} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
+                    <XAxis dataKey="month" tick={{ fontSize: 18, fill: tickColor }} />
+                    <YAxis tick={{ fontSize: 18, fill: tickColor }} />
+                    <Tooltip content={<DarkTooltip total currency={shownCurrency} />} />
+                    <Legend wrapperStyle={LEGEND_STYLE} />
+                    <Area
+                      type="monotone"
+                      dataKey="Investments"
+                      stackId="1"
+                      stroke={colorAt(0)}
+                      fill="url(#g-inv)"
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="Liquidity"
+                      stackId="1"
+                      stroke={colorAt(1)}
+                      fill="url(#g-liq)"
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="Credits/Debts"
+                      stackId="1"
+                      stroke={colorAt(4)}
+                      fill="url(#g-cd)"
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="Total"
+                      stroke={totalStroke}
+                      strokeWidth={3}
+                      dot={{ r: 4 }}
+                      activeDot={{ r: 6 }}
+                    />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </GlassCard>
+          </div>
+        </>
+      )}
     </div>
   );
 }
