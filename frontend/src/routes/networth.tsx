@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   Area,
   AreaChart,
@@ -75,6 +75,50 @@ import { useTheme } from "@/context/ThemeContext";
 //   `getMonthlyFxRates`, rather than one current rate, so the shown curve
 //   reflects what the holdings were actually worth in that currency at that
 //   time (a deliberate product choice, not an approximation).
+
+// Shared by every tab below, for the two failure modes a fetch on this page
+// can hit: the request itself can reject, or it can succeed with a figure
+// that is not really known yet (still loading) or not really convertible
+// (no exchange rate). Neither may be displayed as if it were real data; see
+// `ErrorBanner` and `fmtOrDash`.
+
+/** Extracts a readable message from a caught value. A rejected fetch can throw anything, not only an `Error`. */
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback;
+}
+
+/**
+ * This page's one visual treatment for "a request failed", so a genuine
+ * fetch failure never renders as the empty-data state it would otherwise be
+ * indistinguishable from. Every tab below reuses it instead of inventing
+ * its own error styling.
+ */
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+      {message}
+    </div>
+  );
+}
+
+/**
+ * Renders a reference-currency amount, or a marked dash when `value` is
+ * `null`. `null` here always means "no exchange rate was available to
+ * compute this", which must never be conflated with a real balance of
+ * zero, so this is used instead of calling `formatRef` directly wherever a
+ * figure could be missing.
+ */
+function fmtOrDash(value: number | null, currency: Currency): ReactNode {
+  if (value === null) {
+    return (
+      <span className="text-warning" title="No exchange rate available for this period">
+        —
+      </span>
+    );
+  }
+  return formatRef(value, currency);
+}
+
 export const Route = createFileRoute("/networth")({
   head: () => ({ meta: [{ title: "Net Worth · Finguard" }] }),
   component: NetWorthPage,
@@ -123,9 +167,18 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
   const [view, setView] = useState<"holdings" | "prices" | "value">("value");
   const [adding, setAdding] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
+  // Distinct from `assets` staying empty: a fetch failure must not render
+  // as "No investments yet.", since that reads as "you own nothing", the
+  // opposite of a load error.
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.ensureYear(year).then(() => api.getInvestments(year).then(setAssets));
+    setLoadError(null);
+    api
+      .ensureYear(year)
+      .then(() => api.getInvestments(year))
+      .then(setAssets)
+      .catch((err) => setLoadError(errorMessage(err, "Failed to load investments")));
   }, [year, refreshTick]);
 
   // Optimistic update: see the file-level comment on cell edits above.
@@ -181,6 +234,8 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
           }}
         />
       )}
+
+      {loadError && <ErrorBanner message={`Could not load investments: ${loadError}`} />}
 
       <GlassCard title={`Investments · ${year}`}>
         <div className="scrollbar-thin overflow-x-auto">
@@ -335,7 +390,7 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
                   </tr>
                 );
               })}
-              {assets.length === 0 && (
+              {assets.length === 0 && !loadError && (
                 <tr>
                   <td colSpan={17} className="px-3 py-8 text-center text-muted-foreground">
                     No investments yet.
@@ -434,22 +489,47 @@ function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
   // to convert each row's own balance into the reference currency for the
   // section totals below.
   const [rates, setRates] = useState<MonthlyFxRates | null>(null);
+  const [liqError, setLiqError] = useState<string | null>(null);
+  const [cdError, setCdError] = useState<string | null>(null);
+  // Set only once the rates request settles, successfully or not, so
+  // `rates === null && !ratesError` unambiguously means "still loading"
+  // (see `toRefAmount`, which depends on telling that apart from "resolved,
+  // but this currency has no rate").
+  const [ratesError, setRatesError] = useState<string | null>(null);
 
   useEffect(() => {
+    setLiqError(null);
+    setCdError(null);
+    setRatesError(null);
     api.ensureYear(year).then(() => {
-      api.getLiquidity(year).then(setLiq);
-      api.getCreditsDebts(year).then(setCd);
-      api.getMonthlyFxRates(year).then(setRates);
+      api
+        .getLiquidity(year)
+        .then(setLiq)
+        .catch((err) => setLiqError(errorMessage(err, "Failed to load liquidity rows")));
+      api
+        .getCreditsDebts(year)
+        .then(setCd)
+        .catch((err) => setCdError(errorMessage(err, "Failed to load credit/debt rows")));
+      api
+        .getMonthlyFxRates(year)
+        .then(setRates)
+        .catch((err) => setRatesError(errorMessage(err, "Failed to load exchange rates")));
     });
   }, [year, refreshTick]);
 
   // Converts a row's own balance into the reference currency at month `m`'s
-  // own rate. Returns 0, rather than a wrong figure, when the row's
-  // currency has no resolved rate for that month.
-  const toRefAmount = (amount: number, currency: Currency, m: number): number => {
-    if (currency === refCurrency) return amount;
-    const rate = rates?.months.find((r) => r.month === m)?.rate_to_reference[currency];
-    return rate ? amount * rate : 0;
+  // own rate, reporting which of three states applies rather than always
+  // returning a number: `ok` (converted), `loading` (the rates request has
+  // not settled yet), or `unavailable` (it settled, successfully or not,
+  // but this currency still has no rate for this month). Collapsing these
+  // into a plain number, with 0 for the two failure cases, is exactly the
+  // bug this type exists to prevent: a missing row would silently vanish
+  // from the Total row's sum instead of being visibly excluded.
+  const toRefAmount = (amount: number, currency: Currency, m: number): RefAmount => {
+    if (currency === refCurrency) return { kind: "ok", value: amount };
+    if (rates === null) return { kind: ratesError ? "unavailable" : "loading" };
+    const rate = rates.months.find((r) => r.month === m)?.rate_to_reference[currency];
+    return rate ? { kind: "ok", value: amount * rate } : { kind: "unavailable" };
   };
 
   // Optimistic updates: see the file-level comment on cell edits above.
@@ -488,6 +568,13 @@ function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
 
   return (
     <div className="space-y-5">
+      {liqError && <ErrorBanner message={`Could not load liquidity rows: ${liqError}`} />}
+      {cdError && <ErrorBanner message={`Could not load credit/debt rows: ${cdError}`} />}
+      {ratesError && (
+        <ErrorBanner
+          message={`Could not load exchange rates: ${ratesError}. Totals below may be incomplete.`}
+        />
+      )}
       <LiquiditySection
         title="Liquidity"
         rows={liq}
@@ -637,6 +724,17 @@ interface BaseRow {
 }
 
 /**
+ * One row's contribution to a `LiquiditySection` total for one month: `ok`
+ * carries the converted amount, `loading` means the rates needed to
+ * convert it have not arrived yet, and `unavailable` means they arrived (or
+ * failed to) without a usable rate for this row's currency. Kept apart
+ * instead of always being a number, since `LiquiditySection`'s total row
+ * must render `loading` and `unavailable` differently from a real value,
+ * and never as 0.
+ */
+type RefAmount = { kind: "ok"; value: number } | { kind: "loading" } | { kind: "unavailable" };
+
+/**
  * Generic monthly editable table shared by the Liquidity and Credits/Debts
  * sections. `R` is the row type (`LiquidityRow` or `CreditDebtRow`); the
  * caller supplies `valueFor` to read a cell already converted into
@@ -664,7 +762,7 @@ function LiquiditySection<R extends BaseRow>({
   rows: R[];
   year: number;
   refCurrency: Currency;
-  valueFor: (r: R, m: number) => number;
+  valueFor: (r: R, m: number) => RefAmount;
   onCellCommit: (id: string, m: number, v: number) => void;
   renderAddForm: () => React.ReactNode;
   renderMeta: (r: R) => React.ReactNode;
@@ -674,7 +772,22 @@ function LiquiditySection<R extends BaseRow>({
   signed?: boolean;
 }) {
   const months = Array.from({ length: 12 }, (_, i) => i + 1);
-  const totals = months.map((m) => rows.reduce((s, r) => s + valueFor(r, m), 0));
+  // A month's total is `loading` if any row's conversion is still pending,
+  // `incomplete` if every row settled but at least one could not convert
+  // (the sum below excludes it rather than treating it as 0), and `ok`
+  // only when every row resolved.
+  type Total =
+    | { kind: "loading" }
+    | { kind: "incomplete"; value: number }
+    | { kind: "ok"; value: number };
+  const totals: Total[] = months.map((m) => {
+    const cells = rows.map((r) => valueFor(r, m));
+    if (cells.some((c) => c.kind === "loading")) return { kind: "loading" };
+    const value = cells.reduce((s, c) => s + (c.kind === "ok" ? c.value : 0), 0);
+    return cells.some((c) => c.kind === "unavailable")
+      ? { kind: "incomplete", value }
+      : { kind: "ok", value };
+  });
 
   return (
     <GlassCard title={title} action={renderAddForm()}>
@@ -729,11 +842,23 @@ function LiquiditySection<R extends BaseRow>({
                 <td key={h} />
               ))}
               {totals.map((t, i) => (
-                <td
-                  key={i}
-                  className={`px-2 py-2 text-right tabular-nums ${signed && t < 0 ? "text-destructive" : ""}`}
-                >
-                  {formatRef(t, refCurrency)}
+                <td key={i} className="px-2 py-2 text-right tabular-nums">
+                  {t.kind === "loading" ? (
+                    <span className="text-muted-foreground" title="Loading exchange rates">
+                      …
+                    </span>
+                  ) : t.kind === "incomplete" ? (
+                    <span
+                      className="text-warning"
+                      title="One or more currencies could not be converted for this month; this total excludes them"
+                    >
+                      {formatRef(t.value, refCurrency)}*
+                    </span>
+                  ) : (
+                    <span className={signed && t.value < 0 ? "text-destructive" : ""}>
+                      {formatRef(t.value, refCurrency)}
+                    </span>
+                  )}
                 </td>
               ))}
               <td />
@@ -845,17 +970,29 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   // The grid, pie, and evolution chart all come pre-aggregated and
   // pre-converted into `refCurrency` from the backend; this tab no longer
   // sums raw investment/liquidity/credits-debts rows itself. `null` means
-  // the backend found nothing to report (every value zero) for that
-  // year/month, not that the request is still in flight; see the file-level
-  // comment for why this file skips a separate loading state, matching the
-  // rest of this page.
+  // either the backend found nothing to report (every value zero) for that
+  // year/month, or the request has not resolved yet; `evolutionError`
+  // and `allocationError` are what distinguish a genuine empty year from a
+  // failed request, since both would otherwise leave the value at `null`.
   const [evolution, setEvolution] = useState<NetworthEvolution | null>(null);
   const [allocation, setAllocation] = useState<NetworthAllocation | null>(null);
+  const [evolutionError, setEvolutionError] = useState<string | null>(null);
+  const [allocationError, setAllocationError] = useState<string | null>(null);
 
   useEffect(() => {
+    setEvolutionError(null);
+    setAllocationError(null);
     api.ensureYear(year).then(() => {
-      api.getNetworthEvolution(year).then(setEvolution);
-      api.getNetworthAllocation(year, month).then(setAllocation);
+      api
+        .getNetworthEvolution(year)
+        .then(setEvolution)
+        .catch((err) => setEvolutionError(errorMessage(err, "Failed to load net worth evolution")));
+      api
+        .getNetworthAllocation(year, month)
+        .then(setAllocation)
+        .catch((err) =>
+          setAllocationError(errorMessage(err, "Failed to load net worth allocation")),
+        );
     });
   }, [year, month, refreshTick]);
 
@@ -864,10 +1001,20 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   // only ever returns `year`'s own 12 months, so the prior December figure
   // needs its own request against `year - 1`. A `null` response there means
   // no prior-year data at all, which this treats as a baseline of 0, the
-  // same value the row cells themselves default to when unset.
+  // same value the row cells themselves default to when unset; a rejected
+  // request is a different case, tracked by `prevDecError` and left at
+  // whatever the last successful `prevDecNetWorth` was, so January's delta
+  // is marked unresolved below rather than measured against a wrong 0.
   const [prevDecNetWorth, setPrevDecNetWorth] = useState(0);
+  const [prevDecError, setPrevDecError] = useState<string | null>(null);
   useEffect(() => {
-    api.getNetworthEvolution(year - 1).then((e) => setPrevDecNetWorth(e ? e.net_worth[11] : 0));
+    setPrevDecError(null);
+    api
+      .getNetworthEvolution(year - 1)
+      .then((e) => setPrevDecNetWorth(e ? e.net_worth[11] : 0))
+      .catch((err) =>
+        setPrevDecError(errorMessage(err, "Failed to load last year's December net worth")),
+      );
   }, [year, refreshTick]);
 
   // Display currency: defaults to the reference currency until the user
@@ -878,42 +1025,81 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   // Rates for the display currency, one per calendar month of `year` plus
   // December of `year - 1` for the January baseline. Fetched only when the
   // display currency differs from the reference currency, since the
-  // reference currency needs no conversion at all.
+  // reference currency needs no conversion at all. Reset to `null` (and
+  // their errors cleared) on every re-run, including a plain display
+  // currency switch, so `displayRates === null` reliably means "loading"
+  // for whichever currency is currently selected, never stale data left
+  // over from the previous one.
   const [displayRates, setDisplayRates] = useState<MonthlyFxRates | null>(null);
   const [prevDisplayRates, setPrevDisplayRates] = useState<MonthlyFxRates | null>(null);
+  const [displayRatesError, setDisplayRatesError] = useState<string | null>(null);
+  const [prevDisplayRatesError, setPrevDisplayRatesError] = useState<string | null>(null);
   useEffect(() => {
-    if (displayCurrency === refCurrency) {
-      setDisplayRates(null);
-      setPrevDisplayRates(null);
-      return;
-    }
-    api.getMonthlyFxRates(year, [displayCurrency]).then(setDisplayRates);
-    api.getMonthlyFxRates(year - 1, [displayCurrency]).then(setPrevDisplayRates);
+    setDisplayRates(null);
+    setPrevDisplayRates(null);
+    setDisplayRatesError(null);
+    setPrevDisplayRatesError(null);
+    if (displayCurrency === refCurrency) return;
+    api
+      .getMonthlyFxRates(year, [displayCurrency])
+      .then(setDisplayRates)
+      .catch((err) =>
+        setDisplayRatesError(errorMessage(err, "Failed to load display-currency exchange rates")),
+      );
+    api
+      .getMonthlyFxRates(year - 1, [displayCurrency])
+      .then(setPrevDisplayRates)
+      .catch((err) =>
+        setPrevDisplayRatesError(
+          errorMessage(err, "Failed to load prior-year display-currency exchange rates"),
+        ),
+      );
   }, [year, displayCurrency, refCurrency, refreshTick]);
 
+  // A fetch failure is treated the same as the backend reporting the
+  // currency itself unavailable: either way there is no reliable rate to
+  // show `displayCurrency` with, so both fall back to the reference
+  // currency with the same warning banner rather than each needing its own
+  // UI.
   const displayUnavailable =
-    displayRates?.unavailable_currencies.includes(displayCurrency) ?? false;
+    (displayRates?.unavailable_currencies.includes(displayCurrency) ?? false) ||
+    displayRatesError !== null ||
+    prevDisplayRatesError !== null;
   // Falls back to the reference currency, with a warning banner below,
   // rather than rendering a blank or wrong figure when the chosen display
   // currency has no resolved rate at all.
   const shownCurrency = displayUnavailable ? refCurrency : displayCurrency;
+  // True only in the window between picking a non-reference display
+  // currency and its rates request resolving. Gates the grid, pie, and
+  // evolution chart below so they render a loading state instead of
+  // briefly showing every figure as 0, which is what happened before this
+  // fix: `convert`/`convertPrevDec` had no way to tell "not loaded yet"
+  // apart from "no rate at all", and defaulted both to 0.
+  const ratesLoading =
+    shownCurrency !== refCurrency &&
+    ((displayRates === null && displayRatesError === null) ||
+      (prevDisplayRates === null && prevDisplayRatesError === null));
 
   // Converts a reference-currency amount into `shownCurrency` using *that
   // calendar month's own* rate, not one current rate: the user chose this
   // deliberately, since a single rate would hide currency movement inside
-  // the portfolio curve. `referenceToDisplay` returns `null` for a missing
-  // rate, which this reports as 0 rather than propagating `NaN`.
-  const convert = (amountInReference: number, m: number): number => {
+  // the portfolio curve. Returns `null`, via `referenceToDisplay`, instead
+  // of a fabricated 0 when no rate resolved for this month; callers must
+  // render that with `fmtOrDash` rather than treating it as a real amount.
+  // By the time this runs `ratesLoading` has already gated the section that
+  // calls it, so a `null` here reflects a genuine per-month gap, not the
+  // rates simply not having arrived yet.
+  const convert = (amountInReference: number, m: number): number | null => {
     if (shownCurrency === refCurrency) return amountInReference;
     const rate = displayRates?.months.find((r) => r.month === m)?.rate_to_reference[shownCurrency];
-    return referenceToDisplay(amountInReference, rate) ?? 0;
+    return referenceToDisplay(amountInReference, rate);
   };
-  const convertPrevDec = (amountInReference: number): number => {
+  const convertPrevDec = (amountInReference: number): number | null => {
     if (shownCurrency === refCurrency) return amountInReference;
     const rate = prevDisplayRates?.months.find((r) => r.month === 12)?.rate_to_reference[
       shownCurrency
     ];
-    return referenceToDisplay(amountInReference, rate) ?? 0;
+    return referenceToDisplay(amountInReference, rate);
   };
 
   const updateRateMode = async (mode: CurrentMonthRateMode) => {
@@ -927,15 +1113,19 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   };
 
   const months = Array.from({ length: 12 }, (_, i) => i + 1);
-  const zeros = () => Array(12).fill(0);
+  const zeros = (): number[] => Array(12).fill(0);
 
-  const invByCat: Record<InvestmentCategory, number[]> = {
+  // Every array below is `(number | null)[]`, not `number[]`: `null` marks
+  // a month `convert` could not resolve. `ratesLoading` (checked in the
+  // render below) keeps that from ever meaning "still loading" here, so a
+  // `null` this far down always reflects a genuine per-month gap.
+  const invByCat: Record<InvestmentCategory, (number | null)[]> = {
     "Stocks/ETF": zeros(),
     Commodities: zeros(),
     Bonds: zeros(),
   };
-  let liqTotal = zeros();
-  let cdTotal = zeros();
+  let liqTotal: (number | null)[] = zeros();
+  let cdTotal: (number | null)[] = zeros();
   if (evolution) {
     for (const c of INV_CATS) {
       const series = evolution.components.find((s) => s.name === c)?.values ?? zeros();
@@ -947,26 +1137,45 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
     liqTotal = liqSeries.map((v, i) => convert(v, i + 1));
     cdTotal = cdSeries.map((v, i) => convert(v, i + 1));
   }
-  const invTotal = months.map((_, i) => INV_CATS.reduce((s, c) => s + invByCat[c][i], 0));
-  const total = evolution ? evolution.net_worth.map((v, i) => convert(v, i + 1)) : zeros();
+  // A month's investment total is only known when every category resolved
+  // for it; otherwise it propagates `null` rather than silently summing
+  // just the categories that did.
+  const invTotal: (number | null)[] = months.map((_, i) => {
+    const vals = INV_CATS.map((c) => invByCat[c][i]);
+    return vals.some((v) => v === null) ? null : (vals as number[]).reduce((s, v) => s + v, 0);
+  });
+  const total: (number | null)[] = evolution
+    ? evolution.net_worth.map((v, i) => convert(v, i + 1))
+    : zeros();
 
   // Each month's delta is against the prior month's total, except January,
   // which is measured against decPrev (December of the prior year,
-  // converted at that same December's own rate).
-  const decPrev = convertPrevDec(prevDecNetWorth);
-  const delta = total.map((t, i) => t - (i === 0 ? decPrev : total[i - 1]));
-  const deltaPct = total.map((t, i) => {
+  // converted at that same December's own rate). `prevDecError` means the
+  // reference-currency baseline itself never loaded, so there is no
+  // trustworthy figure to convert regardless of display currency.
+  const decPrev: number | null = prevDecError ? null : convertPrevDec(prevDecNetWorth);
+  const delta: (number | null)[] = total.map((t, i) => {
     const base = i === 0 ? decPrev : total[i - 1];
+    return t === null || base === null ? null : t - base;
+  });
+  const deltaPct: (number | null)[] = total.map((t, i) => {
+    const base = i === 0 ? decPrev : total[i - 1];
+    if (t === null || base === null) return null;
     return base > 0 ? (100 * (t - base)) / base : 0;
   });
 
   // Allocation pie for the active month: the backend already picks which
   // slices qualify (only `> 0`, with "Credits"/"Debts" split by sign), so
-  // this only needs to convert each slice's value.
-  const pieData = (allocation?.slices ?? []).map((s) => ({
+  // this only needs to convert each slice's value. If any slice's month
+  // could not be converted, the pie is not rendered at all (see below)
+  // rather than drawn with a wrong proportion for that slice, so the `?? 0`
+  // fallback in `pieData` is never actually shown.
+  const pieValues = (allocation?.slices ?? []).map((s) => ({
     name: s.name,
     value: convert(s.value, month),
   }));
+  const pieUnresolved = pieValues.some((s) => s.value === null);
+  const pieData = pieValues.map((s) => ({ name: s.name, value: s.value ?? 0 }));
 
   const evoLabels = evolution?.months ?? MONTHS_SHORT;
   const evoData = months.map((m, i) => ({
@@ -976,6 +1185,20 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
     "Credits/Debts": cdTotal[i],
     Total: total[i],
   }));
+
+  // Source currencies (an investment, liquidity, or credit/debt row's own
+  // currency) the backend could not resolve into the reference currency,
+  // and therefore dropped from every component series, total, and slice.
+  // `evolution` and `allocation` are fetched together and normally report
+  // the same set, but a currency could in principle appear in one and not
+  // the other (e.g. only used by a row outside the selected month), so
+  // both are combined into one message.
+  const missingSourceCurrencies = Array.from(
+    new Set([
+      ...(evolution?.unavailable_currencies ?? []),
+      ...(allocation?.unavailable_currencies ?? []),
+    ]),
+  );
 
   return (
     <div className="space-y-5">
@@ -1017,15 +1240,41 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
       </div>
 
       {displayUnavailable && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-          {displayCurrency} has no available exchange rate right now, showing {refCurrency} instead.
-        </div>
+        <ErrorBanner
+          message={
+            displayRatesError || prevDisplayRatesError
+              ? `Could not load exchange rates for ${displayCurrency}: ${displayRatesError ?? prevDisplayRatesError}. Showing ${refCurrency} instead.`
+              : `${displayCurrency} has no available exchange rate right now, showing ${refCurrency} instead.`
+          }
+        />
       )}
 
-      {evolution === null ? (
+      {missingSourceCurrencies.length > 0 && (
+        <ErrorBanner
+          message={`Could not resolve exchange rates for ${missingSourceCurrencies.join(", ")}. Figures below exclude ${missingSourceCurrencies.length > 1 ? "those currencies" : "that currency"}.`}
+        />
+      )}
+
+      {prevDecError && (
+        <ErrorBanner
+          message={`Could not load last year's December net worth: ${prevDecError}. January's change is unresolved.`}
+        />
+      )}
+
+      {evolutionError ? (
+        <GlassCard title={`Net Worth · ${year}`}>
+          <ErrorBanner message={`Could not load net worth data: ${evolutionError}`} />
+        </GlassCard>
+      ) : evolution === null ? (
         <GlassCard title={`Net Worth · ${year}`}>
           <p className="px-3 py-8 text-center text-muted-foreground">
             No net worth data for {year} yet.
+          </p>
+        </GlassCard>
+      ) : ratesLoading ? (
+        <GlassCard title={`Net Worth · ${year}`}>
+          <p className="px-3 py-8 text-center text-muted-foreground">
+            Loading {displayCurrency} exchange rates…
           </p>
         </GlassCard>
       ) : (
@@ -1055,7 +1304,7 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
                       </td>
                       {invByCat[c].map((v, i) => (
                         <td key={i} className="px-2 py-1.5 text-right text-xs tabular-nums">
-                          {formatRef(v, shownCurrency)}
+                          {fmtOrDash(v, shownCurrency)}
                         </td>
                       ))}
                     </tr>
@@ -1064,7 +1313,7 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
                     <td className="px-3 py-1.5">Liquidity total</td>
                     {liqTotal.map((v, i) => (
                       <td key={i} className="px-2 py-1.5 text-right text-xs tabular-nums">
-                        {formatRef(v, shownCurrency)}
+                        {fmtOrDash(v, shownCurrency)}
                       </td>
                     ))}
                   </tr>
@@ -1073,9 +1322,9 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
                     {cdTotal.map((v, i) => (
                       <td
                         key={i}
-                        className={`px-2 py-1.5 text-right text-xs tabular-nums ${v < 0 ? "text-destructive" : ""}`}
+                        className={`px-2 py-1.5 text-right text-xs tabular-nums ${v !== null && v < 0 ? "text-destructive" : ""}`}
                       >
-                        {formatRef(v, shownCurrency)}
+                        {fmtOrDash(v, shownCurrency)}
                       </td>
                     ))}
                   </tr>
@@ -1083,7 +1332,7 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
                     <td className="px-3 py-2 text-gradient">Total Net Worth</td>
                     {total.map((v, i) => (
                       <td key={i} className="px-2 py-2 text-right tabular-nums">
-                        {formatRef(v, shownCurrency)}
+                        {fmtOrDash(v, shownCurrency)}
                       </td>
                     ))}
                   </tr>
@@ -1092,10 +1341,11 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
                     {delta.map((v, i) => (
                       <td
                         key={i}
-                        className={`px-2 py-1.5 text-right tabular-nums ${v >= 0 ? "text-success" : "text-destructive"}`}
+                        className={`px-2 py-1.5 text-right tabular-nums ${v === null ? "" : v >= 0 ? "text-success" : "text-destructive"}`}
                       >
-                        {v >= 0 ? "+" : ""}
-                        {formatRef(v, shownCurrency)}
+                        {v === null
+                          ? fmtOrDash(null, shownCurrency)
+                          : (v >= 0 ? "+" : "") + formatRef(v, shownCurrency)}
                       </td>
                     ))}
                   </tr>
@@ -1104,10 +1354,11 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
                     {deltaPct.map((v, i) => (
                       <td
                         key={i}
-                        className={`px-2 py-1.5 text-right tabular-nums ${v >= 0 ? "text-success" : "text-destructive"}`}
+                        className={`px-2 py-1.5 text-right tabular-nums ${v === null ? "" : v >= 0 ? "text-success" : "text-destructive"}`}
                       >
-                        {v >= 0 ? "+" : ""}
-                        {v.toFixed(1)}%
+                        {v === null
+                          ? fmtOrDash(null, shownCurrency)
+                          : `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`}
                       </td>
                     ))}
                   </tr>
@@ -1118,26 +1369,34 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
 
           <div className="grid gap-5 lg:grid-cols-[1fr_1.4fr]">
             <GlassCard title={`Allocation · ${MONTHS[month - 1]} ${year} (${shownCurrency})`}>
-              <div className="h-80">
-                <ResponsiveContainer>
-                  <PieChart>
-                    <Pie
-                      data={pieData}
-                      dataKey="value"
-                      nameKey="name"
-                      innerRadius={60}
-                      outerRadius={110}
-                      paddingAngle={2}
-                    >
-                      {pieData.map((_, i) => (
-                        <Cell key={i} fill={colorAt(i)} stroke="oklch(0.16 0.02 265)" />
-                      ))}
-                    </Pie>
-                    <Tooltip content={<DarkTooltip currency={shownCurrency} />} />
-                    <Legend verticalAlign="bottom" wrapperStyle={LEGEND_STYLE} />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
+              {allocationError ? (
+                <ErrorBanner message={`Could not load allocation: ${allocationError}`} />
+              ) : pieUnresolved ? (
+                <p className="px-3 py-8 text-center text-sm text-warning">
+                  No exchange rate available to show this chart in {shownCurrency}.
+                </p>
+              ) : (
+                <div className="h-80">
+                  <ResponsiveContainer>
+                    <PieChart>
+                      <Pie
+                        data={pieData}
+                        dataKey="value"
+                        nameKey="name"
+                        innerRadius={60}
+                        outerRadius={110}
+                        paddingAngle={2}
+                      >
+                        {pieData.map((_, i) => (
+                          <Cell key={i} fill={colorAt(i)} stroke="oklch(0.16 0.02 265)" />
+                        ))}
+                      </Pie>
+                      <Tooltip content={<DarkTooltip currency={shownCurrency} />} />
+                      <Legend verticalAlign="bottom" wrapperStyle={LEGEND_STYLE} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
             </GlassCard>
 
             <GlassCard title={`Evolution · ${year} (${shownCurrency})`}>
