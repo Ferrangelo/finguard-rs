@@ -689,8 +689,9 @@ async fn upsert_expense_handler(
 }
 
 /// `DELETE /api/expenses/:id`: remove the expense at row index `id` from
-/// `q.year`/`q.month`'s monthly parquet file, then recompute the
-/// primaries/secondaries summary tables for the year.
+/// `q.year`/`q.month`'s monthly parquet file. Category summaries are no
+/// longer maintained as separate tables; [`get_expenses_handler`] derives
+/// them at read time, so nothing else needs recomputing here.
 ///
 /// Returns [`Error::InvalidArgument`] (`400`) if `id` does not parse as a
 /// `u32`.
