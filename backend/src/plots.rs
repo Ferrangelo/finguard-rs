@@ -28,6 +28,7 @@ use crate::df_operations::{
     Cashflow, CreditsDebts, DetailedExpenses, InvestmentHoldings, Liquidity,
 };
 use crate::error::Result;
+use crate::fx::MonthlyRates;
 use crate::paths::{PRIMARIES_FILENAME, SECONDARIES_FILENAME, get_year_summary_path};
 
 // ======================================================================
@@ -189,9 +190,28 @@ fn f64_col(df: &DataFrame, name: &str) -> Result<Vec<f64>> {
         .collect())
 }
 
-/// Sum a numeric month column, returning `0.0` for a null/empty sum.
-fn sum_col(df: &DataFrame, name: &str) -> Result<f64> {
-    Ok(df.column(name)?.f64()?.sum().unwrap_or(0.0))
+/// Sum a numeric month column, converting each row from its own `currency`
+/// column into the reference currency via `rates` before adding it in.
+///
+/// Net-worth rows are not all in the same currency (a holding, a liquidity
+/// asset, or a credit/debt can each carry its own), so summing raw values
+/// directly would add unlike units together. Returns `0.0` for an empty `df`.
+fn sum_col_converted(
+    df: &DataFrame,
+    col_name: &str,
+    month: u32,
+    rates: &MonthlyRates,
+) -> Result<f64> {
+    if df.height() == 0 {
+        return Ok(0.0);
+    }
+    let currencies = str_col(df, "currency")?;
+    let values = f64_col(df, col_name)?;
+    let mut total = 0.0;
+    for (currency, value) in currencies.iter().zip(values.iter()) {
+        total += value * rates.rate(month, currency)?;
+    }
+    Ok(total)
 }
 
 /// Resolve the summary filename and category column for a `kind`.
@@ -492,8 +512,17 @@ pub fn income_pie_chart(year: i32) -> Result<Option<PieChart>> {
 /// sum yields `"Debts"` with the absolute value). Only `> 0` slices are kept.
 /// Values use two-decimal (round-half-even) rounding.
 ///
+/// Every row is converted into the reference currency via `rates` (see
+/// [`crate::fx::monthly_rates`]) before being summed, using its own
+/// `currency` column; a currency present in the data but missing from
+/// `rates` is an error rather than a silent skip.
+///
 /// Returns `Ok(None)` when no slice qualifies.
-pub fn networth_allocation_pie(year: i32, month: u32) -> Result<Option<PieChart>> {
+pub fn networth_allocation_pie(
+    year: i32,
+    month: u32,
+    rates: &MonthlyRates,
+) -> Result<Option<PieChart>> {
     let inv = InvestmentHoldings::new(year)?;
     let liq = Liquidity::new(year)?;
     let cd = CreditsDebts::new(year)?;
@@ -509,7 +538,7 @@ pub fn networth_allocation_pie(year: i32, month: u32) -> Result<Option<PieChart>
             .filter(col("category").eq(lit(*cat)))
             .collect()?;
         let val = if cat_df.height() > 0 {
-            sum_col(&cat_df, &col_name)?
+            sum_col_converted(&cat_df, &col_name, month, rates)?
         } else {
             0.0
         };
@@ -522,7 +551,7 @@ pub fn networth_allocation_pie(year: i32, month: u32) -> Result<Option<PieChart>
     }
 
     let liq_val = if liq.df.height() > 0 {
-        sum_col(&liq.df, &col_name)?
+        sum_col_converted(&liq.df, &col_name, month, rates)?
     } else {
         0.0
     };
@@ -534,7 +563,7 @@ pub fn networth_allocation_pie(year: i32, month: u32) -> Result<Option<PieChart>
     }
 
     let cd_val = if cd.df.height() > 0 {
-        sum_col(&cd.df, &col_name)?
+        sum_col_converted(&cd.df, &col_name, month, rates)?
     } else {
         0.0
     };
@@ -564,8 +593,16 @@ pub fn networth_allocation_pie(year: i32, month: u32) -> Result<Option<PieChart>
 /// decimals, round-half-even). `net_worth[i]` is the sum of all components at
 /// index `i`.
 ///
+/// Every row is converted into the reference currency via `rates` (see
+/// [`crate::fx::monthly_rates`]) before being summed, using its own
+/// `currency` column; a currency present in the data but missing from
+/// `rates` is an error rather than a silent skip.
+///
 /// Returns `Ok(None)` when every net-worth value is zero.
-pub fn networth_evolution_line(year: i32) -> Result<Option<NetworthEvolution>> {
+pub fn networth_evolution_line(
+    year: i32,
+    rates: &MonthlyRates,
+) -> Result<Option<NetworthEvolution>> {
     let inv = InvestmentHoldings::new(year)?;
     let liq = Liquidity::new(year)?;
     let cd = CreditsDebts::new(year)?;
@@ -586,9 +623,10 @@ pub fn networth_evolution_line(year: i32) -> Result<Option<NetworthEvolution>> {
         let has_rows = cat_df.height() > 0;
         let vals: Vec<f64> = mcols
             .iter()
-            .map(|c| -> Result<f64> {
+            .enumerate()
+            .map(|(i, c)| -> Result<f64> {
                 Ok(if has_rows {
-                    round2_half_even(sum_col(&cat_df, c)?)
+                    round2_half_even(sum_col_converted(&cat_df, c, (i + 1) as u32, rates)?)
                 } else {
                     0.0
                 })
@@ -603,9 +641,10 @@ pub fn networth_evolution_line(year: i32) -> Result<Option<NetworthEvolution>> {
     let liq_has = liq.df.height() > 0;
     let liq_vals: Vec<f64> = mcols
         .iter()
-        .map(|c| -> Result<f64> {
+        .enumerate()
+        .map(|(i, c)| -> Result<f64> {
             Ok(if liq_has {
-                round2_half_even(sum_col(&liq.df, c)?)
+                round2_half_even(sum_col_converted(&liq.df, c, (i + 1) as u32, rates)?)
             } else {
                 0.0
             })
@@ -619,9 +658,10 @@ pub fn networth_evolution_line(year: i32) -> Result<Option<NetworthEvolution>> {
     let cd_has = cd.df.height() > 0;
     let cd_vals: Vec<f64> = mcols
         .iter()
-        .map(|c| -> Result<f64> {
+        .enumerate()
+        .map(|(i, c)| -> Result<f64> {
             Ok(if cd_has {
-                round2_half_even(sum_col(&cd.df, c)?)
+                round2_half_even(sum_col_converted(&cd.df, c, (i + 1) as u32, rates)?)
             } else {
                 0.0
             })
@@ -690,6 +730,7 @@ pub fn monthly_expenses_pie(de: &DetailedExpenses, kind: &str) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// `round2_half_even` must match CPython's `round(x, 2)` (round-half-to-even
     /// on the *true* binary value). Each expected value below was verified
@@ -726,5 +767,170 @@ mod tests {
         assert_eq!(round_half_even(3.5), 4.0);
         assert_eq!(round_half_even(-0.5), 0.0);
         assert_eq!(round_half_even(1.5), 2.0);
+    }
+
+    /// Points `XDG_DATA_HOME`, `XDG_CONFIG_HOME` and `HOME` at a fresh temp
+    /// dir, so a test's parquet writes and config reads never touch real user
+    /// data. Matches `df_operations.rs`'s `with_temp_data_home`.
+    ///
+    /// # Safety
+    ///
+    /// `std::env::set_var` is unsafe because it is not thread-safe; callers
+    /// must hold `#[serial_test::serial]` so no other test reads or writes
+    /// these variables concurrently.
+    fn with_temp_data_home() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            std::env::set_var("HOME", dir.path());
+        }
+        dir
+    }
+
+    /// Build a one-asset, one-month net worth: an investment, a liquidity
+    /// balance, and a credit/debt entry, each in `currency`, for `year`/month
+    /// `01`. Shared by the regression test and the mixed-currency test below,
+    /// which each seed it with a different `currency` per asset.
+    fn seed_single_month_networth(year: i32, currency: &str, suffix: &str) {
+        let mut inv = InvestmentHoldings::new(year).expect("load investments");
+        let asset = format!("Asset{suffix}");
+        inv.add_asset(&asset, "Stocks/ETF", "", currency)
+            .expect("add investment asset");
+        inv.set_quantity(&asset, 1, 10.0).expect("set quantity");
+        inv.set_price(&asset, 1, 50.0).expect("set price");
+
+        let mut liq = Liquidity::new(year).expect("load liquidity");
+        let cash = format!("Cash{suffix}");
+        liq.add_asset(&cash, "Bank/Broker account", currency)
+            .expect("add liquidity asset");
+        liq.set_value(&cash, 1, 1000.0)
+            .expect("set liquidity value");
+
+        let mut cd = CreditsDebts::new(year).expect("load credits/debts");
+        let loan = format!("Loan{suffix}");
+        cd.add_entry(&loan, currency)
+            .expect("add credit/debt entry");
+        cd.set_value(&loan, 1, -200.0)
+            .expect("set credit/debt value");
+    }
+
+    /// A euro-only user (every row's `currency` is the reference currency)
+    /// must see exactly the totals the pre-conversion code produced: `500.0`
+    /// invested (`10 * 50`), `1000.0` liquid, `-200.0` credits/debts, net
+    /// worth `1300.0`. This is the regression this feature could most easily
+    /// introduce without a test to catch it.
+    #[test]
+    #[serial_test::serial]
+    fn euro_only_networth_is_unchanged_by_currency_conversion() {
+        let _temp = with_temp_data_home();
+        let year = 2026;
+        seed_single_month_networth(year, "EUR", "");
+        // No currency needs resolving, so an empty rate table is enough.
+        let rates = MonthlyRates::for_test("EUR", BTreeMap::new());
+
+        let evolution = networth_evolution_line(year, &rates)
+            .expect("compute evolution")
+            .expect("non-zero net worth");
+        let component = |name: &str| {
+            evolution
+                .components
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' component"))
+        };
+        assert_eq!(component("Stocks/ETF").values[0], 500.0);
+        assert_eq!(component("Liquidity").values[0], 1000.0);
+        assert_eq!(component("Credits/Debts").values[0], -200.0);
+        assert_eq!(evolution.net_worth[0], 1300.0);
+
+        let pie = networth_allocation_pie(year, 1, &rates)
+            .expect("compute allocation")
+            .expect("non-empty allocation");
+        assert_eq!(
+            pie.slices,
+            vec![
+                PieSlice {
+                    name: "Stocks/ETF".to_string(),
+                    value: 500.0
+                },
+                PieSlice {
+                    name: "Liquidity".to_string(),
+                    value: 1000.0
+                },
+                PieSlice {
+                    name: "Debts".to_string(),
+                    value: 200.0
+                },
+            ]
+        );
+    }
+
+    /// A liquidity balance split across two currencies must be converted
+    /// through each row's own rate before summing, not added as if both were
+    /// the reference currency. `1000` EUR plus `100` USD at `0.90` is `1090`,
+    /// not `1100`; the wrong total is exactly the bug this feature removes.
+    #[test]
+    #[serial_test::serial]
+    fn mixed_currency_liquidity_is_converted_before_summing() {
+        let _temp = with_temp_data_home();
+        let year = 2026;
+
+        let mut liq = Liquidity::new(year).expect("load liquidity");
+        liq.add_asset("EuroCash", "Bank/Broker account", "EUR")
+            .expect("add EUR asset");
+        liq.set_value("EuroCash", 1, 1000.0).expect("set EUR value");
+        liq.add_asset("DollarCash", "Bank/Broker account", "USD")
+            .expect("add USD asset");
+        liq.set_value("DollarCash", 1, 100.0)
+            .expect("set USD value");
+
+        // A real `monthly_rates` table always covers every month of the
+        // year for a currency it resolves at all (see `fx.rs`), since the
+        // USD row's other, zero-valued months still need a rate to convert.
+        let rates_by_month: BTreeMap<u32, BTreeMap<String, f64>> = (1..=12u32)
+            .map(|month| {
+                let mut month_rates = BTreeMap::new();
+                month_rates.insert("USD".to_string(), 0.90);
+                (month, month_rates)
+            })
+            .collect();
+        let rates = MonthlyRates::for_test("EUR", rates_by_month);
+
+        let evolution = networth_evolution_line(year, &rates)
+            .expect("compute evolution")
+            .expect("non-zero net worth");
+        let liquidity = evolution
+            .components
+            .iter()
+            .find(|c| c.name == "Liquidity")
+            .expect("liquidity component");
+        assert_eq!(liquidity.values[0], 1090.0);
+
+        let pie = networth_allocation_pie(year, 1, &rates)
+            .expect("compute allocation")
+            .expect("non-empty allocation");
+        let liquidity_slice = pie
+            .slices
+            .iter()
+            .find(|s| s.name == "Liquidity")
+            .expect("liquidity slice");
+        assert_eq!(liquidity_slice.value, 1090.0);
+    }
+
+    /// A currency present in the data but absent from the rate table is an
+    /// error, not a silent `1.0`: that silent fallback is the exact bug this
+    /// feature exists to remove.
+    #[test]
+    #[serial_test::serial]
+    fn unresolved_currency_is_an_error_not_a_silent_identity() {
+        let _temp = with_temp_data_home();
+        let year = 2026;
+        seed_single_month_networth(year, "USD", "");
+        // No USD rate was ever added to this table.
+        let rates = MonthlyRates::for_test("EUR", BTreeMap::new());
+
+        let err = networth_evolution_line(year, &rates).expect_err("USD was never resolved");
+        assert!(matches!(err, crate::error::Error::NotFound(_)));
     }
 }

@@ -30,6 +30,7 @@ use finguard_rs_backend::df_operations::{
 };
 use finguard_rs_backend::fx;
 use finguard_rs_backend::paths::{PRIMARIES_FILENAME, get_year_summary_path};
+use finguard_rs_backend::plots;
 use polars::prelude::SerReader;
 
 mod http_error;
@@ -134,6 +135,36 @@ pub struct CreditDebtRowJson {
     pub data: std::collections::HashMap<i32, std::collections::HashMap<u32, f64>>,
 }
 
+/// One slice of [`NetworthAllocationJson`], mirroring [`plots::PieSlice`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NetworthPieSliceJson {
+    pub name: String,
+    pub value: f64,
+}
+
+/// `GET /api/networth/allocation` response body, mirroring [`plots::PieChart`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NetworthAllocationJson {
+    pub slices: Vec<NetworthPieSliceJson>,
+}
+
+/// One stacked component of [`NetworthEvolutionJson`], mirroring
+/// [`plots::Series`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NetworthSeriesJson {
+    pub name: String,
+    pub values: Vec<f64>,
+}
+
+/// `GET /api/networth/evolution` response body, mirroring
+/// [`plots::NetworthEvolution`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NetworthEvolutionJson {
+    pub months: Vec<String>,
+    pub components: Vec<NetworthSeriesJson>,
+    pub net_worth: Vec<f64>,
+}
+
 // ======================================================================
 // Query/Payload Structs
 // ======================================================================
@@ -145,6 +176,12 @@ pub struct CreditDebtRowJson {
 #[derive(Deserialize, Debug)]
 pub struct YearQuery {
     pub year: i32,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct NetworthAllocationQuery {
+    pub year: i32,
+    pub month: u32,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1417,6 +1454,72 @@ async fn set_credits_debts_cell_handler(
     Ok(())
 }
 
+/// Collect every distinct currency code across `year`'s investment holdings,
+/// liquidity, and credits/debts rows, so [`fx::monthly_rates`] resolves
+/// exactly the currencies the net-worth charts need and nothing else.
+fn networth_currencies(year: i32) -> finguard_rs_backend::Result<Vec<String>> {
+    let inv = InvestmentHoldings::new(year)?;
+    let liq = Liquidity::new(year)?;
+    let cd = CreditsDebts::new(year)?;
+
+    let mut currencies = str_col_to_vec(&inv.df, "currency")?;
+    currencies.extend(str_col_to_vec(&liq.df, "currency")?);
+    currencies.extend(str_col_to_vec(&cd.df, "currency")?);
+    currencies.sort();
+    currencies.dedup();
+    Ok(currencies)
+}
+
+/// `GET /api/networth/evolution?year=`: the net-worth evolution line chart
+/// for `q.year` (see [`plots::networth_evolution_line`]), with every row
+/// converted into the reference currency month by month. `null` when every
+/// net-worth value is zero.
+async fn get_networth_evolution_handler(
+    Query(q): Query<YearQuery>,
+) -> Result<Json<Option<NetworthEvolutionJson>>, AppError> {
+    let currencies = networth_currencies(q.year)?;
+    let rates = fx::monthly_rates(q.year, &currencies).await?;
+    let evolution = plots::networth_evolution_line(q.year, &rates)?;
+    Ok(Json(evolution.map(|e| {
+        NetworthEvolutionJson {
+            months: e.months,
+            components: e
+                .components
+                .into_iter()
+                .map(|s| NetworthSeriesJson {
+                    name: s.name,
+                    values: s.values,
+                })
+                .collect(),
+            net_worth: e.net_worth,
+        }
+    })))
+}
+
+/// `GET /api/networth/allocation?year=&month=`: the net-worth allocation pie
+/// chart for `q.year`/`q.month` (see [`plots::networth_allocation_pie`]),
+/// with every row converted into the reference currency. `null` when no
+/// slice qualifies.
+async fn get_networth_allocation_handler(
+    Query(q): Query<NetworthAllocationQuery>,
+) -> Result<Json<Option<NetworthAllocationJson>>, AppError> {
+    let currencies = networth_currencies(q.year)?;
+    let rates = fx::monthly_rates(q.year, &currencies).await?;
+    let pie = plots::networth_allocation_pie(q.year, q.month, &rates)?;
+    Ok(Json(pie.map(|p| {
+        NetworthAllocationJson {
+            slices: p
+                .slices
+                .into_iter()
+                .map(|s| NetworthPieSliceJson {
+                    name: s.name,
+                    value: s.value,
+                })
+                .collect(),
+        }
+    })))
+}
+
 // ======================================================================
 // Server Initialization
 // ======================================================================
@@ -1505,6 +1608,15 @@ async fn main() {
         .route(
             "/api/credits_debts/cell",
             post(set_credits_debts_cell_handler),
+        )
+        // Net Worth - Charts
+        .route(
+            "/api/networth/evolution",
+            get(get_networth_evolution_handler),
+        )
+        .route(
+            "/api/networth/allocation",
+            get(get_networth_allocation_handler),
         )
         .layer(cors);
 
