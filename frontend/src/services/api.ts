@@ -12,6 +12,7 @@ import type {
   Currency,
   CurrencySettings,
   Expense,
+  ExpenseWrite,
   InvestmentAsset,
   InvestmentCategory,
   LiquidityRow,
@@ -105,9 +106,7 @@ export async function getAllExpenses(): Promise<Expense[]> {
  * function always sends an `id` field (defaulting to `""`) rather than
  * omitting it.
  */
-export async function upsertExpense(
-  input: Omit<Expense, "id"> & { id?: string },
-): Promise<Expense> {
+export async function upsertExpense(input: ExpenseWrite): Promise<Expense> {
   return apiFetch("/api/expenses", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -30,6 +30,20 @@ export interface Expense {
   rate_date: string;
 }
 
+/**
+ * The shape a caller builds to create or update an expense through
+ * `upsertExpense` in `services/api.ts`. Omits `id` the same way the old
+ * inline `Omit<Expense, "id">` did, and also omits `fx_rate` and
+ * `rate_date`: both are resolved by the server from `currency` and the
+ * expense's own date on every write, and ignored if sent (see the `Expense`
+ * doc comment above). A write-side type that still required them would
+ * force a caller to invent values it does not have, so it leaves them out
+ * instead of padding them with a placeholder.
+ */
+export interface ExpenseWrite extends Omit<Expense, "id" | "fx_rate" | "rate_date"> {
+  id?: string;
+}
+
 /** Mirrors `RecurringTemplateJson` in backend/src/main.rs. Has no `year`: the backend scopes recurring templates by year through query parameters, not through this shape. */
 export interface RecurringTemplate {
   id: string;
