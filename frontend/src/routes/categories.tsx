@@ -5,7 +5,7 @@ import { useApp } from "@/context/AppContext";
 import * as api from "@/services/api";
 import { formatRef } from "@/services/fx";
 import { GlassCard } from "@/components/finguard/GlassCard";
-import type { Categories } from "@/services/types";
+import type { Categories, Currency } from "@/services/types";
 
 // Categories page: two side-by-side registries (primary and secondary
 // category names) with their all-time expense totals, add and delete
@@ -18,7 +18,8 @@ export const Route = createFileRoute("/categories")({
 });
 
 function CategoriesPage() {
-  const { notify, refresh, refreshTick } = useApp();
+  const { notify, refresh, refreshTick, currencySettings } = useApp();
+  const refCurrency = currencySettings.reference_currency;
   const [cats, setCats] = useState<Categories>({ primary: [], secondary: [] });
   const [pri, setPri] = useState<Record<string, number>>({});
   const [sec, setSec] = useState<Record<string, number>>({});
@@ -38,12 +39,12 @@ function CategoriesPage() {
 
       <div className="grid gap-5 lg:grid-cols-2">
         <CategoryColumn
-          title="Primary categories" kind="primary" list={cats.primary} totals={pri}
+          title="Primary categories" kind="primary" list={cats.primary} totals={pri} currency={refCurrency}
           onAdd={async (n) => { await api.addCategory("primary", n); notify("success", `Added "${n}"`); refresh(); }}
           onDelete={async (n) => { await api.deleteCategory("primary", n); notify("success", `Deleted "${n}"`); refresh(); }}
         />
         <CategoryColumn
-          title="Secondary categories" kind="secondary" list={cats.secondary} totals={sec}
+          title="Secondary categories" kind="secondary" list={cats.secondary} totals={sec} currency={refCurrency}
           onAdd={async (n) => { await api.addCategory("secondary", n); notify("success", `Added "${n}"`); refresh(); }}
           onDelete={async (n) => { await api.deleteCategory("secondary", n); notify("success", `Deleted "${n}"`); refresh(); }}
         />
@@ -53,12 +54,13 @@ function CategoriesPage() {
 }
 
 function CategoryColumn({
-  title, kind, list, totals, onAdd, onDelete,
+  title, kind, list, totals, currency, onAdd, onDelete,
 }: {
   title: string;
   kind: "primary" | "secondary";
   list: string[];
   totals: Record<string, number>;
+  currency: Currency;
   onAdd: (n: string) => Promise<void>;
   onDelete: (n: string) => Promise<void>;
 }) {
@@ -105,7 +107,7 @@ function CategoryColumn({
               return (
                 <tr key={c} className="hover:bg-muted/20">
                   <td className="px-3 py-2 font-medium">{c}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatRef(t)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatRef(t, currency)}</td>
                   <td className="px-3 py-2 text-right">
                     {hasExpenses ? (
                       <span className="text-[11px] italic text-muted-foreground">has existing expenses</span>

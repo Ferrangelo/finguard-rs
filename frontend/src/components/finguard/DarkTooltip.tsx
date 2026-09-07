@@ -2,22 +2,34 @@
 
 import { useTheme } from "@/context/ThemeContext";
 import { formatRef } from "@/services/fx";
+import type { Currency } from "@/services/types";
 
 interface Props {
   active?: boolean;
   payload?: Array<{ name: string; value: number; color?: string }>;
   label?: string | number;
   total?: boolean;
+  /**
+   * The currency every `payload` value is denominated in. Required: this
+   * component only ever renders figures a caller already converted to some
+   * currency, so it takes that currency as a prop rather than reading
+   * `AppContext` itself, the same way `expenses.tsx` threads its own
+   * `refCurrency` through rather than each subcomponent reading context.
+   */
+  currency: Currency;
 }
 
 /**
- * Custom Recharts tooltip content renderer (pass as `<Tooltip content={<DarkTooltip />} />`).
+ * Custom Recharts tooltip content renderer. Pass as
+ * `<Tooltip content={<DarkTooltip currency={refCurrency} />} />`; Recharts
+ * clones this element and merges in its own `active`/`payload`/`label`
+ * props at render time, so `currency` set here survives that merge.
  * Renders nothing while inactive or without a payload, matching Recharts'
  * own tooltip contract. Each `payload` entry is shown as a colored dot,
  * name, and formatted value; pass `total` to additionally show the sum of
  * all entries, useful for stacked/grouped charts with more than one series.
  */
-export function DarkTooltip({ active, payload, label, total }: Props) {
+export function DarkTooltip({ active, payload, label, total, currency }: Props) {
   if (!active || !payload || payload.length === 0) return null;
   const sum = payload.reduce((s, p) => s + (Number(p.value) || 0), 0);
   return (
@@ -33,14 +45,14 @@ export function DarkTooltip({ active, payload, label, total }: Props) {
             <span className="h-2 w-2 rounded-full" style={{ background: p.color }} />
             <span className="text-foreground/90">{p.name}</span>
             <span className="ml-auto font-medium text-foreground">
-              {formatRef(Number(p.value) || 0)}
+              {formatRef(Number(p.value) || 0, currency)}
             </span>
           </li>
         ))}
         {total && payload.length > 1 && (
           <li className="mt-1 flex items-center gap-2 border-t border-border/60 pt-1 text-foreground/80">
             <span className="ml-auto text-[11px]">Total</span>
-            <span className="font-semibold text-foreground">{formatRef(sum)}</span>
+            <span className="font-semibold text-foreground">{formatRef(sum, currency)}</span>
           </li>
         )}
       </ul>

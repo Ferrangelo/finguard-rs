@@ -21,6 +21,7 @@ import { GlassCard } from "@/components/finguard/GlassCard";
 import { MathInput } from "@/components/finguard/MathInput";
 import { DarkTooltip, useChartColors, LEGEND_STYLE } from "@/components/finguard/DarkTooltip";
 import { INCOME_CATEGORIES } from "@/services/types";
+import type { Currency } from "@/services/types";
 import { useTheme } from "@/context/ThemeContext";
 
 // Cashflow page: a single-year grid of income by category, spending, and
@@ -38,7 +39,8 @@ export const Route = createFileRoute("/cashflow")({
 
 function CashflowPage() {
   const colorAt = useChartColors();
-  const { year, notify, refresh, refreshTick } = useApp();
+  const { year, notify, refresh, refreshTick, currencySettings } = useApp();
+  const refCurrency = currencySettings.reference_currency;
   const [income, setIncome] = useState<Record<number, Record<string, number>>>({});
   const [spending, setSpending] = useState<Record<number, Record<string, number>>>({});
   const { theme } = useTheme();
@@ -120,15 +122,35 @@ function CashflowPage() {
                       </td>
                     ))}
                     <td className="px-3 py-1.5 text-right font-semibold tabular-nums">
-                      {formatRef(total)}
+                      {formatRef(total, refCurrency)}
                     </td>
                   </tr>
                 );
               })}
-              <DerivedRow label="Income" values={totalIncomeByMonth} variant="strong" />
-              <DerivedRow label="Spending" values={totalSpendingByMonth} variant="negative" />
-              <DerivedRow label="Saving" values={savings} variant="positive" />
-              <DerivedRow label="Saving %" values={savingsPct} variant="percent" />
+              <DerivedRow
+                label="Income"
+                values={totalIncomeByMonth}
+                variant="strong"
+                currency={refCurrency}
+              />
+              <DerivedRow
+                label="Spending"
+                values={totalSpendingByMonth}
+                variant="negative"
+                currency={refCurrency}
+              />
+              <DerivedRow
+                label="Saving"
+                values={savings}
+                variant="positive"
+                currency={refCurrency}
+              />
+              <DerivedRow
+                label="Saving %"
+                values={savingsPct}
+                variant="percent"
+                currency={refCurrency}
+              />
             </tbody>
           </table>
         </div>
@@ -142,7 +164,7 @@ function CashflowPage() {
                 <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
                 <XAxis dataKey="month" tick={{ fontSize: 14, fill: tickColor }} />
                 <YAxis tick={{ fontSize: 14, fill: tickColor }} />
-                <Tooltip content={<DarkTooltip />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
+                <Tooltip content={<DarkTooltip currency={refCurrency} />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 <Bar dataKey="Income" fill={colorAt(0)} radius={[4, 4, 0, 0]} />
                 <Bar dataKey="Spending" fill={colorAt(4)} radius={[4, 4, 0, 0]} />
@@ -168,7 +190,7 @@ function CashflowPage() {
                     <Cell key={i} fill={colorAt(i)} stroke="oklch(0.16 0.02 265)" />
                   ))}
                 </Pie>
-                <Tooltip content={<DarkTooltip />} />
+                <Tooltip content={<DarkTooltip currency={refCurrency} />} />
                 <Legend verticalAlign="bottom" wrapperStyle={LEGEND_STYLE} />
               </PieChart>
             </ResponsiveContainer>
@@ -190,16 +212,18 @@ function DerivedRow({
   label,
   values,
   variant,
+  currency,
 }: {
   label: string;
   values: number[];
   variant: "strong" | "positive" | "negative" | "percent";
+  currency: Currency;
 }) {
   const total =
     variant === "percent"
       ? values.reduce((s, n) => s + n, 0) / Math.max(values.length, 1)
       : values.reduce((s, n) => s + n, 0);
-  const fmt = (n: number) => (variant === "percent" ? `${n.toFixed(1)}%` : formatRef(n));
+  const fmt = (n: number) => (variant === "percent" ? `${n.toFixed(1)}%` : formatRef(n, currency));
   const cls =
     variant === "positive"
       ? "text-success"

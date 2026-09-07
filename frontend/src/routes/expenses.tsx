@@ -19,7 +19,7 @@ import { Plus, Play, Pencil, X, ArrowUp, ArrowDown } from "lucide-react";
 import { useApp } from "@/context/AppContext";
 import * as api from "@/services/api";
 import { MONTHS, MONTHS_SHORT } from "@/services/api";
-import { CURRENCIES, formatRef, toRef } from "@/services/fx";
+import { CURRENCIES, formatRef } from "@/services/fx";
 import { evalMath } from "@/services/mathEval";
 import { GlassCard } from "@/components/finguard/GlassCard";
 import { SubTabs } from "@/components/finguard/SubTabs";
@@ -30,6 +30,7 @@ import type {
   Categories,
   Currency,
   Expense,
+  ExpenseWrite,
   MappingRule,
   RecurringTemplate,
 } from "@/services/types";
@@ -93,7 +94,8 @@ function ExpensesPage() {
 
 // ────────────────────────────────────────────────────────────── Detailed
 function DetailedTab() {
-  const { year, month, notify, refresh, refreshTick } = useApp();
+  const { year, month, notify, refresh, refreshTick, currencySettings } = useApp();
+  const refCurrency = currencySettings.reference_currency;
   const [rows, setRows] = useState<Expense[]>([]);
   const [cats, setCats] = useState<Categories>({ primary: [], secondary: [] });
   const [mappings, setMappings] = useState<MappingRule[]>([]);
@@ -145,16 +147,33 @@ function DetailedTab() {
     return sorted;
   }, [rows, sortDir]);
 
-  const totalRef = useMemo(() => rows.reduce((s, e) => s + toRef(e.amount, e.currency), 0), [rows]);
+  // The wire has no expense_in_ref_currency field; a caller derives the
+  // reference-currency amount itself as amount * fx_rate (see Expense in
+  // services/types.ts).
+  const totalRef = useMemo(() => rows.reduce((s, e) => s + e.amount * e.fx_rate, 0), [rows]);
+
+  const refreshRates = async () => {
+    notify("loading", "Refreshing fx rates…");
+    const n = await api.refreshExpenseRates(year);
+    notify("success", n === 1 ? "Refreshed 1 superseded rate" : `Refreshed ${n} superseded rates`);
+    refresh();
+  };
 
   return (
     <div className="grid gap-5 lg:grid-cols-[1fr_360px]">
       <GlassCard
         title={`${MONTHS[month - 1]} ${year} · ${rows.length} entries`}
         action={
-          <div className="flex items-center gap-2 text-sm">
+          <div className="flex items-center gap-3 text-sm">
+            <button
+              onClick={refreshRates}
+              className="text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+              title={`Re-resolve any ${year} expense whose stored fx rate has been superseded`}
+            >
+              Refresh fx rates
+            </button>
             <span className="text-muted-foreground">Total</span>
-            <span className="font-semibold text-gradient">{formatRef(totalRef)}</span>
+            <span className="font-semibold text-gradient">{formatRef(totalRef, refCurrency)}</span>
           </div>
         }
       >
@@ -207,7 +226,7 @@ function DetailedTab() {
                 <th className="px-3 py-2 font-medium">Name</th>
                 <th className="px-3 py-2 text-right font-medium">Amount</th>
                 <th className="px-3 py-2 font-medium">Curr</th>
-                <th className="px-3 py-2 text-right font-medium">Ref €</th>
+                <th className="px-3 py-2 text-right font-medium">Ref ({refCurrency})</th>
                 <th className="px-3 py-2 font-medium">Primary</th>
                 <th className="px-3 py-2 font-medium">Secondary</th>
                 <th className="px-3 py-2 text-right font-medium"></th>
@@ -230,7 +249,15 @@ function DetailedTab() {
                     <td className="px-3 py-2 text-right tabular-nums">{e.amount.toFixed(2)}</td>
                     <td className="px-3 py-2 text-xs text-muted-foreground">{e.currency}</td>
                     <td className="px-3 py-2 text-right tabular-nums">
-                      {formatRef(toRef(e.amount, e.currency))}
+                      <span
+                        title={
+                          e.currency !== refCurrency
+                            ? `1 ${e.currency} = ${e.fx_rate.toFixed(4)} ${refCurrency} (rate published ${e.rate_date})`
+                            : undefined
+                        }
+                      >
+                        {formatRef(e.amount * e.fx_rate, refCurrency)}
+                      </span>
                     </td>
                     <td className="px-3 py-2">
                       <CategoryChip name={e.primary} />
@@ -329,7 +356,7 @@ function ExpenseForm({
   initial?: Expense;
   categories: Categories;
   mappings: MappingRule[];
-  onSubmit: (e: Omit<Expense, "id"> & { id?: string }) => Promise<void>;
+  onSubmit: (e: ExpenseWrite) => Promise<void>;
   onCancel: () => void;
 }) {
   const { year, month, notify } = useApp();
@@ -481,7 +508,8 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 // ────────────────────────────────────────────────────────────── Summary
 function SummaryTab() {
   const colorAt = useChartColors();
-  const { year, month, refreshTick } = useApp();
+  const { year, month, refreshTick, currencySettings } = useApp();
+  const refCurrency = currencySettings.reference_currency;
   const [kind, setKind] = useState<"primary" | "secondary">("primary");
   const [yearExpenses, setYearExpenses] = useState<Expense[]>([]);
   const [selMonths, setSelMonths] = useState<number[]>([Math.max(1, month - 1), month]);
@@ -504,7 +532,7 @@ function SummaryTab() {
     const map = new Map<string, number>();
     for (const e of yearExpenses) {
       if (e.month !== month) continue;
-      map.set(catOf(e), (map.get(catOf(e)) ?? 0) + toRef(e.amount, e.currency));
+      map.set(catOf(e), (map.get(catOf(e)) ?? 0) + e.amount * e.fx_rate);
     }
     return Array.from(map.entries())
       .map(([name, value]) => ({ name, value }))
@@ -521,7 +549,7 @@ function SummaryTab() {
       const c = catOf(e);
       cats.add(c);
       if (!grid[c]) grid[c] = Array(12).fill(0);
-      grid[c][e.month - 1] += toRef(e.amount, e.currency);
+      grid[c][e.month - 1] += e.amount * e.fx_rate;
     }
     return Array.from(cats)
       .sort()
@@ -570,7 +598,7 @@ function SummaryTab() {
     for (const e of yearExpenses) {
       if (!selMonths.includes(e.month)) continue;
       cats.add(catOf(e));
-      buckets[e.month][catOf(e)] = (buckets[e.month][catOf(e)] ?? 0) + toRef(e.amount, e.currency);
+      buckets[e.month][catOf(e)] = (buckets[e.month][catOf(e)] ?? 0) + e.amount * e.fx_rate;
     }
     return Array.from(cats).map((c) => {
       const r: Record<string, number | string> = { category: c };
@@ -589,7 +617,7 @@ function SummaryTab() {
       for (const c of selCats) {
         const total = yearExpenses
           .filter((e) => e.month === i + 1 && catOf(e) === c)
-          .reduce((s, e) => s + toRef(e.amount, e.currency), 0);
+          .reduce((s, e) => s + e.amount * e.fx_rate, 0);
         row[c] = total;
       }
       return row;
@@ -650,7 +678,9 @@ function SummaryTab() {
                         />
                         {r.name}
                       </td>
-                      <td className="px-2 py-1.5 text-right tabular-nums">{formatRef(r.value)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums">
+                        {formatRef(r.value, refCurrency)}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -671,7 +701,7 @@ function SummaryTab() {
                       <Cell key={i} fill={colorAt(i)} stroke="oklch(0.16 0.02 265)" />
                     ))}
                   </Pie>
-                  <Tooltip content={<DarkTooltip />} />
+                  <Tooltip content={<DarkTooltip currency={refCurrency} />} />
                 </PieChart>
               </ResponsiveContainer>
             </div>
@@ -699,7 +729,7 @@ function SummaryTab() {
                     width={120}
                     tick={{ fontSize: 14, fill: tickColor }}
                   />
-                  <Tooltip content={<DarkTooltip />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
+                  <Tooltip content={<DarkTooltip currency={refCurrency} />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
                   <Bar dataKey="value" radius={[0, 4, 4, 0]}>
                     {yearBarData.map((entry, i) => (
                       <Cell
@@ -729,7 +759,7 @@ function SummaryTab() {
                       <Cell key={i} fill={colorAt(i)} />
                     ))}
                   </Pie>
-                  <Tooltip content={<DarkTooltip />} />
+                  <Tooltip content={<DarkTooltip currency={refCurrency} />} />
                   <Legend verticalAlign="bottom" wrapperStyle={LEGEND_STYLE} />
                 </PieChart>
               </ResponsiveContainer>
@@ -761,11 +791,11 @@ function SummaryTab() {
                       key={i}
                       className="px-2 py-1.5 text-right text-xs tabular-nums text-muted-foreground"
                     >
-                      {v > 0 ? formatRef(v).replace("€", "") : "—"}
+                      {v > 0 ? v.toFixed(2) : "—"}
                     </td>
                   ))}
                   <td className="px-3 py-1.5 text-right font-semibold tabular-nums">
-                    {formatRef(r.total)}
+                    {formatRef(r.total, refCurrency)}
                   </td>
                 </tr>
               ))}
@@ -811,7 +841,7 @@ function SummaryTab() {
                   height={60}
                 />
                 <YAxis tick={{ fontSize: 14, fill: tickColor }} />
-                <Tooltip content={<DarkTooltip total />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
+                <Tooltip content={<DarkTooltip total currency={refCurrency} />} cursor={{ fill: "oklch(1 0 0 / 4%)" }} />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 {selMonths.map((m, i) => (
                   <Bar
@@ -854,7 +884,7 @@ function SummaryTab() {
                 <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
                 <XAxis dataKey="month" tick={{ fontSize: 14, fill: tickColor }} />
                 <YAxis tick={{ fontSize: 14, fill: tickColor }} />
-                <Tooltip content={<DarkTooltip />} cursor={{ stroke: "oklch(1 0 0 / 10%)" }} />
+                <Tooltip content={<DarkTooltip currency={refCurrency} />} cursor={{ stroke: "oklch(1 0 0 / 10%)" }} />
                 <Legend wrapperStyle={LEGEND_STYLE} />
                 {selCats.map((c, i) => (
                   <Line
