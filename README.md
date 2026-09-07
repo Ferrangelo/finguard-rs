@@ -19,6 +19,7 @@ Backend rewritten in rust, while the typescript + React frontend has been coded 
 - **Cashflow**: Track salary, interest, dividends, and other income alongside spending. Automatically computes savings and savings rate.
 - **Net Worth**: Keep track of all assets: liquidity, credit/debts, investments (stocks/ETFs, commodities, bonds).
 - **Recurring Expenses**: Define payment templates and apply them to any month; instances are stored per-month separately. Supported via the Expenses → Recurring sub-tab.
+- **Currency Conversion**: Enter expenses and investments in different currencies and see everything added up in one currency you choose, using the exchange rate for each item's own date.
 - **Local-First**: All data is stored locally in Parquet files with no external dependencies.
 - **Modern UI**: Built with React, Tailwind CSS, and interactive charts (Recharts).
 - **Themes**: Seven predefined themes with persistent user preference.
@@ -108,7 +109,7 @@ The interface has three main tabs:
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Expenses**  | View, add, edit, delete, and filter detailed monthly expenses. Switch to the _Summary_ sub-tab for category breakdowns and charts. The _Mappings_ sub-tab lets you define automatic expense-name-to-category rules. |
 | **Cashflow**  | Enter monthly income by category (salary, interest, dividends, other). Spending and savings are auto-calculated from expense data.                                                                                  |
-| **Net Worth** | Track investment holdings and prices, bank/broker liquidity, and credits/debts. View allocation pie charts and evolution over time.                                                                                 |
+| **Net Worth** | Track investment holdings and prices, bank/broker liquidity, and credits/debts. View allocation pie charts and evolution over time. The Total sub-tab lets you pick which currency every total is added up in, view the figures in a different currency, and choose whether the month still in progress is priced at last month's closing rate or the latest rate available. |
 
 Use the **year** and **month** selectors at the top to switch between periods. All data refreshes automatically.
 
@@ -117,28 +118,36 @@ Use the **year** and **month** selectors at the top to switch between periods. A
 Data is stored in **Parquet files** (via Polars) in local XDG-compliant directories:
 
 - **Expense & financial data**: `$XDG_DATA_HOME/finguard/` (default: `~/.local/share/finguard/`)
-- **Category mappings**: `$XDG_CONFIG_HOME/finguard/` (default: `~/.config/finguard/`)
+- **Category mappings and settings**: `$XDG_CONFIG_HOME/finguard/` (default: `~/.config/finguard/`)
 
-Directory layout per year:
+Directory layout:
 
 ```
-dbs/
-└── 2026/
-    ├── 01_detailed_expenses.parquet   # January expenses
-    ├── 02_detailed_expenses.parquet   # February expenses
-    ├── ...
-    ├── primaries.parquet              # Cumulative primary category summary
-    ├── secondaries.parquet            # Cumulative secondary category summary
-    ├── cashflow.parquet               # Monthly income/spending/savings
-    ├── investments.parquet            # Investment holdings
-    ├── investments_prices.parquet     # Investment prices
-    ├── liquidity.parquet              # Bank accounts & cash
-    └── credits_debts.parquet          # Credits/debts
+finguard/
+├── fx_rates.json                  # Exchange rates looked up so far, kept so each date is only looked up once
+└── dbs/
+    └── 2026/
+        ├── 01_detailed_expenses.parquet   # January expenses
+        ├── 02_detailed_expenses.parquet   # February expenses
+        ├── ...
+        ├── primaries.parquet              # Primary category totals as of when this file was last saved
+        ├── secondaries.parquet            # Secondary category totals as of when this file was last saved
+        ├── cashflow.parquet               # Monthly income/spending/savings
+        ├── investments.parquet            # Investment holdings
+        ├── investments_prices.parquet     # Investment prices
+        ├── liquidity.parquet              # Bank accounts & cash
+        └── credits_debts.parquet          # Credits/debts
 ```
+
+The app keeps a `currency.json` file next to the category-mapping files: it holds the currency you want totals shown in, and how to price the month that is still in progress.
+
+`primaries.parquet` and `secondaries.parquet` are no longer kept up to date. The app now adds up category totals from the monthly expense files each time it needs them, so these two files are left untouched from whenever they were last written and should not be relied on.
+
+> **Note on switching app versions**: monthly expense files saved by this version no longer keep a saved copy of each expense already converted to your chosen currency; the app works that out each time it shows the figures. Older expense files still open normally, but once one of them is saved again by this version, an older version of the app can no longer open it.
 
 ## Limitations
 
-- **No currency exchange**: all amounts are assumed to be in a single currency.
+- **Currency exchange needs the internet the first time**: the app converts expenses and investments into the currency you have chosen for totals, using the exchange rate published for each item's own date. It only goes online the first time it needs a given date's rate; after that the rate is saved and reused. If every amount you enter is already in that one currency, it never needs to go online.
 - **No automatic price updates**: investment prices must be entered manually each month.
 - **No authentication or multi-user support**
 - **No data import/export**: no CSV, bank-statement, or spreadsheet import; no export functionality (however the parquet files are always saved to disk).
@@ -157,7 +166,6 @@ dbs/
 
 - **TanStack Start**: React meta-framework
 - **TanStack Router**: client-side routing
-- **TanStack Query**: data fetching & caching
 - **React Hook Form**: form management
 - **Tailwind CSS**: utility-first styling
 - **Recharts**: interactive charts
