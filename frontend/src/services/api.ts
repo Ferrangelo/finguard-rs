@@ -10,11 +10,15 @@ import type {
   Categories,
   CreditDebtRow,
   Currency,
+  CurrencySettings,
   Expense,
   InvestmentAsset,
   InvestmentCategory,
   LiquidityRow,
   MappingRule,
+  MonthlyFxRates,
+  NetworthAllocation,
+  NetworthEvolution,
   RecurringTemplate,
 } from "./types";
 
@@ -288,30 +292,41 @@ export async function getInvestments(year: number): Promise<InvestmentAsset[]> {
   return apiFetch(`/api/investments?year=${year}`);
 }
 
-/** POST /api/investments. Creates a new asset in `year` (defaulting to the current year) with all 12 months at qty 0, price 0. */
+/**
+ * POST /api/investments. Creates a new asset in `year` (defaulting to the
+ * current year) with all 12 months at qty 0, price 0. `currency` falls back
+ * to the reference currency in the backend when omitted.
+ */
 export async function addInvestment(
   name: string,
   category: InvestmentCategory,
   link?: string,
   year?: number,
+  currency?: Currency,
 ): Promise<InvestmentAsset> {
   return apiFetch("/api/investments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, category, link, year: year ?? new Date().getFullYear() }),
+    body: JSON.stringify({
+      name,
+      category,
+      link,
+      year: year ?? new Date().getFullYear(),
+      currency,
+    }),
   });
 }
 
 /**
- * PUT /api/investments/:id. Updates an asset's name, category, and/or link.
- * `id` is the asset's current name. If `patch.name` differs from `id`, the
- * backend renames the asset first and then applies the category/link
- * changes under the new name, so a rename and a category or link change can
- * be sent together in one call.
+ * PUT /api/investments/:id. Updates an asset's name, category, link, and/or
+ * currency. `id` is the asset's current name. If `patch.name` differs from
+ * `id`, the backend renames the asset first and then applies the other
+ * changes under the new name, so a rename and any other field change can be
+ * sent together in one call.
  */
 export async function updateInvestmentMeta(
   id: string,
-  patch: Partial<Pick<InvestmentAsset, "name" | "category" | "link">>,
+  patch: Partial<Pick<InvestmentAsset, "name" | "category" | "link" | "currency">>,
   year: number,
 ): Promise<void> {
   await apiFetch(`/api/investments/${encodeURIComponent(id)}`, {
@@ -450,6 +465,77 @@ export async function setCreditDebtCell(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id, year, month, value }),
+  });
+}
+
+/** GET /api/settings/currency. Returns the reference currency and in-progress-month rate mode. */
+export async function getCurrencySettings(): Promise<CurrencySettings> {
+  return apiFetch("/api/settings/currency");
+}
+
+/**
+ * PUT /api/settings/currency. Replaces both settings and returns the saved
+ * values. Throws (via `apiFetch`) on a 400 when `settings.reference_currency`
+ * is outside the five supported codes; nothing is persisted in that case.
+ */
+export async function updateCurrencySettings(
+  settings: CurrencySettings,
+): Promise<CurrencySettings> {
+  return apiFetch("/api/settings/currency", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+}
+
+/**
+ * GET /api/fx/monthly-rates. Resolves one rate per currency per calendar
+ * month of `year`, converting *into* the reference currency (see
+ * `MonthlyFxRate.rate_to_reference` for the exact direction). `currencies`
+ * asks for extra codes beyond whatever `year`'s investment, liquidity, and
+ * credits/debts rows already use; omit it to get exactly those.
+ */
+export async function getMonthlyFxRates(
+  year: number,
+  currencies?: string[],
+): Promise<MonthlyFxRates> {
+  const p = new URLSearchParams({ year: String(year) });
+  if (currencies && currencies.length > 0) p.set("currencies", currencies.join(","));
+  return apiFetch(`/api/fx/monthly-rates?${p}`);
+}
+
+/**
+ * GET /api/networth/evolution. The net-worth evolution line chart for
+ * `year`, with every row already converted into the reference currency
+ * month by month. Resolves to `null` when every net-worth value is zero.
+ */
+export async function getNetworthEvolution(year: number): Promise<NetworthEvolution | null> {
+  return apiFetch(`/api/networth/evolution?year=${year}`);
+}
+
+/**
+ * GET /api/networth/allocation. The net-worth allocation pie chart for
+ * `year`/`month`, with every row already converted into the reference
+ * currency. Resolves to `null` when no slice qualifies.
+ */
+export async function getNetworthAllocation(
+  year: number,
+  month: number,
+): Promise<NetworthAllocation | null> {
+  return apiFetch(`/api/networth/allocation?year=${year}&month=${month}`);
+}
+
+/**
+ * POST /api/expenses/refresh-rates. Re-resolves the fx rate for every stale
+ * expense in `year` (every month when `month` is omitted) and returns the
+ * count of rows actually changed. Safe to call repeatedly: a row already
+ * resolved on its own date is never touched again.
+ */
+export async function refreshExpenseRates(year: number, month?: number): Promise<number> {
+  return apiFetch("/api/expenses/refresh-rates", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ year, month }),
   });
 }
 

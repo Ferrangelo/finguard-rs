@@ -6,7 +6,14 @@
 
 export type Currency = "EUR" | "USD" | "GBP" | "CHF" | "JPY";
 
-/** Mirrors `ExpenseJson` in backend/src/main.rs. `id` is the backend's stringified row index. */
+/**
+ * Mirrors `ExpenseJson` in backend/src/main.rs. `id` is the backend's
+ * stringified row index. `fx_rate` and `rate_date` are read-only: the server
+ * always resolves them from `currency` and the expense's own date, and
+ * ignores them on write, so a caller building a request should not set them.
+ * There is no `expense_in_ref_currency` field on the wire; a caller derives
+ * that amount itself as `amount * fx_rate`.
+ */
 export interface Expense {
   id: string;
   year: number;
@@ -17,6 +24,10 @@ export interface Expense {
   currency: Currency;
   primary: string;
   secondary: string;
+  /** Multiplier that converts `amount` into the reference currency; 1.0 when `currency` already is the reference currency. Read-only. */
+  fx_rate: number;
+  /** ISO `"YYYY-MM-DD"` date `fx_rate` was published for. Often earlier than the expense's own date, since the ECB publishes on working days only. Read-only. */
+  rate_date: string;
 }
 
 /** Mirrors `RecurringTemplateJson` in backend/src/main.rs. Has no `year`: the backend scopes recurring templates by year through query parameters, not through this shape. */
@@ -65,13 +76,17 @@ export type InvestmentCategory = "Stocks/ETF" | "Commodities" | "Bonds";
  * year always has all 12 months present, defaulting each to
  * `{ qty: 0, price: 0 }` when unset. JSON object keys are always strings on
  * the wire; the numeric key types here describe the year and month values
- * after the runtime coerces them back to numbers.
+ * after the runtime coerces them back to numbers. `currency` is typed as
+ * `Currency` for consistency with `LiquidityRow.currency` and
+ * `CreditDebtRow.currency`, but the backend column is a free string: an
+ * older row could in principle hold a code outside the union.
  */
 export interface InvestmentAsset {
   id: string;
   name: string;
   category: InvestmentCategory;
   link?: string;
+  currency: Currency;
   data: Record<number, Record<number, { qty: number; price: number }>>;
 }
 
@@ -107,6 +122,81 @@ export interface CreditDebtRow {
 export interface Categories {
   primary: string[];
   secondary: string[];
+}
+
+/** Mirrors `config::CurrentMonthRateMode` in backend/src/config.rs. `"previous_month_end"` freezes the in-progress month at the prior month's close; `"live"` always uses the newest published rate. */
+export type CurrentMonthRateMode = "previous_month_end" | "live";
+
+/** Mirrors `CurrencySettingsJson` in backend/src/main.rs, the body of `GET`/`PUT /api/settings/currency`. */
+export interface CurrencySettings {
+  reference_currency: Currency;
+  current_month_rate_mode: CurrentMonthRateMode;
+}
+
+/**
+ * One calendar month's resolved rates in `MonthlyFxRates`, mirroring
+ * `MonthlyFxRateJson` in backend/src/main.rs.
+ *
+ * `rate_to_reference[code]` multiplies an amount **in that currency** by it
+ * to reach `MonthlyFxRates.reference_currency`. Converting a
+ * reference-currency amount **into** a display currency means **dividing**
+ * by this value, not multiplying; getting the direction backward produces a
+ * plausible-looking but badly wrong figure. The reference currency itself is
+ * never a key, since its rate is implicitly 1.0. Keyed with `string`, not
+ * `Currency`: a caller can request any currency code through
+ * `getMonthlyFxRates`'s `currencies` argument, not only the five reference
+ * currencies.
+ */
+export interface MonthlyFxRate {
+  month: number;
+  rate_to_reference: Record<string, number>;
+}
+
+/**
+ * Mirrors `MonthlyFxRatesJson` in backend/src/main.rs, the body of
+ * `GET /api/fx/monthly-rates`. `unavailable_currencies` lists codes that
+ * could not be resolved for any month, typically offline with nothing
+ * cached; they are omitted from `months` rather than failing the request, so
+ * a caller must handle a requested currency being absent.
+ */
+export interface MonthlyFxRates {
+  year: number;
+  reference_currency: Currency;
+  months: MonthlyFxRate[];
+  unavailable_currencies: string[];
+}
+
+/** One stacked component of `NetworthEvolution`, mirroring `NetworthSeriesJson` in backend/src/main.rs. */
+export interface NetworthSeries {
+  name: string;
+  values: number[];
+}
+
+/**
+ * Mirrors the body of `GET /api/networth/evolution`, which serializes as
+ * `null` (so `getNetworthEvolution` resolves to `null`) when every net-worth
+ * value for the year is zero. Every figure is already in the reference
+ * currency.
+ */
+export interface NetworthEvolution {
+  months: string[];
+  components: NetworthSeries[];
+  net_worth: number[];
+}
+
+/** One slice of `NetworthAllocation`, mirroring `NetworthPieSliceJson` in backend/src/main.rs. */
+export interface NetworthPieSlice {
+  name: string;
+  value: number;
+}
+
+/**
+ * Mirrors the body of `GET /api/networth/allocation`, which serializes as
+ * `null` (so `getNetworthAllocation` resolves to `null`) when no slice
+ * qualifies. Every figure is already in the reference currency.
+ */
+export interface NetworthAllocation {
+  slices: NetworthPieSlice[];
 }
 
 // StatusKind and StatusMessage are frontend-only UI state (shown in the
