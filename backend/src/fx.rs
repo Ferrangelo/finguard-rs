@@ -495,6 +495,58 @@ pub async fn monthly_rates(year: i32, currencies: &[String]) -> Result<MonthlyRa
     monthly_rates_core(Local::now().date_naive(), year, currencies).await
 }
 
+/// Resolve one rate per currency in `currencies` for every month of `year`,
+/// same as [`monthly_rates`], except a currency that cannot be resolved does
+/// not sink the whole batch: each currency is looked up on its own, so a
+/// missing network and an empty cache for one currency drops only that
+/// currency from the returned table and names it in the second element,
+/// instead of failing every other currency's lookup too.
+///
+/// The reference currency is never looked up and never appears in the
+/// unavailable list, matching [`monthly_rates`].
+///
+/// Shared by every endpoint that must degrade per currency instead of
+/// failing outright: `main.rs`'s `get_monthly_fx_rates_handler`,
+/// `get_networth_evolution_handler`, and `get_networth_allocation_handler`
+/// all resolve through this function rather than each re-implementing the
+/// per-currency retry loop.
+pub async fn monthly_rates_lenient(
+    year: i32,
+    currencies: &[String],
+) -> Result<(MonthlyRates, Vec<String>)> {
+    let reference_currency = config::get_currency_settings()?
+        .reference_currency
+        .trim()
+        .to_uppercase();
+
+    let mut needed: Vec<String> = currencies
+        .iter()
+        .map(|c| c.trim().to_uppercase())
+        .filter(|c| *c != reference_currency)
+        .collect();
+    needed.sort();
+    needed.dedup();
+
+    let mut combined = MonthlyRates {
+        reference_currency,
+        rates: BTreeMap::new(),
+    };
+    let mut unavailable_currencies = Vec::new();
+
+    for currency in &needed {
+        match monthly_rates(year, std::slice::from_ref(currency)).await {
+            Ok(resolved) => {
+                for (month, month_rates) in resolved.rates {
+                    combined.rates.entry(month).or_default().extend(month_rates);
+                }
+            }
+            Err(_) => unavailable_currencies.push(currency.clone()),
+        }
+    }
+
+    Ok((combined, unavailable_currencies))
+}
+
 /// Return the last calendar day of `year`-`month`.
 ///
 /// # Errors
@@ -803,6 +855,46 @@ mod tests {
         assert_eq!(rates.rate(9, "EUR").unwrap(), 1.0);
         // No month was ever populated, proving no lookup was attempted.
         assert!(rates.rates.is_empty());
+    }
+
+    /// A resolvable currency and an unresolvable one in the same request must
+    /// not affect each other: the resolvable one still gets a full month
+    /// table, and only the unresolvable one is reported and left out.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_lenient_reports_one_failure_without_sinking_the_other() {
+        let _temp = with_temp_env_offline();
+        // Year far enough in the past that every month resolves through
+        // `month_end_rate`, regardless of when this test actually runs.
+        // Cached EUR-based: 1 EUR = 0.70 GBP, so a GBP amount converts into
+        // the (default EUR) reference currency at 1 / 0.70, not 0.70 itself.
+        seed_cache(&[("2000-01-31", &[("GBP", 0.70)])]);
+
+        let (rates, unavailable) =
+            monthly_rates_lenient(2000, &["GBP".to_string(), "USD".to_string()])
+                .await
+                .expect("a per-currency failure must not fail the whole batch");
+
+        assert_eq!(unavailable, vec!["USD".to_string()]);
+        assert_eq!(rates.rate(1, "GBP").unwrap(), 1.0 / 0.70);
+        assert!(rates.rate(1, "USD").is_err());
+    }
+
+    /// A request naming only the reference currency needs no cache and no
+    /// network at all, and must report nothing as unavailable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_lenient_reference_currency_only_needs_no_lookup() {
+        let _temp = with_temp_env_offline();
+        // No cache seeded at all: a lookup attempt for the reference
+        // currency would hit the "nothing cached, network disabled" error.
+
+        let (rates, unavailable) = monthly_rates_lenient(2026, &["EUR".to_string()])
+            .await
+            .expect("reference currency never fails");
+
+        assert!(unavailable.is_empty());
+        assert_eq!(rates.rate(1, "EUR").unwrap(), 1.0);
     }
 
     #[test]
