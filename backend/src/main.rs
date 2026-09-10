@@ -1148,7 +1148,8 @@ async fn get_income_handler(
 
 /// `POST /api/cashflow/income`: set one income cell (`payload.category` for
 /// `payload.month` of `payload.year`), then recompute and save the derived
-/// `Income`/`Spending`/`Saving`/`Saving %` rows for every month of the year.
+/// `Income` row for every month of the year. Spending is computed at read time
+/// instead.
 ///
 /// Returns [`Error::InvalidArgument`] (`400`) if `payload.category` is not
 /// one of the four known income categories or `payload.month` is outside

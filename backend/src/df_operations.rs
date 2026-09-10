@@ -63,7 +63,11 @@ const INCOME_CATEGORIES: &[&str] = &[
     "Other",
 ];
 
-/// Row labels for the derived (computed) cashflow categories.
+/// Row labels for the derived cashflow categories. Only `Income` is still
+/// recomputed, from the income categories above. `Spending`, `Saving`, and
+/// `Saving %` stay in this list only so a freshly created table keeps the
+/// same row set as an older file that persisted them from
+/// `primaries.parquet`; see [`Cashflow::recompute`].
 const DERIVED_CATEGORIES: &[&str] = &["Income", "Spending", "Saving", "Saving %"];
 
 /// Valid investment categories.
@@ -822,8 +826,12 @@ fn regex_escape(s: &str) -> String {
 // Cashflow
 // ======================================================================
 
-/// Yearly cashflow table (wide format), with income rows set manually and
-/// derived rows recomputed from income totals and `primaries.parquet`.
+/// Yearly cashflow table (wide format), with income rows set manually and the
+/// `Income` row recomputed from them. `Spending`, `Saving`, and `Saving %`
+/// rows may still be present from an older build that derived them from
+/// `primaries.parquet`, a summary file this branch no longer writes; this
+/// type no longer reads that file or updates those rows, and leaves whatever
+/// is already on disk exactly as it is.
 pub struct Cashflow {
     /// Calendar year of this table.
     pub year: i32,
@@ -874,19 +882,21 @@ impl Cashflow {
         Ok(())
     }
 
-    /// Recompute all derived rows from income values and `primaries.parquet`,
-    /// then save.
+    /// Recompute the `Income` row from income values, then save.
+    ///
+    /// This used to also derive `Spending` from the `Total` row of
+    /// `primaries.parquet` and `Saving`/`Saving %` from `Income` and
+    /// `Spending`. This branch no longer writes `primaries.parquet` and
+    /// stopped storing a reference-currency figure at write time in favor of
+    /// converting each expense at its own date's rate when it is requested
+    /// (see `get_monthly_spending_handler` in `main.rs`), so recomputing
+    /// `Spending` here would persist a figure denominated in whichever
+    /// reference currency happened to be configured at edit time. Any
+    /// `Spending`/`Saving`/`Saving %` values an older build already wrote are
+    /// left untouched on disk; this method neither reads nor rewrites them.
     pub fn recompute(&mut self) -> Result<()> {
-        let primaries_path = get_year_summary_path(self.year, PRIMARIES_FILENAME)?;
-        let primaries = if primaries_path.exists() {
-            Some(read_parquet(&primaries_path)?)
-        } else {
-            None
-        };
-
         for month in 1..=12u32 {
             let col_name = format!("{month:02}");
-            let month_label = format!("{}-{:02}", self.year, month);
 
             // Income = sum of income categories
             let mut income = 0.0;
@@ -894,36 +904,6 @@ impl Cashflow {
                 income += self.get_value(cat, &col_name)?;
             }
             self.set_value("Income", &col_name, income)?;
-
-            // Spending = "Total" row from primaries.parquet for this month
-            let mut spending = 0.0;
-            if let Some(p) = &primaries
-                && has_column(p, &month_label)
-            {
-                let total_rows = p
-                    .clone()
-                    .lazy()
-                    .filter(col("primary_category").eq(lit("Total")))
-                    .collect()?;
-                if total_rows.height() > 0 {
-                    spending = total_rows
-                        .column(&month_label)?
-                        .f64()?
-                        .get(0)
-                        .unwrap_or(0.0);
-                }
-            }
-            self.set_value("Spending", &col_name, spending)?;
-
-            let saving = income - spending;
-            self.set_value("Saving", &col_name, saving)?;
-
-            let saving_pct = if income != 0.0 {
-                100.0 * saving / income
-            } else {
-                0.0
-            };
-            self.set_value("Saving %", &col_name, saving_pct)?;
         }
 
         self.save()?;
@@ -1870,6 +1850,114 @@ mod tests {
         assert_eq!(
             str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
             vec!["EUR", "USD"]
+        );
+    }
+
+    /// `set_income` (via `recompute`) must still sum the income categories
+    /// into `Income`, and must never write `Spending`, `Saving`, or
+    /// `Saving %`: those used to come from `primaries.parquet`, a file this
+    /// branch no longer writes.
+    #[test]
+    #[serial_test::serial]
+    fn cashflow_recompute_updates_income_only() {
+        let _temp = with_temp_data_home();
+
+        let mut cf = Cashflow::new(2026).expect("load cashflow");
+        cf.set_income(3, "Salary", 1000.0).expect("set salary");
+        cf.set_income(3, "Other", 200.0).expect("set other income");
+
+        assert_eq!(cf.get_value("Income", "03").expect("read income"), 1200.0);
+        assert_eq!(cf.get_value("Spending", "03").expect("read spending"), 0.0);
+        assert_eq!(cf.get_value("Saving", "03").expect("read saving"), 0.0);
+        assert_eq!(
+            cf.get_value("Saving %", "03").expect("read saving pct"),
+            0.0
+        );
+    }
+
+    /// A `cashflow.parquet` written by an older build that persisted
+    /// `Spending`/`Saving`/`Saving %` must keep those exact values after a
+    /// later edit and recompute: this branch stops writing them, but must
+    /// not touch what is already on disk.
+    #[test]
+    #[serial_test::serial]
+    fn cashflow_recompute_preserves_legacy_derived_rows() {
+        let _temp = with_temp_data_home();
+
+        // Build a legacy-shaped table by hand: income rows plus derived rows
+        // already carrying nonzero Spending/Saving/Saving% values, as an
+        // older build would have written them from primaries.parquet.
+        let all_cats: Vec<&str> = INCOME_CATEGORIES
+            .iter()
+            .chain(DERIVED_CATEGORIES.iter())
+            .copied()
+            .collect();
+        let mut cols: Vec<Column> = vec![Column::new("category".into(), &all_cats)];
+        for m in month_labels() {
+            let values: Vec<f64> = all_cats
+                .iter()
+                .map(|cat| match *cat {
+                    "Salary" if m == "03" => 1000.0,
+                    "Spending" if m == "03" => 400.0,
+                    "Saving" if m == "03" => 600.0,
+                    "Saving %" if m == "03" => 60.0,
+                    "Income" if m == "03" => 1000.0,
+                    _ => 0.0,
+                })
+                .collect();
+            cols.push(Column::new(m.as_str().into(), values));
+        }
+        let legacy_df = DataFrame::new_infer_height(cols).expect("build legacy cashflow frame");
+        let path = get_year_summary_path(2026, CASHFLOW_FILENAME).expect("cashflow path");
+        write_parquet(&legacy_df, &path).expect("write legacy cashflow file");
+
+        // Editing an unrelated month must not disturb the legacy row.
+        let mut cf = Cashflow::new(2026).expect("load cashflow");
+        cf.set_income(4, "Salary", 50.0).expect("set salary");
+
+        assert_eq!(
+            cf.get_value("Spending", "03")
+                .expect("read legacy spending"),
+            400.0
+        );
+        assert_eq!(
+            cf.get_value("Saving", "03").expect("read legacy saving"),
+            600.0
+        );
+        assert_eq!(
+            cf.get_value("Saving %", "03")
+                .expect("read legacy saving pct"),
+            60.0
+        );
+
+        // `set_income` calls `recompute`, which calls `save`. Reload from
+        // disk instead of trusting the in-memory frame, so the assertion
+        // proves the legacy values actually survived the write, not just
+        // that this process's copy was left alone.
+        let reloaded = Cashflow::new(2026).expect("reload cashflow from disk");
+        assert_eq!(
+            reloaded
+                .get_value("Spending", "03")
+                .expect("read reloaded legacy spending"),
+            400.0
+        );
+        assert_eq!(
+            reloaded
+                .get_value("Saving", "03")
+                .expect("read reloaded legacy saving"),
+            600.0
+        );
+        assert_eq!(
+            reloaded
+                .get_value("Saving %", "03")
+                .expect("read reloaded legacy saving pct"),
+            60.0
+        );
+        assert_eq!(
+            reloaded
+                .get_value("Income", "04")
+                .expect("read reloaded updated income"),
+            50.0
         );
     }
 
