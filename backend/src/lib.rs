@@ -22,7 +22,7 @@
 //! original Python application at `/home/anferrar/Projects/finguard` byte for
 //! byte, most notably category-name normalization
 //! ([`df_operations::normalize_category_value`]) and banker's rounding
-//! ([`plots`]'s `round_half_even`/`round2_half_even`). The on-disk Parquet
+//! ([`plots`] module). The on-disk Parquet
 //! schema is a compatibility boundary shared with that Python project, so
 //! check it before changing a schema-affecting type in [`df_operations`].
 
