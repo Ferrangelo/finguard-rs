@@ -1201,6 +1201,15 @@ async fn update_investment_meta_handler(
         inv.set_category(&final_name, cat)?;
     }
     if let Some(cur) = &payload.currency {
+        if !str_col_to_vec(&inv.df, "asset_name")?
+            .iter()
+            .any(|n| n == &final_name)
+        {
+            return Err(finguard_rs_backend::Error::NotFound(format!(
+                "Asset '{final_name}' not found."
+            ))
+            .into());
+        }
         set_df_str_where(&mut inv.df, "asset_name", &final_name, "currency", cur)?;
         inv.save_df()?;
     }
@@ -1362,6 +1371,15 @@ async fn update_liquidity_meta_handler(
         liq.set_category(&final_name, cat)?;
     }
     if let Some(cur) = &payload.currency {
+        if !str_col_to_vec(&liq.df, "asset_name")?
+            .iter()
+            .any(|n| n == &final_name)
+        {
+            return Err(finguard_rs_backend::Error::NotFound(format!(
+                "Asset '{final_name}' not found."
+            ))
+            .into());
+        }
         set_df_str_where(&mut liq.df, "asset_name", &final_name, "currency", cur)?;
         liq.save()?;
     }
@@ -1499,6 +1517,15 @@ async fn update_credit_debt_meta_handler(
     };
 
     if let Some(cur) = &payload.currency {
+        if !str_col_to_vec(&cd.df, "name")?
+            .iter()
+            .any(|n| n == &final_name)
+        {
+            return Err(finguard_rs_backend::Error::NotFound(format!(
+                "Entry '{final_name}' not found."
+            ))
+            .into());
+        }
         set_df_str_where(&mut cd.df, "name", &final_name, "currency", cur)?;
         cd.save()?;
     }
@@ -2046,6 +2073,136 @@ mod tests {
             str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
             vec!["USD".to_string()]
         );
+    }
+
+    /// A currency-only payload has no `name`, `category`, or `link`, so
+    /// `final_name` falls back to the path `id` unchanged and none of the
+    /// other branches in the handler run an existence check. Before the fix,
+    /// `set_df_str_where` matched zero rows and returned `Ok(())` anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn update_investment_meta_handler_currency_only_on_missing_asset_is_not_found() {
+        let _temp = with_temp_env_offline();
+        InvestmentHoldings::new(2026).expect("load holdings");
+
+        let err = update_investment_meta_handler(
+            Path("Missing Asset".to_string()),
+            Json(UpdateInvestmentPayload {
+                year: 2026,
+                name: None,
+                category: None,
+                link: None,
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .expect_err("a currency-only update on a missing asset must be rejected");
+        assert!(matches!(err.0, finguard_rs_backend::Error::NotFound(_)));
+    }
+
+    /// `PUT /api/liquidity/:id` must update the stored currency when the
+    /// payload includes one, mirroring
+    /// [`update_investment_meta_handler_updates_currency`].
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn update_liquidity_meta_handler_updates_currency() {
+        let _temp = with_temp_env_offline();
+
+        let mut liq = Liquidity::new(2026).expect("load liquidity");
+        liq.add_asset("Test Account", "Cash", "EUR")
+            .expect("add asset");
+
+        update_liquidity_meta_handler(
+            Path("Test Account".to_string()),
+            Json(UpdateLiquidityPayload {
+                year: 2026,
+                name: None,
+                category: None,
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("update succeeds: {err}"));
+
+        let reloaded = Liquidity::new(2026).expect("reload liquidity");
+        assert_eq!(
+            str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
+            vec!["USD".to_string()]
+        );
+    }
+
+    /// Same missing-row regression as
+    /// [`update_investment_meta_handler_currency_only_on_missing_asset_is_not_found`],
+    /// for the liquidity handler.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn update_liquidity_meta_handler_currency_only_on_missing_asset_is_not_found() {
+        let _temp = with_temp_env_offline();
+        Liquidity::new(2026).expect("load liquidity");
+
+        let err = update_liquidity_meta_handler(
+            Path("Missing Account".to_string()),
+            Json(UpdateLiquidityPayload {
+                year: 2026,
+                name: None,
+                category: None,
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .expect_err("a currency-only update on a missing row must be rejected");
+        assert!(matches!(err.0, finguard_rs_backend::Error::NotFound(_)));
+    }
+
+    /// `PUT /api/credits_debts/:id` must update the stored currency when the
+    /// payload includes one, mirroring
+    /// [`update_investment_meta_handler_updates_currency`].
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn update_credit_debt_meta_handler_updates_currency() {
+        let _temp = with_temp_env_offline();
+
+        let mut cd = CreditsDebts::new(2026).expect("load credits/debts");
+        cd.add_entry("Test Entry", "EUR").expect("add entry");
+
+        update_credit_debt_meta_handler(
+            Path("Test Entry".to_string()),
+            Json(UpdateCreditDebtPayload {
+                year: 2026,
+                name: None,
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("update succeeds: {err}"));
+
+        let reloaded = CreditsDebts::new(2026).expect("reload credits/debts");
+        assert_eq!(
+            str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
+            vec!["USD".to_string()]
+        );
+    }
+
+    /// Same missing-row regression as
+    /// [`update_investment_meta_handler_currency_only_on_missing_asset_is_not_found`],
+    /// for the credits/debts handler.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn update_credit_debt_meta_handler_currency_only_on_missing_entry_is_not_found() {
+        let _temp = with_temp_env_offline();
+        CreditsDebts::new(2026).expect("load credits/debts");
+
+        let err = update_credit_debt_meta_handler(
+            Path("Missing Entry".to_string()),
+            Json(UpdateCreditDebtPayload {
+                year: 2026,
+                name: None,
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .expect_err("a currency-only update on a missing entry must be rejected");
+        assert!(matches!(err.0, finguard_rs_backend::Error::NotFound(_)));
     }
 
     /// `GET` then `PUT` then `GET` again on `/api/settings/currency` must
