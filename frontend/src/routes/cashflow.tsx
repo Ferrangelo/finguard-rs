@@ -37,19 +37,39 @@ export const Route = createFileRoute("/cashflow")({
   component: CashflowPage,
 });
 
+/**
+ * This page's one visual treatment for a degraded currency state, matching
+ * the styling `ErrorBanner` uses on the expenses and net-worth pages.
+ */
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+      {message}
+    </div>
+  );
+}
+
 function CashflowPage() {
   const colorAt = useChartColors();
   const { year, notify, refresh, refreshTick, currencySettings } = useApp();
   const refCurrency = currencySettings.reference_currency;
   const [income, setIncome] = useState<Record<number, Record<string, number>>>({});
   const [spending, setSpending] = useState<Record<number, Record<string, number>>>({});
+  // Currencies `getMonthlySpendingByPrimary` could not resolve; a nonempty
+  // list means `spending`, and everything derived from it below (totals,
+  // saving, the bar chart), is a lower bound rather than the true figure.
+  const [spendingUnavailable, setSpendingUnavailable] = useState<string[]>([]);
   const { theme } = useTheme();
   const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
 
   useEffect(() => {
     let active = true;
     api.getIncome(year).then((income) => active && setIncome(income));
-    api.getMonthlySpendingByPrimary(year).then((spending) => active && setSpending(spending));
+    api.getMonthlySpendingByPrimary(year).then((res) => {
+      if (!active) return;
+      setSpending(res.months);
+      setSpendingUnavailable(res.unavailable_currencies);
+    });
     return () => {
       active = false;
     };
@@ -96,6 +116,12 @@ function CashflowPage() {
         <h1 className="text-2xl font-bold tracking-tight">Cashflow</h1>
         <p className="text-sm text-muted-foreground">Monthly income vs. spending across {year}.</p>
       </div>
+
+      {spendingUnavailable.length > 0 && (
+        <ErrorBanner
+          message={`Could not resolve exchange rates for ${spendingUnavailable.join(", ")}. Spending, saving, and saving % below are a lower bound.`}
+        />
+      )}
 
       <GlassCard title={`Cashflow grid · ${year}`}>
         <div className="scrollbar-thin overflow-x-auto">

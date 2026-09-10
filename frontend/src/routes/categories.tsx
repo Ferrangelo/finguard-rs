@@ -5,7 +5,7 @@ import { useApp } from "@/context/AppContext";
 import * as api from "@/services/api";
 import { formatRef } from "@/services/fx";
 import { GlassCard } from "@/components/finguard/GlassCard";
-import type { Categories, Currency } from "@/services/types";
+import type { Categories, CategoryTotals, Currency } from "@/services/types";
 
 // Categories page: two side-by-side registries (primary and secondary
 // category names) with their all-time expense totals, add and delete
@@ -17,12 +17,30 @@ export const Route = createFileRoute("/categories")({
   component: CategoriesPage,
 });
 
+const EMPTY_TOTALS: CategoryTotals = {
+  totals: {},
+  unavailable_currencies: [],
+  unavailable_currencies_by_category: {},
+};
+
+/**
+ * This page's one visual treatment for a degraded currency state, matching
+ * the styling `ErrorBanner` uses on the expenses and net-worth pages.
+ */
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+      {message}
+    </div>
+  );
+}
+
 function CategoriesPage() {
   const { notify, refresh, refreshTick, currencySettings } = useApp();
   const refCurrency = currencySettings.reference_currency;
   const [cats, setCats] = useState<Categories>({ primary: [], secondary: [] });
-  const [pri, setPri] = useState<Record<string, number>>({});
-  const [sec, setSec] = useState<Record<string, number>>({});
+  const [pri, setPri] = useState<CategoryTotals>(EMPTY_TOTALS);
+  const [sec, setSec] = useState<CategoryTotals>(EMPTY_TOTALS);
 
   useEffect(() => {
     let active = true;
@@ -34,6 +52,13 @@ function CategoriesPage() {
     };
   }, [refreshTick]);
 
+  // Combined for one page-level notice; the delete-guard block in
+  // CategoryColumn below still checks each kind's own list, since the
+  // backend's refusal is scoped to that kind's totals call.
+  const unavailableCurrencies = Array.from(
+    new Set([...pri.unavailable_currencies, ...sec.unavailable_currencies]),
+  );
+
   return (
     <div className="space-y-5">
       <div>
@@ -41,14 +66,20 @@ function CategoriesPage() {
         <p className="text-sm text-muted-foreground">Manage your primary and secondary category registries.</p>
       </div>
 
+      {unavailableCurrencies.length > 0 && (
+        <ErrorBanner
+          message={`Could not resolve exchange rates for ${unavailableCurrencies.join(", ")}. All-time totals below are a lower bound, and deleting a category is disabled until rates are available.`}
+        />
+      )}
+
       <div className="grid gap-5 lg:grid-cols-2">
         <CategoryColumn
-          title="Primary categories" kind="primary" list={cats.primary} totals={pri} currency={refCurrency}
+          title="Primary categories" kind="primary" list={cats.primary} totals={pri.totals} unavailableCurrenciesByCategory={pri.unavailable_currencies_by_category} currency={refCurrency}
           onAdd={async (n) => { await api.addCategory("primary", n); notify("success", `Added "${n}"`); refresh(); }}
           onDelete={async (n) => { await api.deleteCategory("primary", n); notify("success", `Deleted "${n}"`); refresh(); }}
         />
         <CategoryColumn
-          title="Secondary categories" kind="secondary" list={cats.secondary} totals={sec} currency={refCurrency}
+          title="Secondary categories" kind="secondary" list={cats.secondary} totals={sec.totals} unavailableCurrenciesByCategory={sec.unavailable_currencies_by_category} currency={refCurrency}
           onAdd={async (n) => { await api.addCategory("secondary", n); notify("success", `Added "${n}"`); refresh(); }}
           onDelete={async (n) => { await api.deleteCategory("secondary", n); notify("success", `Deleted "${n}"`); refresh(); }}
         />
@@ -58,12 +89,13 @@ function CategoriesPage() {
 }
 
 function CategoryColumn({
-  title, kind, list, totals, currency, onAdd, onDelete,
+  title, kind, list, totals, unavailableCurrenciesByCategory, currency, onAdd, onDelete,
 }: {
   title: string;
   kind: "primary" | "secondary";
   list: string[];
   totals: Record<string, number>;
+  unavailableCurrenciesByCategory: Record<string, string[]>;
   currency: Currency;
   onAdd: (n: string) => Promise<void>;
   onDelete: (n: string) => Promise<void>;
@@ -108,6 +140,17 @@ function CategoryColumn({
               // tolerance for float rounding. The UI shows a delete button only
               // when the backend will accept it.
               const hasExpenses = Math.abs(t) >= 1e-9;
+              // NOTE: mirrors delete_category_handler's second refusal reason
+              // (backend/src/main.rs), which is still awaiting a product
+              // ruling. Remove this block, and the
+              // unavailableCurrenciesByCategory prop it depends on, if that
+              // refusal is dropped. Scoped to this category's own name (`c`,
+              // the same raw name used as the `totals` key and sent to
+              // deleteCategory), not the page-wide unavailable_currencies:
+              // another category's unresolved currency does not block this
+              // one, matching the backend's per-category guard.
+              const blockingCurrencies = unavailableCurrenciesByCategory[c] ?? [];
+              const ratesUnavailable = blockingCurrencies.length > 0;
               return (
                 <tr key={c} className="hover:bg-muted/20">
                   <td className="px-3 py-2 font-medium">{c}</td>
@@ -115,6 +158,13 @@ function CategoryColumn({
                   <td className="px-3 py-2 text-right">
                     {hasExpenses ? (
                       <span className="text-[11px] italic text-muted-foreground">has existing expenses</span>
+                    ) : ratesUnavailable ? (
+                      <span
+                        className="text-[11px] italic text-muted-foreground"
+                        title={`Cannot delete "${c}" right now: no exchange rate for ${blockingCurrencies.join(", ")}.`}
+                      >
+                        rates unavailable
+                      </span>
                     ) : (
                       <button onClick={() => onDelete(c)}
                         className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:border-destructive/60 hover:text-destructive">

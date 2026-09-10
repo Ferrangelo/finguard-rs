@@ -8,16 +8,19 @@
 // TypeScript types in `./types.ts` together.
 import type {
   Categories,
+  CategoryTotals,
   CreditDebtRow,
   Currency,
   CurrencySettings,
   Expense,
+  ExpenseList,
   ExpenseWrite,
   InvestmentAsset,
   InvestmentCategory,
   LiquidityRow,
   MappingRule,
   MonthlyFxRates,
+  MonthlySpending,
   NetworthAllocation,
   NetworthEvolution,
   RecurringTemplate,
@@ -74,12 +77,16 @@ export interface ExpenseFilter {
  * file does not exist rather than erroring. `id` in each returned `Expense`
  * is only unique within its own year and month: it is the row's position in
  * that month's Parquet file, not a globally unique identifier.
+ *
+ * A currency that could not be resolved does not drop its rows or fail the
+ * request: they come back with `fx_rate: 0` (see `ExpenseList`), and the
+ * currency is named in the response's `unavailable_currencies`.
  */
 export async function getExpenses(
   year: number,
   month?: number,
   filter?: ExpenseFilter,
-): Promise<Expense[]> {
+): Promise<ExpenseList> {
   const p = new URLSearchParams({ year: String(year) });
   if (month != null) p.set("month", String(month));
   if (filter?.name) p.set("name", filter.name);
@@ -93,10 +100,12 @@ export async function getExpenses(
  * Convenience wrapper around `getExpenses` for the current calendar year
  * only. Despite the name, it does not fetch every year the backend has
  * stored; callers that need historical years must call `getExpenses`
- * directly with that year.
+ * directly with that year. Drops `unavailable_currencies` from the result,
+ * so a caller that needs to warn about a degraded currency should call
+ * `getExpenses` directly instead of this wrapper.
  */
 export async function getAllExpenses(): Promise<Expense[]> {
-  return getExpenses(new Date().getFullYear());
+  return (await getExpenses(new Date().getFullYear())).expenses;
 }
 
 /**
@@ -104,7 +113,9 @@ export async function getAllExpenses(): Promise<Expense[]> {
  * empty, or edits the existing row at that index when it is set. The
  * backend infers create vs. edit from whether `id` is empty, so this
  * function always sends an `id` field (defaulting to `""`) rather than
- * omitting it.
+ * omitting it. The row still saves even when its currency's rate cannot be
+ * resolved; the returned `Expense` then carries `fx_rate: 0` and
+ * `rate_date: ""`, the same "unknown" pair `getExpenses` uses.
  */
 export async function upsertExpense(input: ExpenseWrite): Promise<Expense> {
   return apiFetch("/api/expenses", {
@@ -233,7 +244,13 @@ export async function addCategory(
  * thrown `Error`) if any stored expense still totals a nonzero amount in
  * this category across all years: the backend computes the category's
  * all-time total first and refuses the delete rather than orphaning
- * existing expense rows.
+ * existing expense rows. Also fails with a 400 while `name`'s own rows
+ * include an unresolved currency (see `getCategoryTotals`'s
+ * `unavailable_currencies_by_category`), since a degraded total for this
+ * category could hide expenses that still use it; another category's
+ * unresolved currency does not block this one. Callers should check
+ * `getCategoryTotals` before offering the delete rather than relying on this
+ * call to report that state.
  */
 export async function deleteCategory(
   kind: "primary" | "secondary",
@@ -242,10 +259,18 @@ export async function deleteCategory(
   return apiFetch(`/api/categories/${kind}/${encodeURIComponent(name)}`, { method: "DELETE" });
 }
 
-/** GET /api/categories/totals. Sums every expense's amount by category name (of the given kind) across all years. */
-export async function getCategoryTotals(
-  kind: "primary" | "secondary",
-): Promise<Record<string, number>> {
+/**
+ * GET /api/categories/totals. Sums every expense's reference-currency amount
+ * by category name (of the given kind) across all years. A category whose
+ * rows are all in an unresolved currency is absent from `totals` rather than
+ * present at `0` (see `CategoryTotals`). `unavailable_currencies` nonempty
+ * means some total on this page is a lower bound; `unavailable_currencies_by_category`
+ * says exactly which ones, keyed by the same raw name used in `totals`.
+ * `deleteCategory` refuses only when the category being deleted appears in
+ * that per-category map, so gate a delete action on that entry, not on
+ * `unavailable_currencies`.
+ */
+export async function getCategoryTotals(kind: "primary" | "secondary"): Promise<CategoryTotals> {
   return apiFetch(`/api/categories/totals?kind=${kind}`);
 }
 
@@ -276,13 +301,14 @@ export async function setIncomeCell(
 /**
  * GET /api/cashflow/spending. Returns total spending per primary category
  * for `year`, keyed by month (1 to 12, always present) and then by category
- * name. Reads from the year's precomputed primaries summary file; months
- * or categories with no recorded spending are simply absent from the
- * corresponding map rather than present with a 0.
+ * name; a category with no recorded spending that month is simply absent
+ * from the month's map rather than present with a 0. Computed at read time
+ * from `year`'s expense rows, each converted at its own date's rate. A
+ * category/month combination whose rows are all in an unresolved currency is
+ * excluded the same way (see `MonthlySpending`), so `unavailable_currencies`
+ * nonempty means every reported amount is a lower bound.
  */
-export async function getMonthlySpendingByPrimary(
-  year: number,
-): Promise<Record<number, Record<string, number>>> {
+export async function getMonthlySpendingByPrimary(year: number): Promise<MonthlySpending> {
   return apiFetch(`/api/cashflow/spending?year=${year}`);
 }
 

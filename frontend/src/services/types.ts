@@ -44,6 +44,20 @@ export interface ExpenseWrite extends Omit<Expense, "id" | "fx_rate" | "rate_dat
   id?: string;
 }
 
+/**
+ * Mirrors `ExpenseListJson`, the body of `GET /api/expenses`. A currency
+ * that could not be resolved does not drop its rows: they stay in
+ * `expenses` with `fx_rate: 0` and `rate_date: ""` (see `Expense`), and the
+ * currency is named in `unavailable_currencies`. `fx_rate` is never
+ * legitimately `0` for a resolved row, so a caller can treat `fx_rate === 0`
+ * as "no rate for this row" without cross-checking `unavailable_currencies`
+ * first.
+ */
+export interface ExpenseList {
+  expenses: Expense[];
+  unavailable_currencies: string[];
+}
+
 /** Mirrors `RecurringTemplateJson` in backend/src/main.rs. Has no `year`: the backend scopes recurring templates by year through query parameters, not through this shape. */
 export interface RecurringTemplate {
   id: string;
@@ -78,6 +92,23 @@ export const INCOME_CATEGORIES = [
   "Other",
 ] as const;
 export type IncomeCategory = (typeof INCOME_CATEGORIES)[number];
+
+/**
+ * Mirrors `MonthlySpendingJson` in backend/src/main.rs, the body of
+ * `GET /api/cashflow/spending`. `months` keys every calendar month `1`
+ * through `12` (always present, even with no expense rows that month) to a
+ * category-name -> reference-currency-amount map. Same lower-bound caveat as
+ * `CategoryTotals.totals`: a category/month combination whose rows are all
+ * in an unresolved currency is absent rather than present at `0`. Note
+ * `GET /api/cashflow/income`, which the cashflow page fetches alongside this
+ * endpoint, still returns the older bare `Record<month, Record<category,
+ * number>>` shape directly, with no `unavailable_currencies` wrapper: do not
+ * reuse this type for it.
+ */
+export interface MonthlySpending {
+  months: Record<number, Record<string, number>>;
+  unavailable_currencies: string[];
+}
 
 // Matches `df_operations::INVESTMENT_CATEGORIES` in the backend.
 export type InvestmentCategory = "Stocks/ETF" | "Commodities" | "Bonds";
@@ -136,6 +167,27 @@ export interface CreditDebtRow {
 export interface Categories {
   primary: string[];
   secondary: string[];
+}
+
+/**
+ * Mirrors `CategoryTotalsJson` in backend/src/main.rs, the body of
+ * `GET /api/categories/totals`. `totals` sums every expense's
+ * reference-currency amount by category name of the requested kind. A
+ * category whose rows are all in an unresolved currency is absent from
+ * `totals` rather than present at `0`.
+ *
+ * `unavailable_currencies` covers every category of the requested kind, so
+ * it answers "is anything on this page incomplete", not "is this particular
+ * total incomplete"; use `unavailable_currencies_by_category` for the
+ * per-category answer, keyed by the same raw category name used in
+ * `totals`. `DELETE /api/categories/:kind/:name` refuses to delete only when
+ * the deleted category's own name appears there, so a client offering a
+ * delete should gate on that entry rather than on `unavailable_currencies`.
+ */
+export interface CategoryTotals {
+  totals: Record<string, number>;
+  unavailable_currencies: string[];
+  unavailable_currencies_by_category: Record<string, string[]>;
 }
 
 /** Mirrors `config::CurrentMonthRateMode` in backend/src/config.rs. `"previous_month_end"` freezes the in-progress month at the prior month's close; `"live"` always uses the newest published rate. */
