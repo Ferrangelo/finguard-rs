@@ -23,6 +23,8 @@
 //! disables every network call; resolvers then work purely from the cache.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use chrono::{Datelike, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,47 @@ use crate::error::{Error, Result};
 use crate::paths;
 
 const FRANKFURTER_BASE_URL: &str = "https://api.frankfurter.app";
+
+/// How long a single Frankfurter request may run before it is treated as
+/// failed. The offline fallbacks ([`nearest_earlier`], [`newest_cached`])
+/// only run on `Err`, so a request that hangs instead of erroring bypasses
+/// them and parks the handling task indefinitely; a bounded timeout is what
+/// turns a hang into the `Err` those fallbacks are waiting for.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long establishing the TCP/TLS connection alone may take, as a tighter
+/// bound than [`REQUEST_TIMEOUT`] for the case where the network never even
+/// reaches Frankfurter (e.g. a black-holed route or a captive portal).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The shared client for every Frankfurter request, built once and reused so
+/// repeated rate lookups do not each pay for a fresh connection pool the way
+/// `reqwest::get`'s implicit default client would.
+///
+/// `ClientBuilder::build` does environment-dependent work beyond applying the
+/// timeouts set here (DNS resolver setup, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`
+/// parsing, and, for the rustls backend, loading the native root certificate
+/// store), and it is fallible on purpose. The outcome is cached in the
+/// `OnceLock` either way, so a broken environment fails the same way on every
+/// call instead of retrying the environment-dependent work each time.
+fn http_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                // `reqwest::Error`'s `Display` prints only the error kind
+                // ("builder error") and drops the cause, which cannot tell a
+                // missing root certificate store from a malformed
+                // `HTTP_PROXY`. `Debug` keeps the whole chain, and this
+                // string is the only record left once the `OnceLock` is set.
+                .map_err(|e| format!("{e:?}"))
+        })
+        .as_ref()
+        .map_err(|e| Error::Network(format!("failed to build the Frankfurter HTTP client: {e}")))
+}
 
 /// The rate needed to convert one unit of the requested currency into the
 /// reference currency, and the date whose published rate satisfied the
@@ -112,7 +155,9 @@ fn parse_date(date_str: &str) -> Result<NaiveDate> {
 /// Fetch and parse a Frankfurter response, mapping any failure to
 /// [`Error::Network`] so callers can distinguish it from a lookup miss.
 async fn fetch_rates(url: &str) -> Result<(NaiveDate, BTreeMap<String, f64>)> {
-    let response = reqwest::get(url)
+    let response = http_client()?
+        .get(url)
+        .send()
         .await
         .map_err(|e| Error::Network(format!("request to {url} failed: {e}")))?
         .error_for_status()
