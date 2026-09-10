@@ -514,26 +514,35 @@ function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
     setLiqError(null);
     setCdError(null);
     setRatesError(null);
-    api.ensureYear(year).then(() => {
-      api
-        .getLiquidity(year)
-        .then((rows) => active && setLiq(rows))
-        .catch((err) => {
-          if (active) setLiqError(errorMessage(err, "Failed to load liquidity rows"));
-        });
-      api
-        .getCreditsDebts(year)
-        .then((rows) => active && setCd(rows))
-        .catch((err) => {
-          if (active) setCdError(errorMessage(err, "Failed to load credit/debt rows"));
-        });
-      api
-        .getMonthlyFxRates(year)
-        .then((rates) => active && setRates(rates))
-        .catch((err) => {
-          if (active) setRatesError(errorMessage(err, "Failed to load exchange rates"));
-        });
-    });
+    api
+      .ensureYear(year)
+      .then(() => {
+        api
+          .getLiquidity(year)
+          .then((rows) => active && setLiq(rows))
+          .catch((err) => {
+            if (active) setLiqError(errorMessage(err, "Failed to load liquidity rows"));
+          });
+        api
+          .getCreditsDebts(year)
+          .then((rows) => active && setCd(rows))
+          .catch((err) => {
+            if (active) setCdError(errorMessage(err, "Failed to load credit/debt rows"));
+          });
+        api
+          .getMonthlyFxRates(year)
+          .then((rates) => active && setRates(rates))
+          .catch((err) => {
+            if (active) setRatesError(errorMessage(err, "Failed to load exchange rates"));
+          });
+      })
+      .catch((err) => {
+        if (!active) return;
+        const message = errorMessage(err, "Failed to prepare year data");
+        setLiqError(message);
+        setCdError(message);
+        setRatesError(message);
+      });
     return () => {
       active = false;
     };
@@ -996,6 +1005,13 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   // year/month, or the request has not resolved yet; `evolutionError`
   // and `allocationError` are what distinguish a genuine empty year from a
   // failed request, since both would otherwise leave the value at `null`.
+  // Fetched by two separate effects below, each resetting only its own
+  // state to `null` on every re-run: `getNetworthEvolution` does not take
+  // `month`, so `evolution` must not be cleared by a plain month switch
+  // (that briefly hid a correctly-loaded year behind the empty state), but
+  // both still need to reset on a year change or a `refreshTick` bump (e.g.
+  // a reference-currency change), so neither can render a figure fetched
+  // for a different year or before the currency changed.
   const [evolution, setEvolution] = useState<NetworthEvolution | null>(null);
   const [allocation, setAllocation] = useState<NetworthAllocation | null>(null);
   const [evolutionError, setEvolutionError] = useState<string | null>(null);
@@ -1003,22 +1019,31 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
 
   useEffect(() => {
     let active = true;
+    setEvolution(null);
     setEvolutionError(null);
+    api
+      .ensureYear(year)
+      .then(() => api.getNetworthEvolution(year))
+      .then((e) => active && setEvolution(e))
+      .catch((err) => {
+        if (active) setEvolutionError(errorMessage(err, "Failed to load net worth evolution"));
+      });
+    return () => {
+      active = false;
+    };
+  }, [year, refreshTick]);
+
+  useEffect(() => {
+    let active = true;
+    setAllocation(null);
     setAllocationError(null);
-    api.ensureYear(year).then(() => {
-      api
-        .getNetworthEvolution(year)
-        .then((e) => active && setEvolution(e))
-        .catch((err) => {
-          if (active) setEvolutionError(errorMessage(err, "Failed to load net worth evolution"));
-        });
-      api
-        .getNetworthAllocation(year, month)
-        .then((a) => active && setAllocation(a))
-        .catch((err) => {
-          if (active) setAllocationError(errorMessage(err, "Failed to load net worth allocation"));
-        });
-    });
+    api
+      .ensureYear(year)
+      .then(() => api.getNetworthAllocation(year, month))
+      .then((a) => active && setAllocation(a))
+      .catch((err) => {
+        if (active) setAllocationError(errorMessage(err, "Failed to load net worth allocation"));
+      });
     return () => {
       active = false;
     };
@@ -1027,16 +1052,20 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   // December of the prior year's net worth (reference currency), the
   // baseline for January's month-over-month delta. `getNetworthEvolution`
   // only ever returns `year`'s own 12 months, so the prior December figure
-  // needs its own request against `year - 1`. A `null` response there means
-  // no prior-year data at all, which this treats as a baseline of 0, the
-  // same value the row cells themselves default to when unset; a rejected
-  // request is a different case, tracked by `prevDecError` and left at
-  // whatever the last successful `prevDecNetWorth` was, so January's delta
-  // is marked unresolved below rather than measured against a wrong 0.
-  const [prevDecNetWorth, setPrevDecNetWorth] = useState(0);
+  // needs its own request against `year - 1`. `prevDecNetWorth` is reset to
+  // `null` on every re-run below (including a plain reference-currency
+  // change, via `refreshTick`), so a prior year's stale figure can never
+  // feed January's delta while the current year's own request is still in
+  // flight; once resolved, a `null` response from the backend means no
+  // prior-year data at all, treated as a baseline of 0, the same value the
+  // row cells themselves default to when unset. A rejected request is a
+  // separate case, tracked by `prevDecError`, so January's delta is marked
+  // unresolved below rather than measured against a wrong 0.
+  const [prevDecNetWorth, setPrevDecNetWorth] = useState<number | null>(null);
   const [prevDecError, setPrevDecError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
+    setPrevDecNetWorth(null);
     setPrevDecError(null);
     api
       .getNetworthEvolution(year - 1)
@@ -1210,10 +1239,13 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
 
   // Each month's delta is against the prior month's total, except January,
   // which is measured against decPrev (December of the prior year,
-  // converted at that same December's own rate). `prevDecError` means the
+  // converted at that same December's own rate). `prevDecNetWorth === null`
+  // covers both "still loading" and "reset for a new year/currency"; either
+  // way there is nothing yet to convert. `prevDecError` means the
   // reference-currency baseline itself never loaded, so there is no
   // trustworthy figure to convert regardless of display currency.
-  const decPrev: number | null = prevDecError ? null : convertPrevDec(prevDecNetWorth);
+  const decPrev: number | null =
+    prevDecNetWorth === null || prevDecError ? null : convertPrevDec(prevDecNetWorth);
   const delta: (number | null)[] = total.map((t, i) => {
     const base = i === 0 ? decPrev : total[i - 1];
     return t === null || base === null ? null : t - base;
