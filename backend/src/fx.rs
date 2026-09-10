@@ -9,6 +9,12 @@
 //! { "base": "EUR", "rates": { "2026-09-04": { "USD": 1.0812, "GBP": 0.8365 } } }
 //! ```
 //!
+//! The cache also carries `aliases` (a requested weekend/holiday date mapped
+//! to the earlier date Frankfurter actually published) and `latest_date` /
+//! `latest_fetched_at` (bookkeeping for the last `/latest` fetch), both
+//! omitted above since a file written before they existed loads the same as
+//! one with them empty.
+//!
 //! Rates are always cached EUR-based, exactly as the ECB publishes them,
 //! regardless of the user's reference currency (see [`crate::config::CurrencySettings`]).
 //! A non-EUR reference currency is handled by computing a cross rate from two
@@ -26,7 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
@@ -46,6 +52,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// bound than [`REQUEST_TIMEOUT`] for the case where the network never even
 /// reaches Frankfurter (e.g. a black-holed route or a captive portal).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a successful `/latest` fetch stays fresh enough to answer a
+/// repeat [`resolve_latest_eur_rates`] call from the cache instead of the
+/// network. `monthly_rates_lenient` resolves one currency at a time, so one
+/// live-mode chart request already makes one `/latest` round trip per
+/// currency in the portfolio; this threshold keeps a second request moments
+/// later, or the next chart re-render, from repeating every one of them. The
+/// ECB publishes roughly once per working day, so an hour is conservative
+/// against the publication schedule while still bounding how long a rate
+/// that changed can stay stale.
+const LATEST_STALENESS_THRESHOLD_SECS: i64 = 60 * 60;
 
 /// The shared client for every Frankfurter request, built once and reused so
 /// repeated rate lookups do not each pay for a fresh connection pool the way
@@ -100,6 +117,26 @@ struct RateCache {
     base: String,
     #[serde(default)]
     rates: BTreeMap<String, BTreeMap<String, f64>>,
+    /// Maps a requested date Frankfurter had no rate for (a weekend or
+    /// holiday) to the earlier date it returned instead, whose rates already
+    /// live in `rates`. Populated only for a requested date at least
+    /// [`ALIAS_MIN_AGE_DAYS`] before today, by [`store_historical_rates`]; see
+    /// [`should_alias_as`] for why that window exists. Absent in a cache file
+    /// written before this field existed, which `#[serde(default)]` treats as
+    /// "no aliases known yet" rather than an error.
+    #[serde(default)]
+    aliases: BTreeMap<String, String>,
+    /// The key in `rates` that the most recent successful `/latest` fetch
+    /// returned, paired with `latest_fetched_at`. `None` in a cache file
+    /// written before this field existed.
+    #[serde(default)]
+    latest_date: Option<String>,
+    /// Unix timestamp (seconds, UTC) of the last successful `/latest` fetch;
+    /// see [`LATEST_STALENESS_THRESHOLD_SECS`]. `None` is always treated as
+    /// stale, which is also what a cache file written before this field
+    /// existed deserializes to.
+    #[serde(default)]
+    latest_fetched_at: Option<i64>,
 }
 
 impl Default for RateCache {
@@ -107,6 +144,9 @@ impl Default for RateCache {
         Self {
             base: "EUR".to_string(),
             rates: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            latest_date: None,
+            latest_fetched_at: None,
         }
     }
 }
@@ -132,6 +172,21 @@ fn load_cache() -> Result<RateCache> {
 /// Persist the rate cache to disk (pretty-printed, matching the config files).
 fn save_cache(cache: &RateCache) -> Result<()> {
     config::write_json(&paths::get_fx_rates_path()?, cache)
+}
+
+/// The process-wide lock serializing every on-disk cache load/modify/save
+/// cycle (see [`store_historical_rates`] and [`store_latest_rates`]), so two
+/// resolvers saving different dates concurrently merge instead of one
+/// overwriting the other's snapshot.
+///
+/// Only ever held around that cycle, never around a network call: a
+/// Frankfurter request can run for up to [`REQUEST_TIMEOUT`] before it
+/// resolves, and holding this lock across it would block every other rate
+/// lookup in the process for that long. Built lazily the same way as
+/// [`http_client`], since a `tokio::sync::Mutex` has no `const` constructor.
+fn cache_write_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// `true` when `FINGUARD_FX_OFFLINE` is set, meaning no network call may be
@@ -207,25 +262,98 @@ fn newest_cached(cache: &RateCache) -> Result<Option<(NaiveDate, BTreeMap<String
     }
 }
 
+/// Look up `date` in `cache` without any network access: an exact key match
+/// first, then a recorded alias to an earlier published date (see
+/// [`resolve_eur_rates_on`] and the `aliases` field of [`RateCache`]).
+///
+/// The returned date is always the date the rate was actually published for.
+/// An aliased hit reports the alias's target, never `date` itself, so a
+/// cached weekend or holiday lookup is never mistaken for a publication date.
+fn cached_rate_for(
+    cache: &RateCache,
+    date: NaiveDate,
+) -> Result<Option<(BTreeMap<String, f64>, NaiveDate)>> {
+    let date_str = format_date(date);
+    if let Some(rates) = cache.rates.get(&date_str) {
+        return Ok(Some((rates.clone(), date)));
+    }
+    if let Some(published_str) = cache.aliases.get(&date_str)
+        && let Some(rates) = cache.rates.get(published_str)
+    {
+        return Ok(Some((rates.clone(), parse_date(published_str)?)));
+    }
+    Ok(None)
+}
+
+/// The minimum age, in days, `requested` must have in [`should_alias_as`]
+/// before a Frankfurter substitution for it is trusted as a permanent alias.
+///
+/// A substitution is ambiguous on its own: it can mean `requested` is a
+/// weekend or holiday, whose nearest earlier publication never changes, or it
+/// can mean the ECB simply has not published that business day's own rate
+/// yet, which is temporary and must not be frozen. Requiring `requested` to
+/// be at least this many days old resolves the ambiguity in favor of "no
+/// rate was ever coming": seven days is comfortably beyond any plausible
+/// publication delay, while expense data is dominated by dates well in the
+/// past, so the cost is only that a weekend inside the last week re-fetches
+/// on every repeat lookup instead of hitting the alias, which is rare and
+/// cheap.
+const ALIAS_MIN_AGE_DAYS: i64 = 7;
+
+/// Whether a successful fetch for `requested` should also be cached as an
+/// alias of `returned` (see [`resolve_eur_rates_on`]).
+///
+/// `true` only when Frankfurter actually substituted an earlier date *and*
+/// `requested` is at least [`ALIAS_MIN_AGE_DAYS`] before `today`; see that
+/// constant for why the window exists. Today itself is always younger than
+/// the window, so it can never be frozen by an alias once more rates publish
+/// later in the day.
+fn should_alias_as(requested: NaiveDate, returned: NaiveDate, today: NaiveDate) -> bool {
+    returned != requested && today.signed_duration_since(requested).num_days() >= ALIAS_MIN_AGE_DAYS
+}
+
+/// Merge a freshly fetched historical rate table into the on-disk cache,
+/// serialized against concurrent callers by [`cache_write_lock`] so two
+/// resolvers saving different dates cannot clobber each other's entry.
+/// Reloads the cache under the lock, right before writing, rather than
+/// reusing an earlier snapshot, so a concurrent writer's save is never lost.
+///
+/// `alias_for`, when given, additionally records it as an alias of
+/// `returned_date`; see [`should_alias_as`] for when a caller should pass one.
+async fn store_historical_rates(
+    returned_date: NaiveDate,
+    rates: &BTreeMap<String, f64>,
+    alias_for: Option<NaiveDate>,
+) -> Result<()> {
+    let _guard = cache_write_lock().lock().await;
+    let mut cache = load_cache()?;
+    let returned_date_str = format_date(returned_date);
+    cache.rates.insert(returned_date_str.clone(), rates.clone());
+    if let Some(requested_date) = alias_for {
+        cache
+            .aliases
+            .insert(format_date(requested_date), returned_date_str);
+    }
+    save_cache(&cache)
+}
+
 /// Resolve the EUR-based rate table published on or before `date`: an exact
-/// cache hit first, then the network (unless offline), then the nearest
-/// earlier cached date as a fallback, then a hard error.
+/// or aliased cache hit first, then the network (unless offline), then the
+/// nearest earlier cached date as a fallback, then a hard error.
 async fn resolve_eur_rates_on(date: NaiveDate) -> Result<(BTreeMap<String, f64>, NaiveDate)> {
     let date_str = format_date(date);
     let cache = load_cache()?;
 
-    if let Some(rates) = cache.rates.get(&date_str) {
-        return Ok((rates.clone(), date));
+    if let Some((rates, actual_date)) = cached_rate_for(&cache, date)? {
+        return Ok((rates, actual_date));
     }
 
     if !is_offline() {
         match fetch_historical(date).await {
             Ok((returned_date, rates)) => {
-                let mut cache = cache;
-                cache
-                    .rates
-                    .insert(format_date(returned_date), rates.clone());
-                save_cache(&cache)?;
+                let today = Local::now().date_naive();
+                let alias_for = should_alias_as(date, returned_date, today).then_some(date);
+                store_historical_rates(returned_date, &rates, alias_for).await?;
                 return Ok((rates, returned_date));
             }
             Err(network_err) => {
@@ -246,24 +374,62 @@ async fn resolve_eur_rates_on(date: NaiveDate) -> Result<(BTreeMap<String, f64>,
     }
 }
 
-/// Resolve the newest EUR-based rate table: the network first (unless
+/// Return the cached `/latest` result if it is still within
+/// [`LATEST_STALENESS_THRESHOLD_SECS`] of when it was fetched, without any
+/// network access.
+///
+/// Treats a cache file written before `latest_date`/`latest_fetched_at`
+/// existed (both `None`) as stale, so an old cache file never errors here and
+/// never serves a wrong rate; it simply falls through to the normal
+/// network/fallback path exactly as it did before this staleness check
+/// existed. Also treats a `latest_fetched_at` in the future as stale, which
+/// can only happen from clock skew or a corrupted cache, rather than treating
+/// it as arbitrarily fresh.
+fn fresh_latest_from_cache(
+    cache: &RateCache,
+) -> Result<Option<(BTreeMap<String, f64>, NaiveDate)>> {
+    let (Some(fetched_at), Some(date_str)) = (cache.latest_fetched_at, cache.latest_date.as_ref())
+    else {
+        return Ok(None);
+    };
+    let age_secs = Utc::now().timestamp() - fetched_at;
+    if !(0..LATEST_STALENESS_THRESHOLD_SECS).contains(&age_secs) {
+        return Ok(None);
+    }
+    match cache.rates.get(date_str) {
+        Some(rates) => Ok(Some((rates.clone(), parse_date(date_str)?))),
+        None => Ok(None),
+    }
+}
+
+/// Merge a freshly fetched `/latest` rate table into the on-disk cache and
+/// record it as the newest known "latest" fetch, serialized the same way as
+/// [`store_historical_rates`] (see that function for why).
+async fn store_latest_rates(returned_date: NaiveDate, rates: &BTreeMap<String, f64>) -> Result<()> {
+    let _guard = cache_write_lock().lock().await;
+    let mut cache = load_cache()?;
+    let date_str = format_date(returned_date);
+    cache.rates.insert(date_str.clone(), rates.clone());
+    cache.latest_date = Some(date_str);
+    cache.latest_fetched_at = Some(Utc::now().timestamp());
+    save_cache(&cache)
+}
+
+/// Resolve the newest EUR-based rate table: a fresh-enough cached `/latest`
+/// result first (see [`fresh_latest_from_cache`]), then the network (unless
 /// offline, since only the network can say what is actually newest), then the
 /// most recently cached date as a fallback, then a hard error.
-///
-/// Unlike [`resolve_eur_rates_on`], there is no "exact cache hit" here: the
-/// crate has no system-clock dependency, so it cannot tell whether a cached
-/// entry already reflects today's publication without asking the network.
 async fn resolve_latest_eur_rates() -> Result<(BTreeMap<String, f64>, NaiveDate)> {
     let cache = load_cache()?;
+
+    if let Some(fresh) = fresh_latest_from_cache(&cache)? {
+        return Ok(fresh);
+    }
 
     if !is_offline() {
         match fetch_latest().await {
             Ok((returned_date, rates)) => {
-                let mut cache = cache;
-                cache
-                    .rates
-                    .insert(format_date(returned_date), rates.clone());
-                save_cache(&cache)?;
+                store_latest_rates(returned_date, &rates).await?;
                 return Ok((rates, returned_date));
             }
             Err(network_err) => {
@@ -705,6 +871,7 @@ mod tests {
         save_cache(&RateCache {
             base: "EUR".to_string(),
             rates,
+            ..Default::default()
         })
         .expect("seed cache");
     }
@@ -1085,5 +1252,297 @@ mod tests {
     fn last_day_of_month_rejects_out_of_range_month() {
         let err = last_day_of_month(2026, 13).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    // ======================================================================
+    // Fix 1: weekend/holiday dates are cached as aliases
+    // ======================================================================
+
+    #[test]
+    fn rate_cache_deserializes_a_file_written_before_this_change() {
+        // No `aliases`, `latest_date`, or `latest_fetched_at` keys at all,
+        // matching a cache file saved by the code before this change.
+        let json = r#"{ "base": "EUR", "rates": { "2026-09-04": { "USD": 1.1622 } } }"#;
+        let cache: RateCache =
+            serde_json::from_str(json).expect("an old-format cache file still loads");
+        assert!(cache.aliases.is_empty());
+        assert!(cache.latest_date.is_none());
+        assert!(cache.latest_fetched_at.is_none());
+    }
+
+    #[test]
+    fn cached_rate_for_exact_hit_reports_the_requested_date() {
+        let cache = RateCache {
+            base: "EUR".to_string(),
+            rates: BTreeMap::from([(
+                "2026-09-04".to_string(),
+                BTreeMap::from([("USD".to_string(), 1.1622)]),
+            )]),
+            ..Default::default()
+        };
+
+        let (rates, actual_date) =
+            cached_rate_for(&cache, NaiveDate::from_ymd_opt(2026, 9, 4).unwrap())
+                .unwrap()
+                .expect("exact hit");
+        assert_eq!(rates["USD"], 1.1622);
+        assert_eq!(actual_date, NaiveDate::from_ymd_opt(2026, 9, 4).unwrap());
+    }
+
+    #[test]
+    fn cached_rate_for_alias_hit_reports_the_true_published_date() {
+        let mut cache = RateCache {
+            base: "EUR".to_string(),
+            rates: BTreeMap::from([(
+                "2026-09-04".to_string(),
+                BTreeMap::from([("USD".to_string(), 1.1622)]),
+            )]),
+            ..Default::default()
+        };
+        // 2026-09-06 is a Sunday, aliased to the Friday Frankfurter actually
+        // published for.
+        cache
+            .aliases
+            .insert("2026-09-06".to_string(), "2026-09-04".to_string());
+
+        let (rates, actual_date) =
+            cached_rate_for(&cache, NaiveDate::from_ymd_opt(2026, 9, 6).unwrap())
+                .unwrap()
+                .expect("alias hit");
+        assert_eq!(rates["USD"], 1.1622);
+        // The Sunday must not be reported as if it were a publication date.
+        assert_eq!(actual_date, NaiveDate::from_ymd_opt(2026, 9, 4).unwrap());
+    }
+
+    #[test]
+    fn cached_rate_for_misses_when_neither_exact_nor_alias_is_cached() {
+        let cache = RateCache::default();
+        assert!(
+            cached_rate_for(&cache, NaiveDate::from_ymd_opt(2026, 9, 6).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_alias_as_true_for_an_old_enough_date_frankfurter_substituted() {
+        let requested = NaiveDate::from_ymd_opt(2026, 8, 23).unwrap(); // Sunday
+        let returned = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap(); // Friday
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap(); // 18 days later
+        assert!(should_alias_as(requested, returned, today));
+    }
+
+    #[test]
+    fn should_alias_as_false_when_the_returned_date_matches_the_request() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        assert!(!should_alias_as(date, date, today));
+    }
+
+    #[test]
+    fn should_alias_as_false_for_todays_own_request_even_when_substituted() {
+        // A request for today that Frankfurter has not published yet must
+        // never be frozen, since today's answer can still change later.
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let returned = NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
+        assert!(!should_alias_as(today, returned, today));
+    }
+
+    #[test]
+    fn should_alias_as_false_for_a_recent_past_date_within_the_min_age_window() {
+        // A substitution for a date only a few days old is ambiguous: it
+        // might be a genuine weekend, or the ECB might simply not have
+        // published that business day's own rate yet. Below
+        // `ALIAS_MIN_AGE_DAYS`, it must not be frozen as an alias.
+        let requested = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap(); // Sunday, 4 days ago
+        let returned = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap(); // Friday
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        assert!(!should_alias_as(requested, returned, today));
+    }
+
+    #[test]
+    fn should_alias_as_true_for_a_date_exactly_alias_min_age_days_old() {
+        // Pins the `>=` in `should_alias_as` against `ALIAS_MIN_AGE_DAYS`
+        // itself: a date exactly at the boundary must still be old enough to
+        // alias. An accidental `>` here would fail this test.
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let requested = today - chrono::Duration::days(ALIAS_MIN_AGE_DAYS);
+        let returned = requested - chrono::Duration::days(1);
+        assert!(should_alias_as(requested, returned, today));
+    }
+
+    #[test]
+    fn should_alias_as_false_for_a_date_one_day_younger_than_alias_min_age() {
+        // The other side of the same boundary: one day inside the window
+        // must not be old enough to alias yet.
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let requested = today - chrono::Duration::days(ALIAS_MIN_AGE_DAYS - 1);
+        let returned = requested - chrono::Duration::days(1);
+        assert!(!should_alias_as(requested, returned, today));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repeat_weekend_lookup_uses_the_cached_alias_without_erroring() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-04", &[("USD", 1.1622)])]);
+        let mut cache = load_cache().unwrap();
+        cache
+            .aliases
+            .insert("2026-09-06".to_string(), "2026-09-04".to_string());
+        save_cache(&cache).unwrap();
+
+        // 2026-09-06 has no exact cache entry, only an alias; a working alias
+        // lookup succeeds offline without ever needing `nearest_earlier`.
+        let resolved = rate_on(NaiveDate::from_ymd_opt(2026, 9, 6).unwrap(), "USD")
+            .await
+            .expect("alias hit resolves without a network call");
+        assert_eq!(resolved.rate, 1.0 / 1.1622);
+        assert_eq!(
+            resolved.rate_date,
+            Some(NaiveDate::from_ymd_opt(2026, 9, 4).unwrap())
+        );
+    }
+
+    // ======================================================================
+    // Fix 2: `/latest` results stay fresh for a while
+    // ======================================================================
+
+    #[test]
+    fn fresh_latest_from_cache_hits_within_the_staleness_threshold() {
+        let cache = RateCache {
+            base: "EUR".to_string(),
+            rates: BTreeMap::from([(
+                "2026-09-10".to_string(),
+                BTreeMap::from([("USD".to_string(), 1.18)]),
+            )]),
+            latest_date: Some("2026-09-10".to_string()),
+            latest_fetched_at: Some(Utc::now().timestamp() - 60),
+            ..Default::default()
+        };
+
+        let (rates, actual_date) = fresh_latest_from_cache(&cache).unwrap().expect("fresh hit");
+        assert_eq!(rates["USD"], 1.18);
+        assert_eq!(actual_date, NaiveDate::from_ymd_opt(2026, 9, 10).unwrap());
+    }
+
+    #[test]
+    fn fresh_latest_from_cache_misses_once_the_threshold_has_passed() {
+        let cache = RateCache {
+            base: "EUR".to_string(),
+            rates: BTreeMap::from([(
+                "2026-09-10".to_string(),
+                BTreeMap::from([("USD".to_string(), 1.18)]),
+            )]),
+            latest_date: Some("2026-09-10".to_string()),
+            latest_fetched_at: Some(Utc::now().timestamp() - LATEST_STALENESS_THRESHOLD_SECS - 1),
+            ..Default::default()
+        };
+
+        assert!(fresh_latest_from_cache(&cache).unwrap().is_none());
+    }
+
+    #[test]
+    fn fresh_latest_from_cache_treats_a_future_timestamp_as_stale() {
+        // A `latest_fetched_at` ahead of now can only be clock skew or a
+        // corrupted cache; it must not be treated as arbitrarily fresh.
+        let cache = RateCache {
+            base: "EUR".to_string(),
+            rates: BTreeMap::from([(
+                "2026-09-10".to_string(),
+                BTreeMap::from([("USD".to_string(), 1.18)]),
+            )]),
+            latest_date: Some("2026-09-10".to_string()),
+            latest_fetched_at: Some(Utc::now().timestamp() + 120),
+            ..Default::default()
+        };
+
+        assert!(fresh_latest_from_cache(&cache).unwrap().is_none());
+    }
+
+    #[test]
+    fn fresh_latest_from_cache_treats_a_pre_change_cache_file_as_stale() {
+        // No `latest_date`/`latest_fetched_at` at all, matching a cache file
+        // saved before this change; must fall through, not error.
+        let cache = RateCache::default();
+        assert!(fresh_latest_from_cache(&cache).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_latest_eur_rates_uses_latest_date_not_simply_the_newest_cached_key() {
+        let _temp = with_temp_env_offline();
+        // "2099-01-01" is the lexicographically largest key, so it is what
+        // `newest_cached` would pick if freshness were ignored; a real fresh
+        // hit must use `latest_date` instead and must not be confused with it.
+        seed_cache(&[
+            ("2026-09-08", &[("USD", 1.10)]),
+            ("2099-01-01", &[("USD", 9.99)]),
+        ]);
+        let mut cache = load_cache().unwrap();
+        cache.latest_date = Some("2026-09-08".to_string());
+        cache.latest_fetched_at = Some(Utc::now().timestamp() - 5);
+        save_cache(&cache).unwrap();
+
+        let resolved = live_rate("USD").await.expect("fresh cache hit");
+        assert_eq!(resolved.rate, 1.0 / 1.10);
+        assert_eq!(
+            resolved.rate_date,
+            Some(NaiveDate::from_ymd_opt(2026, 9, 8).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_latest_eur_rates_falls_back_once_the_freshness_threshold_has_passed() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-08", &[("USD", 1.10)])]);
+        let mut cache = load_cache().unwrap();
+        cache.latest_date = Some("2026-09-08".to_string());
+        cache.latest_fetched_at =
+            Some(Utc::now().timestamp() - LATEST_STALENESS_THRESHOLD_SECS - 1);
+        save_cache(&cache).unwrap();
+
+        // Stale by more than the threshold, and offline: must fall back to
+        // the newest cached date exactly as before this change, not error.
+        let resolved = live_rate("USD")
+            .await
+            .expect("offline fallback still works once the cache is stale");
+        assert_eq!(
+            resolved.rate_date,
+            Some(NaiveDate::from_ymd_opt(2026, 9, 8).unwrap())
+        );
+    }
+
+    // ======================================================================
+    // Fix 3: concurrent cache writers do not clobber each other
+    // ======================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn concurrent_cache_writes_for_different_dates_all_survive() {
+        let _temp = with_temp_env_offline();
+
+        let mut handles = Vec::new();
+        for day in 1..=8u32 {
+            let date = NaiveDate::from_ymd_opt(2026, 1, day).unwrap();
+            handles.push(tokio::spawn(async move {
+                let rates = BTreeMap::from([("USD".to_string(), day as f64)]);
+                store_historical_rates(date, &rates, None).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .expect("writer task did not panic")
+                .expect("cache write succeeded");
+        }
+
+        let cache = load_cache().expect("load cache");
+        assert_eq!(cache.rates.len(), 8, "every concurrent write must survive");
+        for day in 1..=8u32 {
+            let key = format!("2026-01-{day:02}");
+            assert_eq!(cache.rates[&key]["USD"], day as f64);
+        }
     }
 }
