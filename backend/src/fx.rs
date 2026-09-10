@@ -22,7 +22,7 @@
 //! Setting the `FINGUARD_FX_OFFLINE` environment variable (to any value)
 //! disables every network call; resolvers then work purely from the cache.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -592,6 +592,62 @@ pub async fn monthly_rates_lenient(
     Ok((combined, unavailable_currencies))
 }
 
+/// Resolve every `(date, currency)` key in `keys` into the reference
+/// currency, without letting one unresolvable currency sink the whole batch:
+/// each key is looked up on its own, and a key that fails is left out of the
+/// returned map while its currency code is named in the second element.
+///
+/// Built for the expense endpoints, whose callers already produce exactly
+/// this key set through [`crate::df_operations::distinct_rate_keys`]. Feed
+/// the returned map straight to [`crate::df_operations::resolve_fact`]; a row
+/// whose key is missing is the degraded case the caller must report rather
+/// than convert.
+///
+/// The reference currency is never looked up (it converts at `1.0`, which
+/// `resolve_fact` handles without a map entry) and never appears in the
+/// unavailable list. Codes in that list are uppercase, deduplicated, and
+/// sorted.
+///
+/// Mirrors [`monthly_rates_lenient`]'s error boundary deliberately, so the
+/// two degrade the same way: reading the currency settings happens once, up
+/// front, and its failure propagates as a genuine error, while *any* error
+/// from resolving a single currency (an empty cache offline, a network
+/// failure, an unreadable cache file, a currency the ECB does not publish)
+/// counts as "this currency is unavailable". Classifying those kinds more
+/// finely here would give the two functions two different definitions of the
+/// same condition.
+pub async fn rates_for_keys_lenient(
+    keys: &[(NaiveDate, String)],
+) -> Result<(HashMap<(NaiveDate, String), ResolvedRate>, Vec<String>)> {
+    let reference_currency = config::get_currency_settings()?
+        .reference_currency
+        .trim()
+        .to_uppercase();
+
+    let mut rates = HashMap::with_capacity(keys.len());
+    let mut unavailable_currencies: Vec<String> = Vec::new();
+
+    for (date, currency) in keys {
+        let currency = currency.trim().to_uppercase();
+        if currency == reference_currency {
+            continue;
+        }
+        match rate_on(*date, &currency).await {
+            Ok(resolved) => {
+                rates.insert((*date, currency), resolved);
+            }
+            Err(_) => {
+                if !unavailable_currencies.contains(&currency) {
+                    unavailable_currencies.push(currency);
+                }
+            }
+        }
+    }
+
+    unavailable_currencies.sort();
+    Ok((rates, unavailable_currencies))
+}
+
 /// Return the last calendar day of `year`-`month`.
 ///
 /// # Errors
@@ -940,6 +996,73 @@ mod tests {
 
         assert!(unavailable.is_empty());
         assert_eq!(rates.rate(1, "EUR").unwrap(), 1.0);
+    }
+
+    /// A resolvable key and an unresolvable one in the same batch must not
+    /// affect each other: the resolvable one lands in the map, and only the
+    /// unresolvable one is reported and left out.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rates_for_keys_lenient_reports_one_failure_without_sinking_the_other() {
+        let _temp = with_temp_env_offline();
+        // Cached EUR-based: 1 EUR = 0.70 GBP, so a GBP amount converts into
+        // the (default EUR) reference currency at 1 / 0.70, not 0.70 itself.
+        seed_cache(&[("2026-09-04", &[("GBP", 0.70)])]);
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+
+        let (rates, unavailable) =
+            rates_for_keys_lenient(&[(date, "GBP".to_string()), (date, "USD".to_string())])
+                .await
+                .expect("a per-key failure must not fail the whole batch");
+
+        assert_eq!(unavailable, vec!["USD".to_string()]);
+        assert_eq!(rates[&(date, "GBP".to_string())].rate, 1.0 / 0.70);
+        assert!(!rates.contains_key(&(date, "USD".to_string())));
+    }
+
+    /// The same currency unresolvable on two dates must be named once, not
+    /// once per date: the report is per currency.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rates_for_keys_lenient_names_an_unavailable_currency_once() {
+        let _temp = with_temp_env_offline();
+
+        let (rates, unavailable) = rates_for_keys_lenient(&[
+            (
+                NaiveDate::from_ymd_opt(2026, 9, 4).unwrap(),
+                "USD".to_string(),
+            ),
+            (
+                NaiveDate::from_ymd_opt(2026, 9, 5).unwrap(),
+                "USD".to_string(),
+            ),
+        ])
+        .await
+        .expect("a per-key failure must not fail the whole batch");
+
+        assert_eq!(unavailable, vec!["USD".to_string()]);
+        assert!(rates.is_empty());
+    }
+
+    /// A key naming the reference currency needs no cache and no network at
+    /// all, and must report nothing as unavailable. It is left out of the map
+    /// too, since `resolve_fact` handles that identity without an entry.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rates_for_keys_lenient_skips_the_reference_currency() {
+        let _temp = with_temp_env_offline();
+        // No cache seeded at all: a lookup attempt for the reference
+        // currency would hit the "nothing cached, network disabled" error.
+
+        let (rates, unavailable) = rates_for_keys_lenient(&[(
+            NaiveDate::from_ymd_opt(2026, 9, 4).unwrap(),
+            "EUR".to_string(),
+        )])
+        .await
+        .expect("reference currency never fails");
+
+        assert!(unavailable.is_empty());
+        assert!(rates.is_empty());
     }
 
     #[test]

@@ -70,6 +70,60 @@ pub struct ExpenseJson {
     pub rate_date: String,
 }
 
+/// `GET /api/expenses` response body.
+///
+/// A currency whose rate could not be resolved does not fail the request, and
+/// does not remove any row either: an offline user must still see their own
+/// expenses at the amounts they entered.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExpenseListJson {
+    /// Every matching row, including rows that could not be converted. Those
+    /// carry `fx_rate` `0.0` and an empty `rate_date`, so a client must not
+    /// multiply by `fx_rate` without checking `unavailable_currencies` first.
+    pub expenses: Vec<ExpenseJson>,
+    /// Currencies present in `expenses` that could not be resolved into the
+    /// reference currency. Empty when everything resolved.
+    pub unavailable_currencies: Vec<String>,
+}
+
+/// `GET /api/categories/totals` response body.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CategoryTotalsJson {
+    /// Category name -> cumulative reference-currency total. Amounts in a
+    /// currency named in `unavailable_currencies` are left out of these sums
+    /// rather than added unconverted, so a nonempty `unavailable_currencies`
+    /// means every total here is a lower bound.
+    pub totals: std::collections::HashMap<String, f64>,
+    /// Currencies excluded from `totals` because their rate could not be
+    /// resolved. Empty when everything resolved. Covers every category of the
+    /// requested kind, so it answers "is anything on this page incomplete",
+    /// not "is this particular total incomplete"; use
+    /// `unavailable_currencies_by_category` for the per-category answer.
+    pub unavailable_currencies: Vec<String>,
+    /// Category name -> the currencies that could not be resolved for *that
+    /// category's own rows*. A category is present only when at least one of
+    /// its rows was excluded, so an absent category (or an empty list) means
+    /// its total in `totals` is exact.
+    ///
+    /// [`delete_category_handler`] refuses a delete only when the category
+    /// named in the request appears here, so a client offering a delete
+    /// should gate on this entry rather than on `unavailable_currencies`.
+    pub unavailable_currencies_by_category: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// `GET /api/cashflow/spending` response body.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MonthlySpendingJson {
+    /// Month (1..=12) -> category name -> reference-currency amount. Every
+    /// month is present, mapping to an empty category map when it has no
+    /// rows. Amounts in a currency named in `unavailable_currencies` are left
+    /// out, exactly as in [`CategoryTotalsJson::totals`].
+    pub months: std::collections::HashMap<u32, std::collections::HashMap<String, f64>>,
+    /// Currencies excluded from `months` because their rate could not be
+    /// resolved. Empty when everything resolved.
+    pub unavailable_currencies: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RecurringTemplateJson {
     pub id: String, // Stringified index "_idx"
@@ -518,6 +572,22 @@ async fn update_currency_settings_handler(
     }))
 }
 
+/// `fact`'s reference-currency rate and the date that rate was published for,
+/// or `None` when its `(date, currency)` pair could not be resolved.
+///
+/// `rates` comes from [`fx::rates_for_keys_lenient`], which leaves out every
+/// key it failed to resolve and names those currencies separately. A missing
+/// pair is [`finguard_rs_backend::df_operations::resolve_fact`]'s only
+/// failure, so `None` here means exactly "this row's currency is one of the
+/// unavailable ones" and never hides an error of another kind.
+fn resolve_fact_lenient(
+    fact: &finguard_rs_backend::df_operations::ExpenseFact,
+    reference_currency: &str,
+    rates: &std::collections::HashMap<(chrono::NaiveDate, String), fx::ResolvedRate>,
+) -> Option<(f64, chrono::NaiveDate)> {
+    finguard_rs_backend::df_operations::resolve_fact(fact, reference_currency, rates).ok()
+}
+
 /// `GET /api/expenses`: list expense rows for `year`, optionally narrowed to
 /// one `month` (otherwise all 12 months are read and concatenated) and
 /// further filtered by `name`/`category` substring and `min`/`max` amount.
@@ -527,9 +597,14 @@ async fn update_currency_settings_handler(
 /// returned [`ExpenseJson::id`] is that row's position in the month's
 /// unfiltered dataframe, which [`delete_expense_handler`] and
 /// [`upsert_expense_handler`] expect back verbatim.
+///
+/// A currency that cannot be resolved (typically no network and nothing
+/// cached) does not fail the request and does not hide any row: the row is
+/// returned with `fx_rate` `0.0` and an empty `rate_date`, and the currency
+/// is named in [`ExpenseListJson::unavailable_currencies`].
 async fn get_expenses_handler(
     Query(q): Query<GetExpensesQuery>,
-) -> Result<Json<Vec<ExpenseJson>>, AppError> {
+) -> Result<Json<ExpenseListJson>, AppError> {
     // Each returned row's fixed fields, paired with the `ExpenseFact` needed
     // to resolve its reference-currency rate below. `fx_rate`/`rate_date`
     // are filled in once every row is collected, so distinct `(date,
@@ -597,22 +672,24 @@ async fn get_expenses_handler(
     let reference_currency = config::get_currency_settings()?.reference_currency;
     let facts: Vec<_> = rows.iter().map(|(_, fact)| fact.clone()).collect();
     let keys = finguard_rs_backend::df_operations::distinct_rate_keys(&facts, &reference_currency);
-    let mut rates = std::collections::HashMap::with_capacity(keys.len());
-    for (date, currency) in keys {
-        let resolved = fx::rate_on(date, &currency).await?;
-        rates.insert((date, currency), resolved);
-    }
+    let (rates, unavailable_currencies) = fx::rates_for_keys_lenient(&keys).await?;
 
-    let mut all = Vec::with_capacity(rows.len());
+    let mut expenses = Vec::with_capacity(rows.len());
     for (mut expense, fact) in rows {
-        let (rate, rate_date) =
-            finguard_rs_backend::df_operations::resolve_fact(&fact, &reference_currency, &rates)?;
-        expense.fx_rate = rate;
-        expense.rate_date = rate_date.format("%Y-%m-%d").to_string();
-        all.push(expense);
+        // An unconvertible row keeps the `0.0`/empty-string pair it was built
+        // with instead of being dropped: its amount and currency are the
+        // user's own record, and only the derived conversion is missing.
+        if let Some((rate, rate_date)) = resolve_fact_lenient(&fact, &reference_currency, &rates) {
+            expense.fx_rate = rate;
+            expense.rate_date = rate_date.format("%Y-%m-%d").to_string();
+        }
+        expenses.push(expense);
     }
 
-    Ok(Json(all))
+    Ok(Json(ExpenseListJson {
+        expenses,
+        unavailable_currencies,
+    }))
 }
 
 /// `POST /api/expenses`: create or update an expense row in
@@ -627,10 +704,12 @@ async fn get_expenses_handler(
 /// [`get_expenses_handler`]) rather than stored here.
 ///
 /// `payload.fx_rate`/`payload.rate_date` are ignored on write: the response
-/// still reports the rate resolved fresh here, via [`fx::rate_on`], for
-/// `payload.currency` on the expense's own date
-/// (`payload.year`/`payload.month`/`payload.day`), not for today, purely as
-/// provenance for the client that just saved the row.
+/// still reports the rate resolved fresh here for `payload.currency` on the
+/// expense's own date (`payload.year`/`payload.month`/`payload.day`), not for
+/// today, purely as provenance for the client that just saved the row. An
+/// unresolvable rate therefore never blocks a save; the row is written either
+/// way and the response reports `fx_rate` `0.0` with an empty `rate_date`,
+/// the same "unknown" pair [`get_expenses_handler`] uses.
 async fn upsert_expense_handler(
     Json(payload): Json<ExpenseJson>,
 ) -> Result<Json<ExpenseJson>, AppError> {
@@ -643,11 +722,28 @@ async fn upsert_expense_handler(
                 payload.day
             ))
         })?;
-    let resolved = fx::rate_on(expense_date, &payload.currency).await?;
-    // `rate_date` is `None` only for the reference-currency identity case
-    // (see `fx::ResolvedRate`), which has no external publication date to
-    // report; the expense's own date is the correct value to report there.
-    let rate_date = resolved.rate_date.unwrap_or(expense_date);
+    // Resolved through the same key/rate/`resolve_fact` path as
+    // `get_expenses_handler`, so a saved row and the same row read back
+    // report the identical rate, including the reference-currency identity
+    // case (rate `1.0` dated the expense itself, which has no external
+    // publication date of its own).
+    let reference_currency = config::get_currency_settings()?.reference_currency;
+    let fact = finguard_rs_backend::df_operations::ExpenseFact {
+        expense_date,
+        currency: payload.currency.clone(),
+        expense_amount: payload.amount,
+        primary_category: payload.primary.clone(),
+        secondary_category: payload.secondary.clone(),
+    };
+    let keys = finguard_rs_backend::df_operations::distinct_rate_keys(
+        std::slice::from_ref(&fact),
+        &reference_currency,
+    );
+    let (rates, _unavailable_currencies) = fx::rates_for_keys_lenient(&keys).await?;
+    let (fx_rate, rate_date) = match resolve_fact_lenient(&fact, &reference_currency, &rates) {
+        Some((rate, date)) => (rate, date.format("%Y-%m-%d").to_string()),
+        None => (0.0, String::new()),
+    };
 
     let mut de = DetailedExpenses::new(year, month)?;
 
@@ -664,8 +760,8 @@ async fn upsert_expense_handler(
         let new_id = (de.expense_df.height() as i32 - 1).to_string();
         let mut response = payload;
         response.id = new_id;
-        response.fx_rate = resolved.rate;
-        response.rate_date = rate_date.format("%Y-%m-%d").to_string();
+        response.fx_rate = fx_rate;
+        response.rate_date = rate_date;
         Ok(Json(response))
     } else {
         let idx = payload
@@ -682,8 +778,8 @@ async fn upsert_expense_handler(
             Some(&payload.secondary),
         )?;
         let mut response = payload;
-        response.fx_rate = resolved.rate;
-        response.rate_date = rate_date.format("%Y-%m-%d").to_string();
+        response.fx_rate = fx_rate;
+        response.rate_date = rate_date;
         Ok(Json(response))
     }
 }
@@ -894,9 +990,15 @@ async fn add_category_handler(
 /// currency was when each was last written, which goes stale the moment a
 /// user changes it (see [`upsert_expense_handler`]'s module-level rationale
 /// for the same fix one level down, on a single row).
-async fn category_totals_across_all_years(
-    kind: &str,
-) -> Result<std::collections::HashMap<String, f64>, AppError> {
+///
+/// An amount in a currency that cannot be resolved is left out of its
+/// category's total rather than added unconverted, and is reported twice in
+/// the result: once across the whole kind, in
+/// [`CategoryTotalsJson::unavailable_currencies`], and once per affected
+/// category, in [`CategoryTotalsJson::unavailable_currencies_by_category`].
+/// Only the per-category breakdown says whether one specific total is
+/// incomplete, which is what [`delete_category_handler`] needs.
+async fn category_totals_across_all_years(kind: &str) -> Result<CategoryTotalsJson, AppError> {
     if kind != "primary" && kind != "secondary" {
         return Err(finguard_rs_backend::Error::InvalidArgument(format!(
             "kind must be 'primary' or 'secondary', got '{kind}'"
@@ -907,24 +1009,39 @@ async fn category_totals_across_all_years(
     let facts = finguard_rs_backend::df_operations::all_expense_facts()?;
     let reference_currency = config::get_currency_settings()?.reference_currency;
     let keys = finguard_rs_backend::df_operations::distinct_rate_keys(&facts, &reference_currency);
-    let mut rates = std::collections::HashMap::with_capacity(keys.len());
-    for (date, currency) in keys {
-        let resolved = fx::rate_on(date, &currency).await?;
-        rates.insert((date, currency), resolved);
-    }
+    let (rates, unavailable_currencies) = fx::rates_for_keys_lenient(&keys).await?;
 
     let mut totals = std::collections::HashMap::new();
+    let mut unavailable_currencies_by_category: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for fact in &facts {
         let category = if kind == "primary" {
             &fact.primary_category
         } else {
             &fact.secondary_category
         };
-        let (rate, _) =
-            finguard_rs_backend::df_operations::resolve_fact(fact, &reference_currency, &rates)?;
+        // Skipping an unconvertible amount keeps every total denominated in
+        // the reference currency alone; the two unavailable-currency lists
+        // are what tell the caller which totals are incomplete.
+        let Some((rate, _)) = resolve_fact_lenient(fact, &reference_currency, &rates) else {
+            unavailable_currencies_by_category
+                .entry(category.clone())
+                .or_default()
+                .push(fact.currency.trim().to_uppercase());
+            continue;
+        };
         *totals.entry(category.clone()).or_insert(0.0) += fact.expense_amount * rate;
     }
-    Ok(totals)
+    for currencies in unavailable_currencies_by_category.values_mut() {
+        currencies.sort();
+        currencies.dedup();
+    }
+
+    Ok(CategoryTotalsJson {
+        totals,
+        unavailable_currencies,
+        unavailable_currencies_by_category,
+    })
 }
 
 /// `DELETE /api/categories/:kind/:name`: unregister `name` from `kind`'s
@@ -935,12 +1052,38 @@ async fn category_totals_across_all_years(
 /// Refuses to delete (returns [`Error::InvalidArgument`], `400`) while the
 /// category still has a nonzero total across all years (checked with a
 /// `1e-9` tolerance for float rounding), so a category cannot be removed out
-/// from under existing expenses.
+/// from under existing expenses. Also refuses while *this* category's own
+/// rows include an unresolvable currency, since the total that guards the
+/// delete would then be incomplete. Another category's unresolvable currency
+/// does not block this one: its total is still exact.
 async fn delete_category_handler(
     Path((kind, name)): Path<(String, String)>,
 ) -> Result<Json<CategoriesJson>, AppError> {
     let totals = category_totals_across_all_years(&kind).await?;
-    let total = totals.get(&name).copied().unwrap_or(0.0);
+    // Unlike the read-only endpoints, this one cannot degrade: the total is
+    // the only guard on a destructive delete, and a category whose rows are
+    // all in an unconvertible currency would total zero and look unused.
+    // Scoped to this category's own rows, so one stale row under some other
+    // category cannot block every delete of the same kind.
+    let blocking_currencies = totals
+        .unavailable_currencies_by_category
+        .get(&name)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if !blocking_currencies.is_empty() {
+        return Err(finguard_rs_backend::Error::InvalidArgument(format!(
+            "Cannot delete \"{name}\" right now: no exchange rate is available for {}, so its \
+             expenses in {} cannot be counted. Try again once rates can be fetched.",
+            blocking_currencies.join(", "),
+            if blocking_currencies.len() == 1 {
+                "that currency"
+            } else {
+                "those currencies"
+            }
+        ))
+        .into());
+    }
+    let total = totals.totals.get(&name).copied().unwrap_or(0.0);
     if total.abs() >= 1e-9 {
         return Err(finguard_rs_backend::Error::InvalidArgument(format!(
             "Cannot delete \"{name}\": it still has {} in existing expenses.",
@@ -963,9 +1106,16 @@ async fn delete_category_handler(
 /// currency total per category of `kind` (see
 /// [`category_totals_across_all_years`]). Backs [`delete_category_handler`]'s
 /// "still in use" check on the frontend before a user attempts a delete.
+///
+/// An unresolvable currency does not fail the request: its amounts are left
+/// out of `totals`, and its code is reported both across the whole kind, in
+/// [`CategoryTotalsJson::unavailable_currencies`], and under each affected
+/// category, in [`CategoryTotalsJson::unavailable_currencies_by_category`]. A
+/// client offering a delete must gate on the per-category entry, since that
+/// is exactly what [`delete_category_handler`] refuses on.
 async fn get_category_totals_handler(
     Query(q): Query<KindQuery>,
-) -> Result<Json<std::collections::HashMap<String, f64>>, AppError> {
+) -> Result<Json<CategoryTotalsJson>, AppError> {
     Ok(Json(category_totals_across_all_years(&q.kind).await?))
 }
 
@@ -1021,31 +1171,37 @@ async fn set_income_cell_handler(
 ///
 /// Every month is present in the result even when it has no expense rows;
 /// such months map to an empty category map rather than being omitted.
+///
+/// An unresolvable currency does not fail the request: its amounts are left
+/// out of the sums and its code is reported in
+/// [`MonthlySpendingJson::unavailable_currencies`], matching
+/// [`get_category_totals_handler`].
 async fn get_monthly_spending_handler(
     Query(q): Query<YearQuery>,
-) -> Result<Json<std::collections::HashMap<u32, std::collections::HashMap<String, f64>>>, AppError>
-{
+) -> Result<Json<MonthlySpendingJson>, AppError> {
     let facts = finguard_rs_backend::df_operations::expense_facts_for_year(q.year)?;
     let reference_currency = config::get_currency_settings()?.reference_currency;
     let keys = finguard_rs_backend::df_operations::distinct_rate_keys(&facts, &reference_currency);
-    let mut rates = std::collections::HashMap::with_capacity(keys.len());
-    for (date, currency) in keys {
-        let resolved = fx::rate_on(date, &currency).await?;
-        rates.insert((date, currency), resolved);
-    }
+    let (rates, unavailable_currencies) = fx::rates_for_keys_lenient(&keys).await?;
 
-    let mut out = std::collections::HashMap::new();
+    let mut months = std::collections::HashMap::new();
     for m in 1..=12u32 {
-        out.insert(m, std::collections::HashMap::new());
+        months.insert(m, std::collections::HashMap::new());
     }
     for fact in &facts {
-        let (rate, _) =
-            finguard_rs_backend::df_operations::resolve_fact(fact, &reference_currency, &rates)?;
+        // Same exclusion rule as `category_totals_across_all_years`: an
+        // unconvertible amount is left out rather than summed unconverted.
+        let Some((rate, _)) = resolve_fact_lenient(fact, &reference_currency, &rates) else {
+            continue;
+        };
         let month = chrono::Datelike::month(&fact.expense_date);
-        let m_map = out.entry(month).or_default();
+        let m_map = months.entry(month).or_default();
         *m_map.entry(fact.primary_category.clone()).or_insert(0.0) += fact.expense_amount * rate;
     }
-    Ok(Json(out))
+    Ok(Json(MonthlySpendingJson {
+        months,
+        unavailable_currencies,
+    }))
 }
 
 /// `GET /api/investments`: list `q.year`'s investment assets with their
@@ -1952,11 +2108,248 @@ mod tests {
         .unwrap_or_else(|AppError(err)| panic!("get succeeds: {err}"))
         .0;
 
+        assert!(expenses.unavailable_currencies.is_empty());
+        let expenses = expenses.expenses;
         let eur_row = expenses.iter().find(|e| e.currency == "EUR").unwrap();
         assert_eq!(eur_row.fx_rate, 1.0);
         let usd_row = expenses.iter().find(|e| e.currency == "USD").unwrap();
         assert_eq!(usd_row.fx_rate, 1.0 / 1.20);
         assert_eq!(usd_row.rate_date, "2026-09-04");
+    }
+
+    /// A currency with no cached rate must not cost the user their expense
+    /// list: every row is still returned, the unconvertible one carries the
+    /// "unknown" `0.0`/empty-string pair with its stored amount intact, and
+    /// only its code is reported. A second, resolvable foreign currency in
+    /// the same response must convert normally.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn get_expenses_keeps_a_row_whose_currency_cannot_be_resolved() {
+        let _temp = with_temp_env_offline();
+        // GBP is cached, USD is not, and the network is disabled.
+        seed_fx_cache(&[("2026-09-04", &[("GBP", 0.70)])]);
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row("Rent", 4, 1_000.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add EUR row");
+        de.add_row(
+            "Tea",
+            4,
+            10.0,
+            Some("Groceries"),
+            "GBP",
+            Some("OtherGroceries"),
+        )
+        .expect("add GBP row");
+        de.add_row(
+            "Groceries",
+            4,
+            100.0,
+            Some("Groceries"),
+            "USD",
+            Some("OtherGroceries"),
+        )
+        .expect("add USD row");
+
+        let response = get_expenses_handler(Query(GetExpensesQuery {
+            year: 2026,
+            month: Some(9),
+            name: None,
+            category: None,
+            min: None,
+            max: None,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("degraded request still succeeds: {err}"))
+        .0;
+
+        assert_eq!(response.unavailable_currencies, vec!["USD".to_string()]);
+        assert_eq!(response.expenses.len(), 3);
+
+        let usd_row = response
+            .expenses
+            .iter()
+            .find(|e| e.currency == "USD")
+            .expect("an unconvertible row must still be listed");
+        assert_eq!(usd_row.fx_rate, 0.0);
+        assert_eq!(usd_row.rate_date, "");
+        assert_eq!(usd_row.amount, 100.0);
+
+        let gbp_row = response
+            .expenses
+            .iter()
+            .find(|e| e.currency == "GBP")
+            .unwrap();
+        assert_eq!(gbp_row.fx_rate, 1.0 / 0.70);
+        let eur_row = response
+            .expenses
+            .iter()
+            .find(|e| e.currency == "EUR")
+            .unwrap();
+        assert_eq!(eur_row.fx_rate, 1.0);
+    }
+
+    /// Both aggregate endpoints must leave an unconvertible amount out of
+    /// their sums and name its currency, rather than failing outright or
+    /// adding the raw foreign amount to a reference-currency total.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn aggregates_exclude_an_unconvertible_currency_and_name_it() {
+        let _temp = with_temp_env_offline();
+        // No cache seeded at all, so USD cannot be resolved offline.
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row("Rent", 4, 100.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add EUR row");
+        de.add_row("Groceries", 4, 100.0, Some("Housing"), "USD", Some("Rent"))
+            .expect("add USD row");
+
+        let totals = category_totals_across_all_years("primary")
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("degraded totals still succeed: {err}"));
+        assert_eq!(totals.unavailable_currencies, vec!["USD".to_string()]);
+        assert_eq!(totals.totals.get("Housing").copied(), Some(100.0));
+        assert_eq!(
+            totals.unavailable_currencies_by_category.get("Housing"),
+            Some(&vec!["USD".to_string()])
+        );
+
+        let spending = get_monthly_spending_handler(Query(YearQuery { year: 2026 }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("degraded spending still succeeds: {err}"))
+            .0;
+        assert_eq!(spending.unavailable_currencies, vec!["USD".to_string()]);
+        assert_eq!(spending.months[&9].get("Housing").copied(), Some(100.0));
+    }
+
+    /// Saving must never depend on a rate lookup: the parquet row stores no
+    /// rate, so an unresolvable currency writes the row anyway and only costs
+    /// the response its provenance fields.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn upsert_expense_succeeds_when_the_rate_cannot_be_resolved() {
+        let _temp = with_temp_env_offline();
+        // No cache seeded at all, so USD cannot be resolved offline.
+
+        let response = upsert_expense_handler(Json(ExpenseJson {
+            id: String::new(),
+            year: 2026,
+            month: 9,
+            day: 4,
+            name: "Groceries".to_string(),
+            amount: 100.0,
+            currency: "USD".to_string(),
+            primary: "Groceries".to_string(),
+            secondary: "OtherGroceries".to_string(),
+            fx_rate: 0.0,
+            rate_date: String::new(),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("saving must not depend on a rate: {err}"));
+
+        assert_eq!(response.0.fx_rate, 0.0);
+        assert_eq!(response.0.rate_date, "");
+        assert_eq!(response.0.id, "0");
+
+        let reloaded = DetailedExpenses::new(2026, 9).expect("reload detailed expenses");
+        assert_eq!(reloaded.expense_df.height(), 1);
+        assert_eq!(
+            reloaded
+                .expense_df
+                .column("expense_amount")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0),
+            Some(100.0)
+        );
+    }
+
+    /// Deleting a category is guarded by its total, so an incomplete total
+    /// must block the delete: a category used only by rows in an
+    /// unconvertible currency sums to zero and would otherwise look unused.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn delete_category_refuses_while_its_own_currency_cannot_be_resolved() {
+        let _temp = with_temp_env_offline();
+        // No cache seeded at all, so USD cannot be resolved offline.
+        config::add_known_category("Housing", "primary").expect("register Housing");
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row("Groceries", 4, 100.0, Some("Housing"), "USD", Some("Rent"))
+            .expect("add USD row");
+
+        let err = delete_category_handler(Path(("primary".to_string(), "Housing".to_string())))
+            .await
+            .expect_err("an incomplete total must not authorize a delete");
+        let finguard_rs_backend::Error::InvalidArgument(message) = err.0 else {
+            panic!("an incomplete total must be refused as a bad request");
+        };
+        assert!(
+            message.contains("USD"),
+            "the refusal must name the blocking currency, got: {message}"
+        );
+
+        // The refusal must leave the category registered.
+        let known = config::get_known_categories().expect("read categories");
+        assert!(known.primary.contains(&"Housing".to_string()));
+    }
+
+    /// The delete guard must be scoped to the category being deleted. One
+    /// unconvertible row filed under some *other* category leaves this
+    /// category's total exact, so the delete must still go through: gating on
+    /// the response-wide `unavailable_currencies` instead would freeze every
+    /// category delete behind a single stale row.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn delete_category_ignores_another_category_s_unconvertible_currency() {
+        let _temp = with_temp_env_offline();
+        // No cache seeded at all, so USD cannot be resolved offline.
+        config::add_known_category("Housing", "primary").expect("register Housing");
+        config::add_known_category("Travel", "primary").expect("register Travel");
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        // Housing nets to zero in the reference currency itself, so nothing
+        // but the currency guard could refuse its delete.
+        de.add_row("Rent", 4, 100.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add EUR row");
+        de.add_row(
+            "Rent refund",
+            5,
+            -100.0,
+            Some("Housing"),
+            "EUR",
+            Some("Rent"),
+        )
+        .expect("add offsetting EUR row");
+        de.add_row("Flight", 4, 100.0, Some("Travel"), "USD", Some("Rent"))
+            .expect("add unconvertible USD row under another category");
+
+        let totals = category_totals_across_all_years("primary")
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("degraded totals still succeed: {err}"));
+        // The response-wide list still reports USD, which is exactly what the
+        // guard must not react to here.
+        assert_eq!(totals.unavailable_currencies, vec!["USD".to_string()]);
+        assert_eq!(
+            totals.unavailable_currencies_by_category.get("Travel"),
+            Some(&vec!["USD".to_string()])
+        );
+        assert!(
+            !totals
+                .unavailable_currencies_by_category
+                .contains_key("Housing")
+        );
+
+        let remaining =
+            delete_category_handler(Path(("primary".to_string(), "Housing".to_string())))
+                .await
+                .unwrap_or_else(|AppError(err)| {
+                    panic!("another category's unconvertible currency must not block this: {err}")
+                })
+                .0;
+        assert!(!remaining.primary.contains(&"Housing".to_string()));
+        assert!(remaining.primary.contains(&"Travel".to_string()));
     }
 
     /// Category totals summed across a mix of currencies must weight each
@@ -1977,7 +2370,8 @@ mod tests {
         let totals = category_totals_across_all_years("primary")
             .await
             .unwrap_or_else(|AppError(err)| panic!("category totals succeed: {err}"));
-        assert_eq!(totals.get("Housing").copied(), Some(180.0));
+        assert!(totals.unavailable_currencies.is_empty());
+        assert_eq!(totals.totals.get("Housing").copied(), Some(180.0));
     }
 
     /// Changing the reference currency must change the reported category
@@ -2012,7 +2406,7 @@ mod tests {
         let eur_totals = category_totals_across_all_years("primary")
             .await
             .unwrap_or_else(|AppError(err)| panic!("EUR totals succeed: {err}"));
-        assert_eq!(eur_totals.get("Groceries").copied(), Some(100.0));
+        assert_eq!(eur_totals.totals.get("Groceries").copied(), Some(100.0));
 
         config::set_currency_settings(&config::CurrencySettings {
             reference_currency: "GBP".to_string(),
@@ -2023,7 +2417,7 @@ mod tests {
         let gbp_totals = category_totals_across_all_years("primary")
             .await
             .unwrap_or_else(|AppError(err)| panic!("GBP totals succeed: {err}"));
-        assert_eq!(gbp_totals.get("Groceries").copied(), Some(85.0));
+        assert_eq!(gbp_totals.totals.get("Groceries").copied(), Some(85.0));
 
         // The stored row itself must be byte-for-byte unchanged by the
         // settings switch: no write happened, only the read-time conversion.
