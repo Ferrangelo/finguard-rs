@@ -717,7 +717,7 @@ pub async fn monthly_rates(year: i32, currencies: &[String]) -> Result<MonthlyRa
 /// unavailable list, matching [`monthly_rates`].
 ///
 /// Shared by every endpoint that must degrade per currency instead of
-/// failing outright: `main.rs`'s `get_monthly_fx_rates_handler`,
+/// failing outright: `api.rs`'s `get_monthly_fx_rates_handler`,
 /// `get_networth_evolution_handler`, and `get_networth_allocation_handler`
 /// all resolve through this function rather than each re-implementing the
 /// per-currency retry loop.

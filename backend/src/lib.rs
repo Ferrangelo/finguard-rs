@@ -1,9 +1,13 @@
 //! finguard_rs: a Rust rewrite of the finguard personal-finance app.
 //!
-//! This crate is the library backing the application; the `finguard_rs_backend`
-//! binary built from `src/main.rs` is a thin Axum HTTP layer on top of it.
-//! Module responsibilities:
+//! This crate is the library backing the application. The `finguard_rs_backend`
+//! binary built from `src/main.rs` is only startup: it binds the listener,
+//! runs the row ID migration, and serves [`api::router`]. Module
+//! responsibilities:
 //!
+//! - [`api`]: the HTTP surface, routes, request/response DTOs, and handlers,
+//!   built as [`api::router`] so any embedder, such as a future Tauri app,
+//!   can serve the same router the desktop binary does.
 //! - [`paths`]: resolves on-disk Parquet file locations under
 //!   `$XDG_DATA_HOME/finguard/dbs/`.
 //! - [`config`]: reads and writes the JSON category-mapping and known-category
@@ -29,11 +33,13 @@
 //! schema is a compatibility boundary shared with that Python project, so
 //! check it before changing a schema-affecting type in [`df_operations`].
 
+pub mod api;
 pub mod config;
 pub mod df_operations;
 pub mod error;
 pub mod expr;
 pub mod fx;
+mod http_error;
 pub mod paths;
 pub mod plots;
 pub mod row_id_migration;

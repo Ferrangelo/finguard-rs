@@ -1,13 +1,13 @@
 // These types mirror the JSON DTOs the Rust backend serves from
-// backend/src/main.rs (the `*Json` structs near the top of that file). The
-// route list in backend/src/main.rs (grep for `.route(`) is the source of
+// backend/src/api.rs (the `*Json` structs near the top of that file). The
+// route list in backend/src/api.rs (grep for `.route(`) is the source of
 // truth for the API surface. If a field here changes shape, the matching
 // Rust struct must change in the same commit, and vice versa.
 
 export type Currency = "EUR" | "USD" | "GBP" | "CHF" | "JPY";
 
 /**
- * Mirrors `ExpenseJson` in backend/src/main.rs. `id` is a stable,
+ * Mirrors `ExpenseJson` in backend/src/api.rs. `id` is a stable,
  * backend-assigned opaque string ID. Do not parse it. `fx_rate` and
  * `rate_date` are read-only: the server
  * always resolves them from `currency` and the expense's own date, and
@@ -59,7 +59,7 @@ export interface ExpenseList {
   unavailable_currencies: string[];
 }
 
-/** Mirrors `RecurringTemplateJson` in backend/src/main.rs. Has no `year`: the backend scopes recurring templates by year through query parameters, not through this shape. */
+/** Mirrors `RecurringTemplateJson` in backend/src/api.rs. Has no `year`: the backend scopes recurring templates by year through query parameters, not through this shape. */
 export interface RecurringTemplate {
   id: string;
   name: string;
@@ -95,7 +95,7 @@ export const INCOME_CATEGORIES = [
 export type IncomeCategory = (typeof INCOME_CATEGORIES)[number];
 
 /**
- * Mirrors `MonthlySpendingJson` in backend/src/main.rs, the body of
+ * Mirrors `MonthlySpendingJson` in backend/src/api.rs, the body of
  * `GET /api/cashflow/spending`. `months` keys every calendar month `1`
  * through `12` (always present, even with no expense rows that month) to a
  * category-name -> reference-currency-amount map. Same lower-bound caveat as
@@ -115,7 +115,7 @@ export interface MonthlySpending {
 export type InvestmentCategory = "Stocks/ETF" | "Commodities" | "Bonds";
 
 /**
- * Mirrors `InvestmentAssetJson` in backend/src/main.rs. `id` is the asset
+ * Mirrors `InvestmentAssetJson` in backend/src/api.rs. `id` is the asset
  * name (assets are keyed by name, not a generated id). `data` is a
  * year -> month -> { qty, price } table, but a single fetch (`getInvestments`
  * takes one `year`) only ever populates the requested year's key; that one
@@ -140,7 +140,7 @@ export interface InvestmentAsset {
 export type LiquidityCategory = "Bank/Broker account" | "Cash" | "Other";
 
 /**
- * Mirrors `LiquidityRowJson` in backend/src/main.rs. `id` is the row name.
+ * Mirrors `LiquidityRowJson` in backend/src/api.rs. `id` is the row name.
  * `data` has the same one-year-per-fetch, all-12-months-present shape as
  * `InvestmentAsset.data`, defaulting each unset month to 0.
  */
@@ -153,7 +153,7 @@ export interface LiquidityRow {
 }
 
 /**
- * Mirrors `CreditDebtRowJson` in backend/src/main.rs. `id` is the row name.
+ * Mirrors `CreditDebtRowJson` in backend/src/api.rs. `id` is the row name.
  * `data` (balances, positive or negative) has the same one-year-per-fetch,
  * all-12-months-present shape as `LiquidityRow.data`.
  */
@@ -164,14 +164,14 @@ export interface CreditDebtRow {
   data: Record<number, Record<number, number>>;
 }
 
-/** Mirrors `CategoriesJson` in backend/src/main.rs: the full set of known primary and secondary expense categories. */
+/** Mirrors `CategoriesJson` in backend/src/api.rs: the full set of known primary and secondary expense categories. */
 export interface Categories {
   primary: string[];
   secondary: string[];
 }
 
 /**
- * Mirrors `CategoryTotalsJson` in backend/src/main.rs, the body of
+ * Mirrors `CategoryTotalsJson` in backend/src/api.rs, the body of
  * `GET /api/categories/totals`. `totals` sums every expense's
  * reference-currency amount by category name of the requested kind. A
  * category whose rows are all in an unresolved currency is absent from
@@ -194,7 +194,7 @@ export interface CategoryTotals {
 /** Mirrors `config::CurrentMonthRateMode` in backend/src/config.rs. `"previous_month_end"` freezes the in-progress month at the prior month's close; `"live"` always uses the newest published rate. */
 export type CurrentMonthRateMode = "previous_month_end" | "live";
 
-/** Mirrors `CurrencySettingsJson` in backend/src/main.rs, the body of `GET`/`PUT /api/settings/currency`. */
+/** Mirrors `CurrencySettingsJson` in backend/src/api.rs, the body of `GET`/`PUT /api/settings/currency`. */
 export interface CurrencySettings {
   reference_currency: Currency;
   current_month_rate_mode: CurrentMonthRateMode;
@@ -202,7 +202,7 @@ export interface CurrencySettings {
 
 /**
  * One calendar month's resolved rates in `MonthlyFxRates`, mirroring
- * `MonthlyFxRateJson` in backend/src/main.rs.
+ * `MonthlyFxRateJson` in backend/src/api.rs.
  *
  * `rate_to_reference[code]` multiplies an amount **in that currency** by it
  * to reach `MonthlyFxRates.reference_currency`. Converting a
@@ -220,7 +220,7 @@ export interface MonthlyFxRate {
 }
 
 /**
- * Mirrors `MonthlyFxRatesJson` in backend/src/main.rs, the body of
+ * Mirrors `MonthlyFxRatesJson` in backend/src/api.rs, the body of
  * `GET /api/fx/monthly-rates`. `unavailable_currencies` lists codes that
  * could not be resolved for any month, typically offline with nothing
  * cached; they are omitted from `months` rather than failing the request, so
@@ -233,7 +233,7 @@ export interface MonthlyFxRates {
   unavailable_currencies: string[];
 }
 
-/** One stacked component of `NetworthEvolution`, mirroring `NetworthSeriesJson` in backend/src/main.rs. */
+/** One stacked component of `NetworthEvolution`, mirroring `NetworthSeriesJson` in backend/src/api.rs. */
 export interface NetworthSeries {
   name: string;
   values: number[];
@@ -261,7 +261,7 @@ export interface NetworthEvolution {
   unavailable_currencies?: string[];
 }
 
-/** One slice of `NetworthAllocation`, mirroring `NetworthPieSliceJson` in backend/src/main.rs. */
+/** One slice of `NetworthAllocation`, mirroring `NetworthPieSliceJson` in backend/src/api.rs. */
 export interface NetworthPieSlice {
   name: string;
   value: number;

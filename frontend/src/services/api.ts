@@ -1,9 +1,9 @@
 // This module is the single point of contact with the Rust backend's JSON
 // REST API. Every function here corresponds to one route registered in
-// backend/src/main.rs (grep `.route(` there for the current, authoritative
-// list); the route list in main.rs is the source of truth for the API
+// backend/src/api.rs (grep `.route(` there for the current, authoritative
+// list); the route list in api.rs is the source of truth for the API
 // surface, not this file. Request and response shapes mirror the backend's
-// `*Json` DTO structs and payload structs in main.rs. If a call's shape
+// `*Json` DTO structs and payload structs in api.rs. If a call's shape
 // changes on either side, update the matching Rust handler/struct and the
 // TypeScript types in `./types.ts` together.
 import type {
@@ -84,7 +84,7 @@ export interface ExpenseFilter {
  * concatenates their per-month expense files, skipping months whose data
  * file does not exist rather than erroring. `id` in each returned `Expense`
  * is a stable, backend-assigned opaque string ID (see `ExpenseJson` in
- * backend/src/main.rs). Do not parse it.
+ * backend/src/api.rs). Do not parse it.
  *
  * A currency that could not be resolved does not drop its rows or fail the
  * request: they come back with `fx_rate: 0` (see `ExpenseList`), and the

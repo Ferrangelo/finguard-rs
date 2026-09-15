@@ -975,7 +975,7 @@ impl Cashflow {
     /// `Spending`. This branch no longer writes `primaries.parquet` and
     /// stopped storing a reference-currency figure at write time in favor of
     /// converting each expense at its own date's rate when it is requested
-    /// (see `get_monthly_spending_handler` in `main.rs`), so recomputing
+    /// (see `get_monthly_spending_handler` in `api.rs`), so recomputing
     /// `Spending` here would persist a figure denominated in whichever
     /// reference currency happened to be configured at edit time. Any
     /// `Spending`/`Saving`/`Saving %` values an older build already wrote are
@@ -1112,7 +1112,7 @@ fn set_f64_where(
 ///
 /// `currency` lives on `df` only, not on `df_prices`. A holding has exactly
 /// one currency, `df` is the frame the API reads asset metadata from (see
-/// `get_investments_handler` in `main.rs`), and `df_value`'s join already
+/// `get_investments_handler` in `api.rs`), and `df_value`'s join already
 /// selects only the price columns out of `df_prices`, so a copy on
 /// `df_prices` would never reach a caller and would just be a second value to
 /// keep in sync.
@@ -2181,7 +2181,7 @@ mod tests {
     }
 
     /// Reloading a liquidity table must migrate a legacy `"E"` currency value
-    /// to `"EUR"`, matching what the `/liquidity` handler in `main.rs` reads.
+    /// to `"EUR"`, matching what the `/liquidity` handler in `api.rs` reads.
     #[test]
     #[serial_test::serial]
     fn liquidity_load_normalizes_legacy_currency() {
@@ -2202,7 +2202,7 @@ mod tests {
 
     /// Reloading a credits/debts table must migrate a legacy `"E"` currency
     /// value to `"EUR"`, matching what the `/credits-debts` handler in
-    /// `main.rs` reads.
+    /// `api.rs` reads.
     #[test]
     #[serial_test::serial]
     fn credits_debts_load_normalizes_legacy_currency() {
@@ -2222,7 +2222,7 @@ mod tests {
 
     /// Reloading a recurring-expenses table must migrate a legacy `"E"`
     /// currency value to `"EUR"`, matching what the recurring-expenses
-    /// handler in `main.rs` reads.
+    /// handler in `api.rs` reads.
     #[test]
     #[serial_test::serial]
     fn recurring_expenses_load_normalizes_legacy_currency() {
@@ -2245,7 +2245,7 @@ mod tests {
 
     /// Reloading a detailed-expenses table must migrate a legacy `"E"`
     /// currency value to `"EUR"`, matching what the expenses handler in
-    /// `main.rs` reads.
+    /// `api.rs` reads.
     #[test]
     #[serial_test::serial]
     fn detailed_expenses_load_normalizes_legacy_currency() {

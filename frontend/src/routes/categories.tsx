@@ -135,13 +135,13 @@ function CategoryColumn({
             {list.map((c) => {
               const t = totals[c] ?? 0;
               // This condition mirrors the backend's delete guard in
-              // delete_category_handler (backend/src/main.rs). The
+              // delete_category_handler (backend/src/api.rs). The
               // backend rejects a delete when total.abs() >= 1e-9, using that
               // tolerance for float rounding. The UI shows a delete button only
               // when the backend will accept it.
               const hasExpenses = Math.abs(t) >= 1e-9;
               // NOTE: mirrors delete_category_handler's second refusal reason
-              // (backend/src/main.rs), which is still awaiting a product
+              // (backend/src/api.rs), which is still awaiting a product
               // ruling. Remove this block, and the
               // unavailableCurrenciesByCategory prop it depends on, if that
               // refusal is dropped. Scoped to this category's own name (`c`,

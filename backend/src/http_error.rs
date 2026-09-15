@@ -1,16 +1,15 @@
 //! HTTP-facing error wrapper for Axum handlers.
 //!
-//! Wraps [`finguard_rs_backend::Error`] so it can be returned directly from
-//! handlers and turned into a proper HTTP response (status code + JSON body)
-//! instead of Axum's default `200 OK` / `text/plain` handling of `String`
-//! errors.
+//! Wraps [`crate::Error`] so it can be returned directly from handlers and
+//! turned into a proper HTTP response (status code + JSON body) instead of
+//! Axum's default `200 OK` / `text/plain` handling of `String` errors.
 
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
-use finguard_rs_backend::Error;
+use crate::Error;
 
 /// Error type returned by HTTP handlers.
 ///
