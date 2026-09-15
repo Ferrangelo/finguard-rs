@@ -1,0 +1,27 @@
+[package]
+name = "finguard-mobile"
+version = "0.1.0"
+description = "finguard Android app, built with Tauri"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+# Exact version pin: the container's Gradle cache was warmed up against this
+# tauri release, and `cargo tauri android init` copies its Android Gradle
+# module from the resolved `tauri` crate. A different version can need Maven
+# libraries the offline cache does not have.
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+# See the tauri-build comment above: this pin keeps the Android Gradle module
+# matched to the container's warm cache.
+tauri = { version = "=2.11.5", features = [] }
+# Pinned for the same reason: the offline Gradle cache matches 2.9.1.
+tauri-plugin-log = "=2.9.1"
