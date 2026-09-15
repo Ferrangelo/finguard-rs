@@ -7,6 +7,10 @@
 //! other's parquet files: renaming, retyping, or reordering a column here is a
 //! cross-project data-contract change, not a local refactor, and must be
 //! checked against that project first.
+//!
+//! Exception: the synced tables also carry a [`ROW_ID_COLUMN`] column that
+//! the Python application never wrote. See that constant for which tables
+//! have it and how it is maintained.
 
 use std::collections::HashSet;
 
@@ -79,6 +83,79 @@ const LIQUIDITY_CATEGORIES: &[&str] = &["Bank/Broker account", "Cash", "Other"];
 /// Month column labels (`"01"`..`"12"`) used in wide yearly tables.
 fn month_labels() -> Vec<String> {
     (1..=12).map(|m| format!("{m:02}")).collect()
+}
+
+/// Stable row ID column of the synced tables: the monthly detailed
+/// expenses, recurring expenses, investments and investment prices,
+/// liquidity, and credits/debts. `cashflow.parquet` has none (its category
+/// name is the key), nor do the legacy `primaries.parquet` and
+/// `secondaries.parquet` summaries.
+///
+/// Each value is a random UUID v4 string from [`new_row_id`]. Every code
+/// path that creates a row sets a fresh one, and edits, renames, and cell
+/// updates keep it. An investment asset has one ID, shared by its
+/// `investments.parquet` and `investments_prices.parquet` rows. Only
+/// [`crate::row_id_migration`] assigns IDs to rows that lack one; every
+/// loader here rejects such a file with [`Error::RowIdsMissing`].
+pub const ROW_ID_COLUMN: &str = "row_id";
+
+/// Return a fresh random row ID for [`ROW_ID_COLUMN`].
+pub fn new_row_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Whether `df` still needs [`crate::row_id_migration`]: it has no
+/// [`ROW_ID_COLUMN`], the column is not a string column, or a row's value
+/// is null or empty.
+pub(crate) fn needs_row_ids(df: &DataFrame) -> Result<bool> {
+    if !has_column(df, ROW_ID_COLUMN) {
+        return Ok(true);
+    }
+    let ids = df.column(ROW_ID_COLUMN)?;
+    if ids.dtype() != &DataType::String {
+        return Ok(true);
+    }
+    Ok(ids.str()?.iter().any(|id| id.is_none_or(str::is_empty)))
+}
+
+/// Fail with [`Error::RowIdsMissing`] when `df`, just read from `path`,
+/// still needs row IDs (see [`needs_row_ids`]).
+fn require_row_ids(df: &DataFrame, path: &std::path::Path) -> Result<()> {
+    if needs_row_ids(df)? {
+        return Err(Error::RowIdsMissing(format!(
+            "{} has rows without a row ID. Restart the finguard backend: at startup it backs \
+             up the data folder and assigns the missing row IDs.",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Succeed when exactly one row of `df` has `row_id` as its
+/// [`ROW_ID_COLUMN`] value, so an edit or delete by that ID touches one row.
+///
+/// Returns [`Error::NotFound`] when no row matches. Returns
+/// [`Error::AlreadyExists`], the uniqueness violation, when several rows
+/// share the ID: the caller must then change nothing rather than edit or
+/// delete every copy. `kind` names the row kind (for example `"expense"`)
+/// and `place` the table (for example `"2026-09"`) in the message.
+fn require_single_row(df: &DataFrame, row_id: &str, kind: &str, place: &str) -> Result<()> {
+    let matches = df
+        .column(ROW_ID_COLUMN)?
+        .str()?
+        .iter()
+        .filter(|id| *id == Some(row_id))
+        .count();
+    match matches {
+        1 => Ok(()),
+        0 => Err(Error::NotFound(format!(
+            "No {kind} with id '{row_id}' in {place}."
+        ))),
+        n => Err(Error::AlreadyExists(format!(
+            "{n} {kind} rows in {place} share the id '{row_id}', so nothing was changed. \
+             Each row ID must be unique; the data file needs repair."
+        ))),
+    }
 }
 
 // ======================================================================
@@ -206,7 +283,7 @@ pub fn remove_category_from_all_summaries(name: &str, kind: &str) -> Result<()> 
 // ======================================================================
 
 /// Read a parquet file eagerly from `path`.
-fn read_parquet(path: &std::path::Path) -> Result<DataFrame> {
+pub(crate) fn read_parquet(path: &std::path::Path) -> Result<DataFrame> {
     let file = std::fs::File::open(path)?;
     Ok(ParquetReader::new(file).finish()?)
 }
@@ -220,7 +297,7 @@ fn write_parquet(df: &DataFrame, path: &std::path::Path) -> Result<()> {
 }
 
 /// Return whether `df` contains a column named `name`.
-fn has_column(df: &DataFrame, name: &str) -> bool {
+pub(crate) fn has_column(df: &DataFrame, name: &str) -> bool {
     df.get_column_names().iter().any(|c| c.as_str() == name)
 }
 
@@ -279,6 +356,7 @@ fn empty_expenses_df() -> DataFrame {
         Field::new("currency".into(), DataType::String),
         Field::new("primary_category".into(), DataType::String),
         Field::new("secondary_category".into(), DataType::String),
+        Field::new(ROW_ID_COLUMN.into(), DataType::String),
     ]))
 }
 
@@ -299,7 +377,9 @@ pub struct DetailedExpenses {
 
 impl DetailedExpenses {
     /// Construct from a `year` and `month`, loading the parquet file if it
-    /// exists or initialising an empty table otherwise.
+    /// exists or initialising an empty table otherwise. Returns
+    /// [`Error::RowIdsMissing`] for a file with a row that has no
+    /// [`ROW_ID_COLUMN`] value.
     pub fn new(year: i32, month: u32) -> Result<Self> {
         let path = get_monthly_parquet_path(year, month)?;
         Self::load(year, month, path)
@@ -315,6 +395,7 @@ impl DetailedExpenses {
     fn load(year: i32, month: u32, path: std::path::PathBuf) -> Result<Self> {
         let expense_df = if path.exists() {
             let mut df = read_parquet(&path)?;
+            require_row_ids(&df, &path)?;
             // Ensure expense_date is Date (older files may store it as Int64).
             if has_column(&df, "expense_date")
                 && df.column("expense_date")?.dtype() != &DataType::Date
@@ -346,7 +427,8 @@ impl DetailedExpenses {
         })
     }
 
-    /// Append an expense row and save the updated dataframe.
+    /// Append an expense row with a fresh [`ROW_ID_COLUMN`] value, save the
+    /// updated dataframe, and return the new row's ID.
     ///
     /// If `primary_category` or `secondary_category` are `None`, they are
     /// resolved from the category-mappings config. Returns
@@ -359,7 +441,7 @@ impl DetailedExpenses {
         primary_category: Option<&str>,
         currency: &str,
         secondary_category: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut primary = primary_category.map(|s| s.to_string());
         let mut secondary = secondary_category.map(|s| s.to_string());
 
@@ -399,6 +481,7 @@ impl DetailedExpenses {
                 ))
             })?;
 
+        let row_id = new_row_id();
         let new_row = DataFrame::new_infer_height(vec![
             Column::new("expense_name".into(), &[expense_name]),
             date_series("expense_date", &[date]).into(),
@@ -412,22 +495,36 @@ impl DetailedExpenses {
                 "secondary_category".into(),
                 &[normalize_category_value(&secondary)],
             ),
+            Column::new(ROW_ID_COLUMN.into(), &[row_id.as_str()]),
         ])?;
 
         self.expense_df = concat_df_diagonal(&[self.expense_df.clone(), new_row])?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
-        Ok(())
+        Ok(row_id)
     }
 
-    /// Remove the `row_index`-th row, then save.
-    pub fn delete_row(&mut self, row_index: u32) -> Result<()> {
+    /// Succeed when exactly one row of this month has `row_id`; see
+    /// [`require_single_row`] for the errors.
+    fn require_row(&self, row_id: &str) -> Result<()> {
+        require_single_row(
+            &self.expense_df,
+            row_id,
+            "expense",
+            &format!("{}-{:02}", self.year, self.month),
+        )
+    }
+
+    /// Remove the row whose [`ROW_ID_COLUMN`] is `row_id`, then save.
+    /// Returns [`Error::NotFound`] when this month has no such row, and
+    /// [`Error::AlreadyExists`] without changing anything when several rows
+    /// share that ID.
+    pub fn delete_row(&mut self, row_id: &str) -> Result<()> {
+        self.require_row(row_id)?;
         self.expense_df = self
             .expense_df
             .clone()
             .lazy()
-            .with_row_index("_idx", None)
-            .filter(col("_idx").neq(lit(row_index)))
-            .drop(cols(["_idx"]))
+            .filter(col(ROW_ID_COLUMN).neq(lit(row_id)))
             .collect()?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
         Ok(())
@@ -470,7 +567,10 @@ impl DetailedExpenses {
         set
     }
 
-    /// Apply field edits to the `row_index`-th row, then save.
+    /// Apply field edits to the row whose [`ROW_ID_COLUMN`] is `row_id`,
+    /// then save. The row keeps its ID. Returns [`Error::NotFound`] when this
+    /// month has no such row, and [`Error::AlreadyExists`] without changing
+    /// anything when several rows share that ID.
     ///
     /// This ports the `save_edit` logic from `ui_expenses.py`: any field left
     /// `None` is unchanged; `expense_day` rebuilds `expense_date` from the
@@ -487,7 +587,7 @@ impl DetailedExpenses {
     #[allow(clippy::too_many_arguments)]
     pub fn edit_row(
         &mut self,
-        row_index: u32,
+        row_id: &str,
         expense_name: Option<&str>,
         expense_day: Option<u32>,
         expense_amount: Option<f64>,
@@ -495,9 +595,10 @@ impl DetailedExpenses {
         primary_category: Option<&str>,
         secondary_category: Option<&str>,
     ) -> Result<()> {
-        let mut df = self.expense_df.clone().lazy().with_row_index("_idx", None);
+        self.require_row(row_id)?;
+        let mut df = self.expense_df.clone().lazy();
 
-        let pred = col("_idx").eq(lit(row_index));
+        let pred = col(ROW_ID_COLUMN).eq(lit(row_id));
 
         if let Some(name) = expense_name {
             df = df.with_column(
@@ -560,12 +661,15 @@ impl DetailedExpenses {
             );
         }
 
-        self.expense_df = df.drop(cols(["_idx"])).collect()?;
+        self.expense_df = df.collect()?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
         Ok(())
     }
 
-    /// Return a filtered copy of the expense dataframe.
+    /// Return a filtered copy of the expense dataframe. Each returned row
+    /// keeps its [`ROW_ID_COLUMN`] value, which
+    /// [`edit_row`](Self::edit_row) and [`delete_row`](Self::delete_row)
+    /// take.
     ///
     /// `name_substr` matches `expense_name` case-insensitively; `category_substr`
     /// matches either category column case-insensitively; `amount_min`/`amount_max`
@@ -588,36 +692,9 @@ impl DetailedExpenses {
         Ok(lf.collect()?)
     }
 
-    /// Like [`filter_expenses`](Self::filter_expenses) but each returned row
-    /// carries an extra `_idx` (UInt32) column holding its position in the
-    /// *unfiltered* `expense_df`.
-    ///
-    /// The row index is attached with `with_row_index` *before* filtering, so the
-    /// `_idx` values survive any filter and are the true underlying indices
-    /// expected by [`edit_row`](Self::edit_row) / [`delete_row`](Self::delete_row).
-    /// This mirrors the Python `with_row_index("id")`-before-filter approach and
-    /// avoids fuzzy positional matching in the UI. Filter predicates are
-    /// identical to [`filter_expenses`](Self::filter_expenses).
-    pub fn filter_expenses_indexed(
-        &self,
-        name_substr: Option<&str>,
-        category_substr: Option<&str>,
-        amount_min: Option<f64>,
-        amount_max: Option<f64>,
-    ) -> Result<DataFrame> {
-        let lf = Self::apply_expense_filters(
-            self.expense_df.clone().lazy().with_row_index("_idx", None),
-            name_substr,
-            category_substr,
-            amount_min,
-            amount_max,
-        );
-        Ok(lf.collect()?)
-    }
-
-    /// Apply the shared expense filter predicates to a lazy frame. Empty / `None`
-    /// filters are ignored. Used by both [`filter_expenses`](Self::filter_expenses)
-    /// and [`filter_expenses_indexed`](Self::filter_expenses_indexed).
+    /// Apply the expense filter predicates of
+    /// [`filter_expenses`](Self::filter_expenses) to a lazy frame. Empty /
+    /// `None` filters are ignored.
     fn apply_expense_filters(
         mut lf: LazyFrame,
         name_substr: Option<&str>,
@@ -727,9 +804,13 @@ pub fn expense_facts_for_year(year: i32) -> Result<Vec<ExpenseFact>> {
 /// walk [`remove_category_from_all_summaries`] uses; per-year read errors
 /// are swallowed the same way (a year directory that cannot be read
 /// contributes no facts rather than failing the whole scan).
+///
+/// The exception is [`Error::RowIdsMissing`], which is returned: skipping a
+/// year that only waits for the row ID migration would silently understate
+/// the totals that guard a category delete.
 pub fn all_expense_facts() -> Result<Vec<ExpenseFact>> {
     let mut facts = Vec::new();
-    let _ = (|| -> Result<()> {
+    let scan = (|| -> Result<()> {
         let root = get_dbs_root()?;
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
@@ -743,13 +824,18 @@ pub fn all_expense_facts() -> Result<Vec<ExpenseFact>> {
             else {
                 continue;
             };
-            if let Ok(year_facts) = expense_facts_for_year(year) {
-                facts.extend(year_facts);
+            match expense_facts_for_year(year) {
+                Ok(year_facts) => facts.extend(year_facts),
+                Err(err @ Error::RowIdsMissing(_)) => return Err(err),
+                Err(_) => {}
             }
         }
         Ok(())
     })();
-    Ok(facts)
+    match scan {
+        Err(err @ Error::RowIdsMissing(_)) => Err(err),
+        _ => Ok(facts),
+    }
 }
 
 /// Every distinct `(expense_date, currency)` pair in `facts` whose currency
@@ -951,7 +1037,8 @@ impl Cashflow {
 // ======================================================================
 
 /// Build an empty wide dataframe with the given leading `String` meta columns
-/// followed by month columns `"01".."12"` of `Float64`.
+/// followed by month columns `"01".."12"` of `Float64`, then
+/// [`ROW_ID_COLUMN`].
 fn empty_wide_df(meta_cols: &[&str]) -> DataFrame {
     let mut fields: Vec<Field> = meta_cols
         .iter()
@@ -960,12 +1047,13 @@ fn empty_wide_df(meta_cols: &[&str]) -> DataFrame {
     for m in month_labels() {
         fields.push(Field::new(m.as_str().into(), DataType::Float64));
     }
+    fields.push(Field::new(ROW_ID_COLUMN.into(), DataType::String));
     DataFrame::empty_with_schema(&Schema::from_iter(fields))
 }
 
 /// Build a single-row wide dataframe from `(meta column, value)` pairs plus
-/// zeroed month columns.
-fn wide_row(meta: &[(&str, &str)]) -> Result<DataFrame> {
+/// zeroed month columns, then `row_id` as its [`ROW_ID_COLUMN`].
+fn wide_row(meta: &[(&str, &str)], row_id: &str) -> Result<DataFrame> {
     let mut cols: Vec<Column> = meta
         .iter()
         .map(|(name, val)| Column::new((*name).into(), &[*val]))
@@ -973,6 +1061,7 @@ fn wide_row(meta: &[(&str, &str)]) -> Result<DataFrame> {
     for m in month_labels() {
         cols.push(Column::new(m.as_str().into(), &[0.0_f64]));
     }
+    cols.push(Column::new(ROW_ID_COLUMN.into(), &[row_id]));
     Ok(DataFrame::new_infer_height(cols)?)
 }
 
@@ -1027,38 +1116,46 @@ fn set_f64_where(
 /// selects only the price columns out of `df_prices`, so a copy on
 /// `df_prices` would never reach a caller and would just be a second value to
 /// keep in sync.
+///
+/// An asset's row in `df` and its row in `df_prices` share one
+/// [`ROW_ID_COLUMN`] value.
 pub struct InvestmentHoldings {
     /// Calendar year of this table.
     pub year: i32,
     path: std::path::PathBuf,
     path_prices: std::path::PathBuf,
-    /// Quantities dataframe (`asset_name, category, link, currency, 01..12`).
+    /// Quantities dataframe (`asset_name, category, link, currency, 01..12,
+    /// row_id`).
     pub df: DataFrame,
-    /// Prices dataframe (`asset_name, category, link, 01..12`; no `currency`).
+    /// Prices dataframe (`asset_name, category, link, 01..12, row_id`; no
+    /// `currency`).
     pub df_prices: DataFrame,
 }
 
 impl InvestmentHoldings {
     /// Construct for `year`, loading holdings and prices from disk (or
     /// initialising empty), migrating a missing `link` column on both frames
-    /// and a missing or legacy `currency` column on `df`.
+    /// and a missing or legacy `currency` column on `df`. Returns
+    /// [`Error::RowIdsMissing`] when either file has a row without a
+    /// [`ROW_ID_COLUMN`] value.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, INVESTMENTS_FILENAME)?;
         let path_prices = get_year_summary_path(year, INVESTMENTS_PRICES_FILENAME)?;
 
-        let load = |p: &std::path::Path| -> Result<DataFrame> {
+        let load = |p: &std::path::Path, empty_meta_cols: &[&str]| -> Result<DataFrame> {
             if p.exists() {
                 let mut df = read_parquet(p)?;
+                require_row_ids(&df, p)?;
                 if !has_column(&df, "link") {
                     df = df.lazy().with_column(lit("").alias("link")).collect()?;
                 }
                 Ok(df)
             } else {
-                Ok(empty_wide_df(&["asset_name", "category", "link"]))
+                Ok(empty_wide_df(empty_meta_cols))
             }
         };
 
-        let mut df = load(&path)?;
+        let mut df = load(&path, &["asset_name", "category", "link", "currency"])?;
         if !has_column(&df, "currency") {
             // Holdings saved before this column existed are already priced in
             // the reference currency, so backfill it from settings rather
@@ -1074,7 +1171,7 @@ impl InvestmentHoldings {
         Ok(Self {
             year,
             df,
-            df_prices: load(&path_prices)?,
+            df_prices: load(&path_prices, &["asset_name", "category", "link"])?,
             path,
             path_prices,
         })
@@ -1085,9 +1182,12 @@ impl InvestmentHoldings {
     }
 
     /// Add a new asset row (monthly quantities initialised to 0) and save.
+    /// The rows appended to `df` and `df_prices` get the same fresh
+    /// [`ROW_ID_COLUMN`] value.
     ///
     /// `currency` is stored on `df` only; the row appended to `df_prices`
-    /// keeps that frame's existing `asset_name, category, link` schema.
+    /// keeps that frame's existing `asset_name, category, link, 01..12,
+    /// row_id` schema.
     pub fn add_asset(
         &mut self,
         asset_name: &str,
@@ -1105,17 +1205,24 @@ impl InvestmentHoldings {
                 "Asset '{asset_name}' already exists."
             )));
         }
-        let new_row = wide_row(&[
-            ("asset_name", asset_name),
-            ("category", category),
-            ("link", link),
-            ("currency", currency),
-        ])?;
-        let price_row = wide_row(&[
-            ("asset_name", asset_name),
-            ("category", category),
-            ("link", link),
-        ])?;
+        let row_id = new_row_id();
+        let new_row = wide_row(
+            &[
+                ("asset_name", asset_name),
+                ("category", category),
+                ("link", link),
+                ("currency", currency),
+            ],
+            &row_id,
+        )?;
+        let price_row = wide_row(
+            &[
+                ("asset_name", asset_name),
+                ("category", category),
+                ("link", link),
+            ],
+            &row_id,
+        )?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
         self.df_prices = concat_df_diagonal(&[self.df_prices.clone(), price_row])?;
         self.save()
@@ -1261,10 +1368,10 @@ impl InvestmentHoldings {
 
     /// Return a dataframe of quantity × price for each asset and month.
     ///
-    /// Same shape as `df` (`asset_name, category, link, currency, 01..12`)
-    /// but each monthly cell contains `quantity * price`. The join only pulls
-    /// the price columns out of `df_prices`, so `df`'s other columns,
-    /// including `currency`, pass through unchanged.
+    /// Same shape as `df` (`asset_name, category, link, currency, 01..12,
+    /// row_id`) but each monthly cell contains `quantity * price`. The join
+    /// only pulls the price columns out of `df_prices`, so `df`'s other
+    /// columns, including `currency` and `row_id`, pass through unchanged.
     pub fn df_value(&self) -> Result<DataFrame> {
         let mcols = month_labels();
         let price_select: Vec<Expr> = std::iter::once(col("asset_name"))
@@ -1311,7 +1418,7 @@ impl InvestmentHoldings {
 // Liquidity
 // ======================================================================
 
-/// Yearly liquidity table (`asset_name, category, currency, 01..12`).
+/// Yearly liquidity table (`asset_name, category, currency, 01..12, row_id`).
 pub struct Liquidity {
     /// Calendar year of this table.
     pub year: i32,
@@ -1323,11 +1430,13 @@ pub struct Liquidity {
 impl Liquidity {
     /// Construct for `year`, loading from disk (migrating a missing `currency`
     /// column to `"EUR"` and a legacy `"E"` value in an existing one to
-    /// `"EUR"`) or initialising empty.
+    /// `"EUR"`) or initialising empty. Returns [`Error::RowIdsMissing`] for
+    /// a file with a row that has no [`ROW_ID_COLUMN`] value.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, LIQUIDITY_FILENAME)?;
         let df = if path.exists() {
             let mut df = read_parquet(&path)?;
+            require_row_ids(&df, &path)?;
             if !has_column(&df, "currency") {
                 df = df
                     .lazy()
@@ -1345,7 +1454,8 @@ impl Liquidity {
         str_col_to_vec(&self.df, "asset_name")
     }
 
-    /// Add a new liquidity asset row (monthly values initialised to 0), save.
+    /// Add a new liquidity asset row (monthly values initialised to 0) with a
+    /// fresh [`ROW_ID_COLUMN`] value, then save.
     pub fn add_asset(&mut self, asset_name: &str, category: &str, currency: &str) -> Result<()> {
         if !LIQUIDITY_CATEGORIES.contains(&category) {
             return Err(Error::InvalidArgument(format!(
@@ -1357,11 +1467,14 @@ impl Liquidity {
                 "Asset '{asset_name}' already exists."
             )));
         }
-        let new_row = wide_row(&[
-            ("asset_name", asset_name),
-            ("category", category),
-            ("currency", currency),
-        ])?;
+        let new_row = wide_row(
+            &[
+                ("asset_name", asset_name),
+                ("category", category),
+                ("currency", currency),
+            ],
+            &new_row_id(),
+        )?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
         self.save()
     }
@@ -1443,7 +1556,7 @@ impl Liquidity {
 // CreditsDebts
 // ======================================================================
 
-/// Yearly credits & debts table (`name, currency, 01..12`).
+/// Yearly credits & debts table (`name, currency, 01..12, row_id`).
 ///
 /// Positive monthly values represent credits, negative values represent debts.
 pub struct CreditsDebts {
@@ -1457,11 +1570,14 @@ pub struct CreditsDebts {
 impl CreditsDebts {
     /// Construct for `year`, loading from disk (migrating a missing `currency`
     /// column to `"EUR"`, a legacy `"E"` value in an existing one to `"EUR"`,
-    /// and dropping a legacy `type` column) or initialising empty.
+    /// and dropping a legacy `type` column) or initialising empty. Returns
+    /// [`Error::RowIdsMissing`] for a file with a row that has no
+    /// [`ROW_ID_COLUMN`] value.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, CREDITS_DEBTS_FILENAME)?;
         let df = if path.exists() {
             let mut df = read_parquet(&path)?;
+            require_row_ids(&df, &path)?;
             if !has_column(&df, "currency") {
                 df = df
                     .lazy()
@@ -1483,14 +1599,15 @@ impl CreditsDebts {
         str_col_to_vec(&self.df, "name")
     }
 
-    /// Add a new credit/debt row (monthly values initialised to 0), then save.
+    /// Add a new credit/debt row (monthly values initialised to 0) with a
+    /// fresh [`ROW_ID_COLUMN`] value, then save.
     pub fn add_entry(&mut self, name: &str, currency: &str) -> Result<()> {
         if self.entry_names()?.iter().any(|n| n == name) {
             return Err(Error::AlreadyExists(format!(
                 "Entry '{name}' already exists."
             )));
         }
-        let new_row = wide_row(&[("name", name), ("currency", currency)])?;
+        let new_row = wide_row(&[("name", name), ("currency", currency)], &new_row_id())?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
         self.save()
     }
@@ -1555,6 +1672,7 @@ fn empty_recurring_df() -> DataFrame {
         Field::new("currency".into(), DataType::String),
         Field::new("primary_category".into(), DataType::String),
         Field::new("secondary_category".into(), DataType::String),
+        Field::new(ROW_ID_COLUMN.into(), DataType::String),
     ]))
 }
 
@@ -1591,18 +1709,23 @@ pub struct RecurringExpenses {
 
 impl RecurringExpenses {
     /// Construct for `year`, loading from disk (normalizing a legacy `"E"`
-    /// currency value to `"EUR"`) or initialising empty.
+    /// currency value to `"EUR"`) or initialising empty. Returns
+    /// [`Error::RowIdsMissing`] for a file with a row that has no
+    /// [`ROW_ID_COLUMN`] value.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, RECURRING_EXPENSES_FILENAME)?;
         let df = if path.exists() {
-            normalize_currency_column(read_parquet(&path)?)?
+            let df = read_parquet(&path)?;
+            require_row_ids(&df, &path)?;
+            normalize_currency_column(df)?
         } else {
             empty_recurring_df()
         };
         Ok(Self { year, path, df })
     }
 
-    /// Add a recurring expense definition (day must be 1..=28), then save.
+    /// Add a recurring expense definition (day must be 1..=28) with a fresh
+    /// [`ROW_ID_COLUMN`] value, save, and return the new row's ID.
     pub fn add(
         &mut self,
         expense_name: &str,
@@ -1611,12 +1734,13 @@ impl RecurringExpenses {
         currency: &str,
         primary_category: &str,
         secondary_category: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         if !(1..=28).contains(&expense_day) {
             return Err(Error::InvalidArgument(format!(
                 "expense_day must be between 1 and 28, got {expense_day}"
             )));
         }
+        let row_id = new_row_id();
         let new_row = DataFrame::new_infer_height(vec![
             Column::new("expense_name".into(), &[expense_name]),
             Column::new("expense_day".into(), &[expense_day]),
@@ -1630,20 +1754,29 @@ impl RecurringExpenses {
                 "secondary_category".into(),
                 &[normalize_category_value(secondary_category)],
             ),
+            Column::new(ROW_ID_COLUMN.into(), &[row_id.as_str()]),
         ])?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
-        self.save()
+        self.save()?;
+        Ok(row_id)
     }
 
-    /// Remove a recurring expense by row index, then save.
-    pub fn remove(&mut self, index: u32) -> Result<()> {
+    /// Remove the recurring expense whose [`ROW_ID_COLUMN`] is `row_id`, then
+    /// save. Returns [`Error::NotFound`] when this year has no such row, and
+    /// [`Error::AlreadyExists`] without changing anything when several rows
+    /// share that ID.
+    pub fn remove(&mut self, row_id: &str) -> Result<()> {
+        require_single_row(
+            &self.df,
+            row_id,
+            "recurring expense",
+            &self.year.to_string(),
+        )?;
         self.df = self
             .df
             .clone()
             .lazy()
-            .with_row_index("_idx", None)
-            .filter(col("_idx").neq(lit(index)))
-            .drop(cols(["_idx"]))
+            .filter(col(ROW_ID_COLUMN).neq(lit(row_id)))
             .collect()?;
         self.save()
     }
@@ -1816,11 +1949,14 @@ mod tests {
         .expect("set currency settings");
 
         let path = get_year_summary_path(2026, INVESTMENTS_FILENAME).expect("investments path");
-        let legacy_row = wide_row(&[
-            ("asset_name", "Legacy Holding"),
-            ("category", "Stocks/ETF"),
-            ("link", ""),
-        ])
+        let legacy_row = wide_row(
+            &[
+                ("asset_name", "Legacy Holding"),
+                ("category", "Stocks/ETF"),
+                ("link", ""),
+            ],
+            &new_row_id(),
+        )
         .expect("build legacy row without a currency column");
         write_parquet(&legacy_row, &path).expect("write legacy investments file");
 
@@ -2164,6 +2300,7 @@ mod tests {
             date_series("rate_date", &[date]).into(),
             Column::new("primary_category".into(), &["Housing"]),
             Column::new("secondary_category".into(), &["Rent"]),
+            Column::new(ROW_ID_COLUMN.into(), &["old-rent-id"]),
         ])
         .expect("build a file written under the old schema");
         write_parquet(&pre_migration, &path).expect("write pre-migration file");
@@ -2290,5 +2427,66 @@ mod tests {
             distinct_rate_keys(&facts, "eur"),
             vec![(date, "USD".to_string())]
         );
+    }
+
+    /// A `row_id` shared by two rows (only possible through a damaged or
+    /// hand-edited file) must make edit and delete refuse with
+    /// `AlreadyExists` and leave the file byte-for-byte unchanged, instead of
+    /// changing both rows.
+    #[test]
+    #[serial_test::serial]
+    fn duplicate_row_id_changes_nothing() {
+        let _temp = with_temp_data_home();
+
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let expenses = DataFrame::new_infer_height(vec![
+            Column::new("expense_name".into(), &["Rent", "Tea", "Bus"]),
+            date_series("expense_date", &[date, date, date]).into(),
+            Column::new("expense_amount".into(), &[900.0, 3.0, 2.0]),
+            Column::new("currency".into(), &["EUR", "EUR", "EUR"]),
+            Column::new("primary_category".into(), &["Housing", "Out", "Transport"]),
+            Column::new("secondary_category".into(), &["Rent", "Cafe", "Bus"]),
+            Column::new(ROW_ID_COLUMN.into(), &["twin", "twin", "single"]),
+        ])
+        .unwrap();
+        let expenses_path = get_monthly_parquet_path(2026, 9).unwrap();
+        write_parquet(&expenses, &expenses_path).unwrap();
+        let expenses_before = std::fs::read(&expenses_path).unwrap();
+
+        let mut de = DetailedExpenses::new(2026, 9).unwrap();
+        let err = de.delete_row("twin").expect_err("delete must refuse");
+        assert!(matches!(err, Error::AlreadyExists(_)), "{err}");
+        assert!(err.to_string().contains("nothing was changed"), "{err}");
+        let err = de
+            .edit_row("twin", Some("Changed"), None, None, None, None, None)
+            .expect_err("edit must refuse");
+        assert!(matches!(err, Error::AlreadyExists(_)), "{err}");
+        assert_eq!(std::fs::read(&expenses_path).unwrap(), expenses_before);
+        assert_eq!(de.expense_df.height(), 3);
+
+        // The unique row is still editable and deletable.
+        de.delete_row("single")
+            .expect("a unique row_id still deletes");
+        assert_eq!(de.expense_df.height(), 2);
+
+        let recurring = DataFrame::new_infer_height(vec![
+            Column::new("expense_name".into(), &["Gym", "Gym"]),
+            Column::new("expense_day".into(), &[5_i64, 5]),
+            Column::new("expense_amount".into(), &[40.0, 40.0]),
+            Column::new("currency".into(), &["EUR", "EUR"]),
+            Column::new("primary_category".into(), &["Leisure", "Leisure"]),
+            Column::new("secondary_category".into(), &["Gym", "Gym"]),
+            Column::new(ROW_ID_COLUMN.into(), &["twin", "twin"]),
+        ])
+        .unwrap();
+        let recurring_path = get_year_summary_path(2026, RECURRING_EXPENSES_FILENAME).unwrap();
+        write_parquet(&recurring, &recurring_path).unwrap();
+        let recurring_before = std::fs::read(&recurring_path).unwrap();
+
+        let mut rec = RecurringExpenses::new(2026).unwrap();
+        let err = rec.remove("twin").expect_err("remove must refuse");
+        assert!(matches!(err, Error::AlreadyExists(_)), "{err}");
+        assert_eq!(std::fs::read(&recurring_path).unwrap(), recurring_before);
+        assert_eq!(rec.df.height(), 2);
     }
 }

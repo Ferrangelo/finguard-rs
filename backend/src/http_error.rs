@@ -29,9 +29,12 @@ impl IntoResponse for AppError {
             Error::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::AlreadyExists(_) => StatusCode::CONFLICT,
-            Error::Io(_) | Error::Json(_) | Error::Polars(_) | Error::NoHomeDir => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Error::Io(_)
+            | Error::Json(_)
+            | Error::Polars(_)
+            | Error::NoHomeDir
+            | Error::RowIdsMissing(_)
+            | Error::RowIdMigration { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Network(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
 

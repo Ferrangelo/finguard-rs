@@ -50,4 +50,22 @@ pub enum Error {
     /// not in the shape the caller expected.
     #[error("{0}")]
     Network(String),
+
+    /// A loaded table has no `row_id` column, or a row without a `row_id`.
+    /// Only the startup migration in [`crate::row_id_migration`] assigns
+    /// IDs to existing rows, because an ID assigned on read and never saved
+    /// would change on every request and make a delete miss its row.
+    #[error("{0}")]
+    RowIdsMissing(String),
+
+    /// The row ID migration failed on `path`. The backend must not serve
+    /// requests after this error.
+    #[error("row ID migration failed for {}: {source}", path.display())]
+    RowIdMigration {
+        /// The file or folder the migration was reading, backing up, or
+        /// writing when it failed.
+        path: std::path::PathBuf,
+        /// The underlying failure.
+        source: Box<Error>,
+    },
 }

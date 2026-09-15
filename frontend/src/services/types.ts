@@ -7,8 +7,9 @@
 export type Currency = "EUR" | "USD" | "GBP" | "CHF" | "JPY";
 
 /**
- * Mirrors `ExpenseJson` in backend/src/main.rs. `id` is the backend's
- * stringified row index. `fx_rate` and `rate_date` are read-only: the server
+ * Mirrors `ExpenseJson` in backend/src/main.rs. `id` is a stable,
+ * backend-assigned opaque string ID. Do not parse it. `fx_rate` and
+ * `rate_date` are read-only: the server
  * always resolves them from `currency` and the expense's own date, and
  * ignores them on write, so a caller building a request should not set them.
  * There is no `expense_in_ref_currency` field on the wire; a caller derives

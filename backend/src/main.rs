@@ -26,10 +26,12 @@ use tower_http::cors::CorsLayer;
 
 use finguard_rs_backend::config;
 use finguard_rs_backend::df_operations::{
-    Cashflow, CreditsDebts, DetailedExpenses, InvestmentHoldings, Liquidity, RecurringExpenses,
+    self, Cashflow, CreditsDebts, DetailedExpenses, InvestmentHoldings, Liquidity,
+    RecurringExpenses,
 };
 use finguard_rs_backend::fx;
 use finguard_rs_backend::plots;
+use finguard_rs_backend::row_id_migration;
 
 mod http_error;
 use http_error::AppError;
@@ -47,7 +49,9 @@ use http_error::AppError;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExpenseJson {
-    pub id: String, // String representation of index "_idx"
+    /// The row's stable `row_id` (see [`df_operations::ROW_ID_COLUMN`]), or
+    /// an empty string in a create request.
+    pub id: String,
     pub year: i32,
     pub month: u32,
     pub day: u32,
@@ -126,7 +130,8 @@ pub struct MonthlySpendingJson {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RecurringTemplateJson {
-    pub id: String, // Stringified index "_idx"
+    /// The template's stable `row_id` (see [`df_operations::ROW_ID_COLUMN`]).
+    pub id: String,
     pub name: String,
     pub day: i64,
     pub amount: f64,
@@ -593,10 +598,14 @@ fn resolve_fact_lenient(
 /// further filtered by `name`/`category` substring and `min`/`max` amount.
 ///
 /// A month with no parquet file yet is treated as empty (skipped), not an
-/// error, so requesting a full year with partial data still succeeds. Each
-/// returned [`ExpenseJson::id`] is that row's position in the month's
-/// unfiltered dataframe, which [`delete_expense_handler`] and
-/// [`upsert_expense_handler`] expect back verbatim.
+/// error, so requesting a full year with partial data still succeeds. A month
+/// whose file still lacks row IDs fails the request with
+/// [`Error::RowIdsMissing`] rather than being skipped. Each returned
+/// [`ExpenseJson::id`] is that row's stable `row_id`, which
+/// [`delete_expense_handler`] and [`upsert_expense_handler`] expect back
+/// verbatim.
+///
+/// [`Error::RowIdsMissing`]: finguard_rs_backend::Error::RowIdsMissing
 ///
 /// A currency that cannot be resolved (typically no network and nothing
 /// cached) does not fail the request and does not hide any row: the row is
@@ -620,13 +629,14 @@ async fn get_expenses_handler(
     for m in months {
         let de = match DetailedExpenses::new(q.year, m) {
             Ok(de) => de,
+            Err(err @ finguard_rs_backend::Error::RowIdsMissing(_)) => return Err(err.into()),
             Err(_) => continue,
         };
 
         let filtered_df =
-            de.filter_expenses_indexed(q.name.as_deref(), q.category.as_deref(), q.min, q.max)?;
+            de.filter_expenses(q.name.as_deref(), q.category.as_deref(), q.min, q.max)?;
 
-        let indices = column_i64(&filtered_df, "_idx");
+        let row_ids = str_col_to_vec(&filtered_df, df_operations::ROW_ID_COLUMN)?;
         let names = column_strings(&filtered_df, "expense_name");
         let days = column_dates_day(&filtered_df, "expense_date");
         let amounts = column_f64(&filtered_df, "expense_amount");
@@ -634,7 +644,7 @@ async fn get_expenses_handler(
         let primaries = column_strings(&filtered_df, "primary_category");
         let secondaries = column_strings(&filtered_df, "secondary_category");
 
-        for fi in 0..filtered_df.height() {
+        for (fi, row_id) in row_ids.into_iter().enumerate() {
             let day = days.get(fi).copied().unwrap_or(1) as u32;
             let Some(expense_date) = chrono::NaiveDate::from_ymd_opt(q.year, m, day) else {
                 continue;
@@ -646,7 +656,7 @@ async fn get_expenses_handler(
 
             rows.push((
                 ExpenseJson {
-                    id: indices.get(fi).copied().unwrap_or(0).to_string(),
+                    id: row_id,
                     year: q.year,
                     month: m,
                     day,
@@ -695,11 +705,12 @@ async fn get_expenses_handler(
 /// `POST /api/expenses`: create or update an expense row in
 /// `payload.year`/`payload.month`'s monthly parquet file.
 ///
-/// An empty `payload.id` means "create": the row is appended and the response
-/// carries the new row's index as its `id`. A non-empty `id` means "update
-/// the row at that index"; it must parse as a `u32` or this returns
-/// [`Error::InvalidArgument`] (`400`). Either path rewrites the month's
-/// parquet file; only `expense_amount`/`currency` and the other facts are
+/// An empty `payload.id` means "create": the row is appended with a fresh
+/// `row_id`, which the response carries as its `id`. A non-empty `id` means
+/// "update the row with that `row_id`", which keeps its ID; this returns
+/// [`Error::NotFound`] (`404`) when the month has no such row, and
+/// [`Error::AlreadyExists`] (`409`) without changing anything when several
+/// rows share it. Either path rewrites the month's parquet file; only `expense_amount`/`currency` and the other facts are
 /// stored, since the reference-currency amount is derived at read time (see
 /// [`get_expenses_handler`]) rather than stored here.
 ///
@@ -710,6 +721,9 @@ async fn get_expenses_handler(
 /// unresolvable rate therefore never blocks a save; the row is written either
 /// way and the response reports `fx_rate` `0.0` with an empty `rate_date`,
 /// the same "unknown" pair [`get_expenses_handler`] uses.
+///
+/// [`Error::NotFound`]: finguard_rs_backend::Error::NotFound
+/// [`Error::AlreadyExists`]: finguard_rs_backend::Error::AlreadyExists
 async fn upsert_expense_handler(
     Json(payload): Json<ExpenseJson>,
 ) -> Result<Json<ExpenseJson>, AppError> {
@@ -748,7 +762,7 @@ async fn upsert_expense_handler(
     let mut de = DetailedExpenses::new(year, month)?;
 
     if payload.id.is_empty() {
-        de.add_row(
+        let new_id = de.add_row(
             &payload.name,
             payload.day,
             payload.amount,
@@ -757,19 +771,14 @@ async fn upsert_expense_handler(
             Some(&payload.secondary),
         )?;
 
-        let new_id = (de.expense_df.height() as i32 - 1).to_string();
         let mut response = payload;
         response.id = new_id;
         response.fx_rate = fx_rate;
         response.rate_date = rate_date;
         Ok(Json(response))
     } else {
-        let idx = payload
-            .id
-            .parse::<u32>()
-            .map_err(|e| finguard_rs_backend::Error::InvalidArgument(e.to_string()))?;
         de.edit_row(
-            idx,
+            &payload.id,
             Some(&payload.name),
             Some(payload.day),
             Some(payload.amount),
@@ -784,35 +793,36 @@ async fn upsert_expense_handler(
     }
 }
 
-/// `DELETE /api/expenses/:id`: remove the expense at row index `id` from
-/// `q.year`/`q.month`'s monthly parquet file. Category summaries are no
+/// `DELETE /api/expenses/:id`: remove the expense whose `row_id` is `id`
+/// from `q.year`/`q.month`'s monthly parquet file. Category summaries are no
 /// longer maintained as separate tables; [`get_expenses_handler`] derives
 /// them at read time, so nothing else needs recomputing here.
 ///
-/// Returns [`Error::InvalidArgument`] (`400`) if `id` does not parse as a
-/// `u32`.
+/// Returns [`Error::NotFound`] (`404`) when the month has no row with that
+/// `row_id`, and [`Error::AlreadyExists`] (`409`) without deleting anything
+/// when several rows share it.
+///
+/// [`Error::NotFound`]: finguard_rs_backend::Error::NotFound
+/// [`Error::AlreadyExists`]: finguard_rs_backend::Error::AlreadyExists
 async fn delete_expense_handler(
     Path(id): Path<String>,
     Query(q): Query<DeleteExpenseQuery>,
 ) -> Result<(), AppError> {
-    let idx = id
-        .parse::<u32>()
-        .map_err(|e| finguard_rs_backend::Error::InvalidArgument(e.to_string()))?;
     let mut de = DetailedExpenses::new(q.year, q.month)?;
-    de.delete_row(idx)?;
+    de.delete_row(&id)?;
     Ok(())
 }
 
 /// `GET /api/recurring`: list `q.year`'s recurring expense templates. Each
-/// [`RecurringTemplateJson::id`] is that row's position in the year's
-/// recurring-expenses table, which [`delete_recurring_handler`] expects back
-/// verbatim.
+/// [`RecurringTemplateJson::id`] is that template's stable `row_id`, which
+/// [`delete_recurring_handler`] expects back verbatim.
 async fn get_recurring_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<Vec<RecurringTemplateJson>>, AppError> {
     let rec = RecurringExpenses::new(q.year)?;
     let df = &rec.df;
 
+    let row_ids = str_col_to_vec(df, df_operations::ROW_ID_COLUMN)?;
     let names = column_strings(df, "expense_name");
     let days = column_i64(df, "expense_day");
     let amounts = column_f64(df, "expense_amount");
@@ -823,7 +833,7 @@ async fn get_recurring_handler(
     let mut list = Vec::new();
     for i in 0..df.height() {
         list.push(RecurringTemplateJson {
-            id: i.to_string(),
+            id: row_ids[i].clone(),
             name: names[i].clone(),
             day: days[i],
             amount: amounts[i],
@@ -836,7 +846,8 @@ async fn get_recurring_handler(
 }
 
 /// `POST /api/recurring`: append a recurring expense template for
-/// `payload.year` and save the table.
+/// `payload.year` and save the table. The response's `id` is the new
+/// template's `row_id`.
 ///
 /// Returns [`Error::InvalidArgument`] (`400`) if `payload.day` is outside
 /// 1..=28 (a template must fire in every month, including February).
@@ -844,7 +855,7 @@ async fn add_recurring_handler(
     Json(payload): Json<AddRecurringPayload>,
 ) -> Result<Json<RecurringTemplateJson>, AppError> {
     let mut rec = RecurringExpenses::new(payload.year)?;
-    rec.add(
+    let new_id = rec.add(
         &payload.name,
         payload.day,
         payload.amount,
@@ -853,7 +864,6 @@ async fn add_recurring_handler(
         &payload.secondary,
     )?;
 
-    let new_id = (rec.df.height() as i32 - 1).to_string();
     Ok(Json(RecurringTemplateJson {
         id: new_id,
         name: payload.name,
@@ -865,20 +875,21 @@ async fn add_recurring_handler(
     }))
 }
 
-/// `DELETE /api/recurring/:id`: remove the recurring template at row index
-/// `id` from `q.year`'s table and save.
+/// `DELETE /api/recurring/:id`: remove the recurring template whose `row_id`
+/// is `id` from `q.year`'s table and save.
 ///
-/// Returns [`Error::InvalidArgument`] (`400`) if `id` does not parse as a
-/// `u32`.
+/// Returns [`Error::NotFound`] (`404`) when the year has no template with
+/// that `row_id`, and [`Error::AlreadyExists`] (`409`) without deleting
+/// anything when several templates share it.
+///
+/// [`Error::NotFound`]: finguard_rs_backend::Error::NotFound
+/// [`Error::AlreadyExists`]: finguard_rs_backend::Error::AlreadyExists
 async fn delete_recurring_handler(
     Path(id): Path<String>,
     Query(q): Query<YearQuery>,
 ) -> Result<(), AppError> {
-    let idx = id
-        .parse::<u32>()
-        .map_err(|e| finguard_rs_backend::Error::InvalidArgument(e.to_string()))?;
     let mut rec = RecurringExpenses::new(q.year)?;
-    rec.remove(idx)?;
+    rec.remove(&id)?;
     Ok(())
 }
 
@@ -1868,7 +1879,16 @@ async fn get_monthly_fx_rates_handler(
 // Server Initialization
 // ======================================================================
 
-/// Build the route table and CORS layer, then bind and serve.
+/// Bind the listener, run the row ID migration, build the route table and
+/// CORS layer, then serve.
+///
+/// Binding comes first so that a taken or invalid address stops the process
+/// before any data file is touched. The migration
+/// ([`row_id_migration::migrate_row_ids`]) runs before serving, because every
+/// handler that loads a synced table rejects a file without row IDs.
+/// Requests that arrive during the migration wait in the listen queue. If
+/// binding or the migration fails, the process exits with status 1 and never
+/// serves a request.
 ///
 /// `FINGUARD_HOST`/`FINGUARD_PORT` override the default bind address
 /// (`127.0.0.1:3111`); both are read once at startup, not per request. CORS
@@ -1879,6 +1899,32 @@ async fn get_monthly_fx_rates_handler(
 /// the API.
 #[tokio::main]
 async fn main() {
+    let host = std::env::var("FINGUARD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("FINGUARD_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3111);
+
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .expect("Invalid address");
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("Finguard server not started: cannot listen on {addr}: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    match row_id_migration::migrate_row_ids() {
+        Ok(report) => println!("{report}"),
+        Err(err) => {
+            eprintln!("Finguard server not started: {err}");
+            std::process::exit(1);
+        }
+    }
+
     let cors = CorsLayer::permissive();
 
     let app = Router::new()
@@ -1965,18 +2011,7 @@ async fn main() {
         .route("/api/fx/monthly-rates", get(get_monthly_fx_rates_handler))
         .layer(cors);
 
-    let host = std::env::var("FINGUARD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port: u16 = std::env::var("FINGUARD_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3111);
-
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .expect("Invalid address");
-
     println!("Finguard server running on http://{}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap()
 }
 
@@ -2250,10 +2285,13 @@ mod tests {
 
         assert_eq!(response.0.fx_rate, 0.0);
         assert_eq!(response.0.rate_date, "");
-        assert_eq!(response.0.id, "0");
 
         let reloaded = DetailedExpenses::new(2026, 9).expect("reload detailed expenses");
         assert_eq!(reloaded.expense_df.height(), 1);
+        assert_eq!(
+            str_col_to_vec(&reloaded.expense_df, df_operations::ROW_ID_COLUMN).unwrap(),
+            vec![response.0.id.clone()]
+        );
         assert_eq!(
             reloaded
                 .expense_df
@@ -2926,5 +2964,394 @@ mod tests {
                 .expect("an unresolvable currency must not report as 'no data'");
         assert_eq!(allocation.unavailable_currencies, vec!["USD".to_string()]);
         assert!(allocation.slices.is_empty());
+    }
+
+    fn expense_payload(id: &str, name: &str, day: u32, amount: f64) -> ExpenseJson {
+        ExpenseJson {
+            id: id.to_string(),
+            year: 2026,
+            month: 9,
+            day,
+            name: name.to_string(),
+            amount,
+            currency: "EUR".to_string(),
+            primary: "Housing".to_string(),
+            secondary: "Rent".to_string(),
+            fx_rate: 0.0,
+            rate_date: String::new(),
+        }
+    }
+
+    async fn list_september() -> Vec<ExpenseJson> {
+        get_expenses_handler(Query(GetExpensesQuery {
+            year: 2026,
+            month: Some(9),
+            name: None,
+            category: None,
+            min: None,
+            max: None,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("get succeeds: {err}"))
+        .0
+        .expenses
+    }
+
+    fn row_ids_of(df: &polars::prelude::DataFrame) -> Vec<String> {
+        str_col_to_vec(df, df_operations::ROW_ID_COLUMN).expect("read row_id column")
+    }
+
+    /// Expenses are created, listed, edited, and deleted by `row_id`. An
+    /// edit keeps the row's ID, and deleting one row leaves the other rows'
+    /// IDs pointing at the same rows, which a position could not guarantee.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn expenses_are_addressed_by_row_id() {
+        let _temp = with_temp_env_offline();
+
+        let mut ids = Vec::new();
+        for (name, day) in [("First", 1), ("Second", 2), ("Third", 3)] {
+            let created = upsert_expense_handler(Json(expense_payload("", name, day, 10.0)))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("create succeeds: {err}"))
+                .0;
+            assert!(uuid::Uuid::parse_str(&created.id).is_ok(), "{}", created.id);
+            ids.push(created.id);
+        }
+        let listed: Vec<String> = list_september().await.into_iter().map(|e| e.id).collect();
+        assert_eq!(listed, ids);
+
+        let edited =
+            upsert_expense_handler(Json(expense_payload(&ids[2], "Third, edited", 7, 99.0)))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("edit succeeds: {err}"))
+                .0;
+        assert_eq!(edited.id, ids[2]);
+
+        delete_expense_handler(
+            Path(ids[0].clone()),
+            Query(DeleteExpenseQuery {
+                year: 2026,
+                month: 9,
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("delete succeeds: {err}"));
+
+        let remaining = list_september().await;
+        let by_id: Vec<(String, String, f64, u32)> = remaining
+            .into_iter()
+            .map(|e| (e.id, e.name, e.amount, e.day))
+            .collect();
+        assert_eq!(
+            by_id,
+            vec![
+                (ids[1].clone(), "Second".to_string(), 10.0, 2),
+                (ids[2].clone(), "Third, edited".to_string(), 99.0, 7),
+            ]
+        );
+    }
+
+    /// Editing or deleting an expense whose `row_id` the month does not
+    /// have is a `404`, and changes nothing. An old position-style ID such
+    /// as `"0"` is just an unknown ID now.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn unknown_expense_row_id_is_not_found() {
+        let _temp = with_temp_env_offline();
+        let kept = upsert_expense_handler(Json(expense_payload("", "Rent", 1, 900.0)))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("create succeeds: {err}"))
+            .0;
+
+        for unknown in ["0", "no-such-id"] {
+            let err = delete_expense_handler(
+                Path(unknown.to_string()),
+                Query(DeleteExpenseQuery {
+                    year: 2026,
+                    month: 9,
+                }),
+            )
+            .await
+            .expect_err("deleting an unknown row_id must fail");
+            assert!(matches!(err.0, finguard_rs_backend::Error::NotFound(_)));
+
+            let err = upsert_expense_handler(Json(expense_payload(unknown, "Other", 2, 1.0)))
+                .await
+                .expect_err("editing an unknown row_id must fail");
+            assert!(matches!(err.0, finguard_rs_backend::Error::NotFound(_)));
+        }
+
+        let listed = list_september().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, kept.id);
+        assert_eq!(listed[0].name, "Rent");
+    }
+
+    /// Recurring templates are created, listed, and deleted by `row_id`, and
+    /// an unknown `row_id` is a `404` that deletes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn recurring_templates_are_addressed_by_row_id() {
+        let _temp = with_temp_env_offline();
+
+        let mut ids = Vec::new();
+        for name in ["Rent", "Gym"] {
+            let created = add_recurring_handler(Json(AddRecurringPayload {
+                year: 2026,
+                name: name.to_string(),
+                day: 5,
+                amount: 40.0,
+                currency: "EUR".to_string(),
+                primary: "Leisure".to_string(),
+                secondary: "Gym".to_string(),
+            }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("create succeeds: {err}"))
+            .0;
+            assert!(uuid::Uuid::parse_str(&created.id).is_ok(), "{}", created.id);
+            ids.push(created.id);
+        }
+        let listed = get_recurring_handler(Query(YearQuery { year: 2026 }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("list succeeds: {err}"))
+            .0;
+        assert_eq!(listed.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), ids);
+
+        let err = delete_recurring_handler(Path("1".to_string()), Query(YearQuery { year: 2026 }))
+            .await
+            .expect_err("deleting an unknown row_id must fail");
+        assert!(matches!(err.0, finguard_rs_backend::Error::NotFound(_)));
+
+        delete_recurring_handler(Path(ids[0].clone()), Query(YearQuery { year: 2026 }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("delete succeeds: {err}"));
+        let listed = get_recurring_handler(Query(YearQuery { year: 2026 }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("list succeeds: {err}"))
+            .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, ids[1]);
+        assert_eq!(listed[0].name, "Gym");
+    }
+
+    /// Net worth rows keep their `row_id` through every edit route: rename,
+    /// category, link, currency, and cell updates. An investment's holdings
+    /// row and prices row keep sharing one ID.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn net_worth_edits_keep_row_ids() {
+        let _temp = with_temp_env_offline();
+        let year = 2026;
+        seed_single_month_networth(year, "EUR", "");
+        let inv = InvestmentHoldings::new(year).unwrap();
+        let investment_id = row_ids_of(&inv.df);
+        assert_eq!(row_ids_of(&inv.df_prices), investment_id);
+        let liquidity_id = row_ids_of(&Liquidity::new(year).unwrap().df);
+        let credit_debt_id = row_ids_of(&CreditsDebts::new(year).unwrap().df);
+
+        update_investment_meta_handler(
+            Path("Asset".to_string()),
+            Json(UpdateInvestmentPayload {
+                year,
+                name: Some("Renamed Asset".to_string()),
+                category: Some("Bonds".to_string()),
+                link: Some("https://example.com".to_string()),
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("investment update succeeds: {err}"));
+        for field in ["quantity", "price"] {
+            set_investment_cell_handler(Json(SetInvestmentCellPayload {
+                id: "Renamed Asset".to_string(),
+                year,
+                month: 2,
+                field: field.to_string(),
+                value: 3.0,
+            }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("investment cell succeeds: {err}"));
+        }
+
+        update_liquidity_meta_handler(
+            Path("Cash".to_string()),
+            Json(UpdateLiquidityPayload {
+                year,
+                name: Some("Renamed Cash".to_string()),
+                category: Some("Cash".to_string()),
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("liquidity update succeeds: {err}"));
+        set_liquidity_cell_handler(Json(SetLiquidityCellPayload {
+            id: "Renamed Cash".to_string(),
+            year,
+            month: 2,
+            value: 5.0,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("liquidity cell succeeds: {err}"));
+
+        update_credit_debt_meta_handler(
+            Path("Loan".to_string()),
+            Json(UpdateCreditDebtPayload {
+                year,
+                name: Some("Renamed Loan".to_string()),
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("credit/debt update succeeds: {err}"));
+        set_credits_debts_cell_handler(Json(SetCreditDebtCellPayload {
+            id: "Renamed Loan".to_string(),
+            year,
+            month: 2,
+            value: -7.0,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("credit/debt cell succeeds: {err}"));
+
+        let inv = InvestmentHoldings::new(year).unwrap();
+        assert_eq!(
+            str_col_to_vec(&inv.df, "asset_name").unwrap(),
+            vec!["Renamed Asset"]
+        );
+        assert_eq!(row_ids_of(&inv.df), investment_id);
+        assert_eq!(row_ids_of(&inv.df_prices), investment_id);
+        let liq = Liquidity::new(year).unwrap();
+        assert_eq!(
+            str_col_to_vec(&liq.df, "asset_name").unwrap(),
+            vec!["Renamed Cash"]
+        );
+        assert_eq!(row_ids_of(&liq.df), liquidity_id);
+        let cd = CreditsDebts::new(year).unwrap();
+        assert_eq!(
+            str_col_to_vec(&cd.df, "name").unwrap(),
+            vec!["Renamed Loan"]
+        );
+        assert_eq!(row_ids_of(&cd.df), credit_debt_id);
+    }
+
+    /// A file without row IDs that appears while the backend runs (for
+    /// example, restored from a backup) makes every handler that loads it
+    /// fail with the restart message, instead of silently skipping it or
+    /// handing out IDs that were never saved.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn handlers_reject_a_file_without_row_ids() {
+        use polars::prelude::*;
+        let _temp = with_temp_env_offline();
+        let mut de = DetailedExpenses::new(2026, 9).unwrap();
+        de.add_row("Rent", 1, 900.0, Some("Housing"), "EUR", Some("Rent"))
+            .unwrap();
+        let mut rec = RecurringExpenses::new(2026).unwrap();
+        rec.add("Gym", 5, 40.0, "EUR", "Leisure", "Gym").unwrap();
+        for (path, df) in [
+            (de.expense_df_path.clone(), de.expense_df.clone()),
+            (
+                finguard_rs_backend::paths::get_year_summary_path(
+                    2026,
+                    finguard_rs_backend::paths::RECURRING_EXPENSES_FILENAME,
+                )
+                .unwrap(),
+                rec.df.clone(),
+            ),
+        ] {
+            let mut old = df.drop(df_operations::ROW_ID_COLUMN).unwrap();
+            let file = std::fs::File::create(path).unwrap();
+            ParquetWriter::new(file).finish(&mut old).unwrap();
+        }
+
+        let assert_restart_error = |err: AppError| {
+            let finguard_rs_backend::Error::RowIdsMissing(message) = &err.0 else {
+                panic!("expected the missing row IDs error, got {}", err.0);
+            };
+            assert!(message.contains("Restart"), "{message}");
+        };
+
+        assert_restart_error(
+            get_expenses_handler(Query(GetExpensesQuery {
+                year: 2026,
+                month: None,
+                name: None,
+                category: None,
+                min: None,
+                max: None,
+            }))
+            .await
+            .expect_err("listing must not skip the month"),
+        );
+        assert_restart_error(
+            delete_expense_handler(
+                Path("any".to_string()),
+                Query(DeleteExpenseQuery {
+                    year: 2026,
+                    month: 9,
+                }),
+            )
+            .await
+            .expect_err("delete must fail"),
+        );
+        assert_restart_error(
+            category_totals_across_all_years("primary")
+                .await
+                .expect_err("totals must not skip the year"),
+        );
+        assert_restart_error(
+            get_recurring_handler(Query(YearQuery { year: 2026 }))
+                .await
+                .expect_err("recurring list must fail"),
+        );
+    }
+
+    /// A `row_id` shared by two rows makes delete and edit answer `409
+    /// Conflict` and leave both rows in place.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn duplicate_expense_row_id_is_a_conflict() {
+        use axum::response::IntoResponse;
+        use polars::prelude::*;
+        let _temp = with_temp_env_offline();
+        let mut de = DetailedExpenses::new(2026, 9).unwrap();
+        de.add_row("Rent", 1, 900.0, Some("Housing"), "EUR", Some("Rent"))
+            .unwrap();
+        de.add_row("Tea", 2, 3.0, Some("Out"), "EUR", Some("Cafe"))
+            .unwrap();
+        let mut twins = de.expense_df.clone();
+        twins
+            .with_column(Column::new(
+                df_operations::ROW_ID_COLUMN.into(),
+                &["twin", "twin"],
+            ))
+            .unwrap();
+        let file = std::fs::File::create(&de.expense_df_path).unwrap();
+        ParquetWriter::new(file).finish(&mut twins).unwrap();
+
+        let err = delete_expense_handler(
+            Path("twin".to_string()),
+            Query(DeleteExpenseQuery {
+                year: 2026,
+                month: 9,
+            }),
+        )
+        .await
+        .expect_err("a shared row_id must not delete");
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::CONFLICT
+        );
+
+        let err = upsert_expense_handler(Json(expense_payload("twin", "Changed", 3, 1.0)))
+            .await
+            .expect_err("a shared row_id must not edit");
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::CONFLICT
+        );
+
+        let names: Vec<String> = list_september().await.into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["Rent", "Tea"]);
     }
 }

@@ -83,8 +83,8 @@ export interface ExpenseFilter {
  * range. Without `month`, the backend loops over all 12 months and
  * concatenates their per-month expense files, skipping months whose data
  * file does not exist rather than erroring. `id` in each returned `Expense`
- * is only unique within its own year and month: it is the row's position in
- * that month's Parquet file, not a globally unique identifier.
+ * is a stable, backend-assigned opaque string ID (see `ExpenseJson` in
+ * backend/src/main.rs). Do not parse it.
  *
  * A currency that could not be resolved does not drop its rows or fail the
  * request: they come back with `fx_rate: 0` (see `ExpenseList`), and the
@@ -118,12 +118,15 @@ export async function getAllExpenses(): Promise<Expense[]> {
 
 /**
  * POST /api/expenses. Creates a new expense when `input.id` is missing or
- * empty, or edits the existing row at that index when it is set. The
+ * empty, or edits the existing row with that ID when it is set. The
  * backend infers create vs. edit from whether `id` is empty, so this
  * function always sends an `id` field (defaulting to `""`) rather than
- * omitting it. The row still saves even when its currency's rate cannot be
- * resolved; the returned `Expense` then carries `fx_rate: 0` and
- * `rate_date: ""`, the same "unknown" pair `getExpenses` uses.
+ * omitting it. On edit, the backend looks for `id` only in
+ * `input.year`/`input.month`'s file; an unknown id returns 404, so
+ * `apiFetch` throws instead of creating a row. The row still saves even
+ * when its currency's rate cannot be resolved; the returned `Expense` then
+ * carries `fx_rate: 0` and `rate_date: ""`, the same "unknown" pair
+ * `getExpenses` uses.
  */
 export async function upsertExpense(input: ExpenseWrite): Promise<Expense> {
   return apiFetch("/api/expenses", {
@@ -135,15 +138,15 @@ export async function upsertExpense(input: ExpenseWrite): Promise<Expense> {
 
 /**
  * DELETE /api/expenses/:id. `year` and `month` are required query
- * parameters because `id` alone (a per-month row index) does not identify
- * which month's file to edit.
+ * parameters because `id` alone does not tell the backend which month's
+ * file to search. An unknown id returns 404.
  */
 export async function deleteExpense(id: string, year: number, month: number): Promise<void> {
   const p = new URLSearchParams({ year: String(year), month: String(month) });
   await apiFetch(`/api/expenses/${encodeURIComponent(id)}?${p}`, { method: "DELETE" });
 }
 
-/** GET /api/recurring. Lists the recurring expense templates configured for a year. `id` is the template's row index within that year's file. */
+/** GET /api/recurring. Lists the recurring expense templates configured for a year. `id` is a stable, backend-assigned opaque string ID. Do not parse it. */
 export async function getRecurring(year: number): Promise<RecurringTemplate[]> {
   return apiFetch(`/api/recurring?year=${year}`);
 }
@@ -159,7 +162,7 @@ export async function addRecurring(
   });
 }
 
-/** DELETE /api/recurring/:id. `year` scopes which year's template file to edit. */
+/** DELETE /api/recurring/:id. `year` scopes which year's template file to edit. An unknown id returns 404. */
 export async function deleteRecurring(id: string, year: number): Promise<void> {
   await apiFetch(`/api/recurring/${encodeURIComponent(id)}?year=${year}`, { method: "DELETE" });
 }

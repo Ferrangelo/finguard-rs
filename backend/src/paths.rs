@@ -36,7 +36,10 @@ use crate::error::{Error, Result};
 
 const APP_DIR_NAME: &str = "finguard";
 const DBS_DIR_NAME: &str = "dbs";
-const PARQUET_SUFFIX: &str = "_detailed_expenses.parquet";
+const BACKUPS_DIR_NAME: &str = "backups";
+/// Suffix of a monthly detailed-expenses file name, after the zero-padded
+/// month number (`MM`).
+pub const PARQUET_SUFFIX: &str = "_detailed_expenses.parquet";
 const FX_RATES_FILE_NAME: &str = "fx_rates.json";
 
 /// Filename for the per-year primary-category summary.
@@ -83,6 +86,16 @@ pub fn get_fx_rates_path() -> Result<PathBuf> {
     let app_dir = get_data_home()?.join(APP_DIR_NAME);
     std::fs::create_dir_all(&app_dir)?;
     Ok(app_dir.join(FX_RATES_FILE_NAME))
+}
+
+/// Return `<XDG_DATA_HOME>/finguard/backups`, creating it if necessary.
+/// Data migrations copy the `dbs/` tree here before changing it. It sits
+/// next to `dbs/` rather than inside it, so a backup never contains an
+/// earlier backup and the year walkers never see it.
+pub fn get_backups_dir() -> Result<PathBuf> {
+    let backups_dir = get_data_home()?.join(APP_DIR_NAME).join(BACKUPS_DIR_NAME);
+    std::fs::create_dir_all(&backups_dir)?;
+    Ok(backups_dir)
 }
 
 /// Return `<dbs_root>/<year>/`, creating it if necessary.

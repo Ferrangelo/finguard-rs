@@ -16,6 +16,9 @@
 //! - [`expr`]: a small safe arithmetic evaluator for amount input fields.
 //! - [`fx`]: currency settings, the cached Frankfurter (ECB) exchange-rate
 //!   table, and the rate resolvers used to convert amounts between currencies.
+//! - [`row_id_migration`]: the startup migration that gives every row of the
+//!   synced tables a stable row ID, after backing up the data folder. Every
+//!   program that serves this data calls it before its first request.
 //! - [`error`]: the crate-wide [`Error`]/[`Result`] pair used by every module.
 //!
 //! Several parts of this crate deliberately reproduce behavior from the
@@ -33,5 +36,6 @@ pub mod expr;
 pub mod fx;
 pub mod paths;
 pub mod plots;
+pub mod row_id_migration;
 
 pub use error::{Error, Result};

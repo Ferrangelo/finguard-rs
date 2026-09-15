@@ -710,6 +710,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower-http 0.5.2",
+ "uuid",
 ]
 
 [[package]]
