@@ -26,18 +26,26 @@ import type {
   RecurringTemplate,
 } from "./types";
 
+// Prefixes every request. Empty by default, which keeps the relative
+// `/api/...` paths this app has always used, so Lovable's dev server and its
+// `/api` proxy still work unchanged. Set `VITE_API_BASE_URL` only for a build
+// that is not served from the backend's own origin, such as the static
+// Tauri Android build. Stripping a trailing slash here avoids a double
+// slash where a call path starts with `/api`.
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
+
 /**
- * Shared fetch wrapper for every backend call. On a non-2xx response it
- * reads the body, tries to parse it as `{ error: string }` (the shape every
- * Axum handler returns via `AppError`, see backend/src/http_error.rs), and
- * throws an `Error` with that message. Falls back to the raw response text,
- * then to `HTTP <status>`, if the body is not that shape. On success it
- * returns the parsed JSON body, or `undefined` if the response has no JSON
- * content type (used by endpoints that reply with an empty body, such as
- * deletes).
+ * Shared fetch wrapper for every backend call. Prepends `API_BASE_URL` to
+ * `url`. On a non-2xx response it reads the body, tries to parse it as
+ * `{ error: string }` (the shape every Axum handler returns via `AppError`,
+ * see backend/src/http_error.rs), and throws an `Error` with that message.
+ * Falls back to the raw response text, then to `HTTP <status>`, if the body
+ * is not that shape. On success it returns the parsed JSON body, or
+ * `undefined` if the response has no JSON content type (used by endpoints
+ * that reply with an empty body, such as deletes).
  */
 async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(url, options);
+  const res = await fetch(`${API_BASE_URL}${url}`, options);
   if (!res.ok) {
     const text = await res.text();
     let message = text;
