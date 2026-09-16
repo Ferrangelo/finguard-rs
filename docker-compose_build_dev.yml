@@ -14,9 +14,12 @@ services:
       # OVERRIDE the Dockerfile XDG defaults here:
       XDG_DATA_HOME: "/data"
       XDG_CONFIG_HOME: "/config" 
+    # FINGUARD_DATA_DIR and FINGUARD_CONFIG_DIR pin the host paths. The ${HOME}
+    # fallback expands in the environment of the process that runs compose, so under
+    # sudo it becomes /root, which the desktop user cannot read.
     volumes:
-      - "${HOME}/.local/share/finguard:/data/finguard"
-      - "${HOME}/.config/finguard:/config/finguard"
+      - "${FINGUARD_DATA_DIR:-${HOME}/.local/share/finguard}:/data/finguard"
+      - "${FINGUARD_CONFIG_DIR:-${HOME}/.config/finguard}:/config/finguard"
     restart: unless-stopped
 
   frontend:
@@ -31,7 +34,7 @@ services:
       - /app/node_modules
     environment:
       # Use the service name, not localhost. Docker's internal DNS resolves this
-      - VITE_API_URL=http://backend:3111
+      - VITE_API_URL=http://backend:${FINGUARD_PORT:-3111}
     restart: unless-stopped
 
 volumes:

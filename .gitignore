@@ -68,3 +68,6 @@ frontend/*.sln
 frontend/*.sw?
 
 backend/target/*
+
+# Local compose overrides
+/.env

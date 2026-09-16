@@ -48,6 +48,8 @@ docker compose up -d
 printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env
 ```
 
+The same `.env` file can also pin the host directories the backend data and config are mounted from, through `FINGUARD_DATA_DIR` and `FINGUARD_CONFIG_DIR`. See `.env.example` in the repository for every variable the compose file reads.
+
 Finally install with (this will pull the latest image if it doesn't already exist locally):
 
 ```
@@ -56,7 +58,11 @@ docker compose up -d
 
 Notes:
 
-- `${HOME}` is expanded on the machine where `docker compose` is run. If it is run as `root`, then `${HOME}` may expand to `/root` and bind mounts may point to `/root/.local/share` and `/root/.config`.
+- With no `.env` entry, the bind mounts fall back to `${HOME}`, which is expanded in the environment of the process that runs `docker compose`. Under `sudo` that is `/root`, so the mounts point at `/root/.local/share/finguard` and `/root/.config/finguard`, which your own account cannot read. Set `FINGUARD_DATA_DIR` and `FINGUARD_CONFIG_DIR` in `.env` to make the paths explicit:
+
+```
+printf 'FINGUARD_DATA_DIR=%s/.local/share/finguard\nFINGUARD_CONFIG_DIR=%s/.config/finguard\n' "$HOME" "$HOME" >> .env
+```
 
 #### Update docker image
 
@@ -79,6 +85,18 @@ The UI is available at `http://localhost:5173` as soon as the container starts.
 ```bash
 # stop and remove
 docker compose down
+```
+
+#### Run the same stack with rootless Podman
+
+`run-podman.sh` starts the same two `ghcr.io/ferrangelo/finguard-rs-backend` and `ghcr.io/ferrangelo/finguard-rs-frontend` images without Docker. Like `docker-compose.yml`, it is a single self-contained file, so downloading just `run-podman.sh` and running it is enough. It pulls both images, creates a user-defined `finguard` network so the frontend container can resolve `backend` by name, and mounts `~/.local/share/finguard` and `~/.config/finguard` from the account that runs it. `FINGUARD_PORT` (default `3111`) and `FRONTEND_PORT` (default `5173`) are read from the environment. The script sets `PUID=0` and `PGID=0` on purpose, the opposite of the Docker case: rootless Podman maps container UID 0 to your host user, while any other value lands in the subuid range at 100000 and up, where you cannot read the files it writes.
+
+Cloning the repository is one way to get the script:
+
+```bash
+git clone https://github.com/Ferrangelo/finguard-rs.git
+cd finguard-rs
+./run-podman.sh
 ```
 
 ### Option B: Build and run from source
@@ -191,6 +209,7 @@ finguard-rs/
 │   ├── Dockerfile
 │   └── package.json
 ├── run.sh               # Unified startup script
+├── run-podman.sh        # Runs the published images under rootless Podman
 └── README.md            # This file
 ```
 
