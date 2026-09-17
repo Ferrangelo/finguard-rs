@@ -3,7 +3,9 @@ name = "finguard-mobile"
 version = "0.1.0"
 description = "finguard Android app, built with Tauri"
 edition = "2021"
-rust-version = "1.77.2"
+# The `finguard_rs_backend` dependency below is edition 2024, which no
+# compiler before 1.85 can build. The container builds this crate with 1.98.1.
+rust-version = "1.85"
 
 [lib]
 name = "app_lib"
@@ -25,3 +27,24 @@ log = "0.4"
 tauri = { version = "=2.11.5", features = [] }
 # Pinned for the same reason: the offline Gradle cache matches 2.9.1.
 tauri-plugin-log = "=2.9.1"
+# The whole backend, served in process: the app opens no network port, so the
+# `api_request` command calls the router directly.
+finguard_rs_backend = { path = "../../backend" }
+# Must resolve to the same axum version the backend uses, or the router this
+# crate calls would be a different type than the one it builds.
+axum = "0.7"
+# For `ServiceExt::oneshot`, which runs one request through the router.
+tower = { version = "0.5", features = ["util"] }
+# For the `watch` channel that makes an API call wait until startup has run
+# the migration, and the timeout that bounds that wait. Already in the graph
+# through the backend, but named here so trimming the backend's tokio
+# features cannot break this crate silently.
+tokio = { version = "1", features = ["sync", "time"] }
+
+[profile.dev]
+# Without this the debug info of the backend and Polars makes
+# libapp_lib.so about 1.7 GB and the debug APK about 1.8 GB. Dropping debug
+# info leaves about 370 MB and keeps function names in a native crash trace.
+# A profile set here applies to every crate in this build, including
+# finguard_rs_backend and Polars, so `backend/` needs no change.
+strip = "debuginfo"
