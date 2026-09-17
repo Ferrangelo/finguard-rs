@@ -37,6 +37,7 @@ use crate::error::{Error, Result};
 const APP_DIR_NAME: &str = "finguard";
 const DBS_DIR_NAME: &str = "dbs";
 const BACKUPS_DIR_NAME: &str = "backups";
+const SYNC_DIR_NAME: &str = "sync";
 /// Suffix of a monthly detailed-expenses file name, after the zero-padded
 /// month number (`MM`).
 pub const PARQUET_SUFFIX: &str = "_detailed_expenses.parquet";
@@ -96,6 +97,16 @@ pub fn get_backups_dir() -> Result<PathBuf> {
     let backups_dir = get_data_home()?.join(APP_DIR_NAME).join(BACKUPS_DIR_NAME);
     std::fs::create_dir_all(&backups_dir)?;
     Ok(backups_dir)
+}
+
+/// Return `<XDG_DATA_HOME>/finguard/sync`, creating it if necessary. The sync
+/// change log written by [`crate::sync`] lives here. It sits next to `dbs/`
+/// rather than inside it, so the year walkers and the backup copier never see
+/// it.
+pub fn get_sync_dir() -> Result<PathBuf> {
+    let sync_dir = get_data_home()?.join(APP_DIR_NAME).join(SYNC_DIR_NAME);
+    std::fs::create_dir_all(&sync_dir)?;
+    Ok(sync_dir)
 }
 
 /// Return `<dbs_root>/<year>/`, creating it if necessary.

@@ -58,6 +58,21 @@ pub enum Error {
     #[error("{0}")]
     RowIdsMissing(String),
 
+    /// Another handle, in this process or another one, already holds the sync
+    /// change log at `path`. Only one writer at a time may append to it,
+    /// because two would recover the same clock state and then issue the same
+    /// stamps, and a stamp has to name one change forever.
+    #[error(
+        "the sync change log at {} is already open: another process, or another handle in this \
+         one, holds it. Only one writer at a time may append, because two would issue the same \
+         stamps.",
+        path.display()
+    )]
+    SyncLogLocked {
+        /// The change log the caller tried to open.
+        path: std::path::PathBuf,
+    },
+
     /// The row ID migration failed on `path`. The backend must not serve
     /// requests after this error.
     #[error("row ID migration failed for {}: {source}", path.display())]

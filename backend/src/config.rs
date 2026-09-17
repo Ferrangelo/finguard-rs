@@ -55,7 +55,7 @@ pub struct KnownCategories {
 }
 
 /// Return the finguard config directory, creating it if necessary.
-fn get_config_dir() -> Result<PathBuf> {
+pub(crate) fn get_config_dir() -> Result<PathBuf> {
     let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {

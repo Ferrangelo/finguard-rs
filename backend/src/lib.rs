@@ -23,6 +23,9 @@
 //! - [`row_id_migration`]: the startup migration that gives every row of the
 //!   synced tables a stable row ID, after backing up the data folder. Every
 //!   program that serves this data calls it before its first request.
+//! - [`sync`]: the append-only change log under
+//!   `$XDG_DATA_HOME/finguard/sync/`, its hybrid logical clock, and this
+//!   device's id. Nothing writes to it yet.
 //! - [`error`]: the crate-wide [`Error`]/[`Result`] pair used by every module.
 //!
 //! Several parts of this crate deliberately reproduce behavior from the
@@ -43,5 +46,6 @@ mod http_error;
 pub mod paths;
 pub mod plots;
 pub mod row_id_migration;
+pub mod sync;
 
 pub use error::{Error, Result};

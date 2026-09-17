@@ -35,6 +35,10 @@ impl IntoResponse for AppError {
             | Error::RowIdsMissing(_)
             | Error::RowIdMigration { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Network(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // Another writer holds the change log. The request can succeed
+            // once that writer exits, so this is the one retryable failure
+            // here, not a permanent one.
+            Error::SyncLogLocked { .. } => StatusCode::SERVICE_UNAVAILABLE,
         };
 
         let body = ErrorBody {
