@@ -91,12 +91,15 @@ fn month_labels() -> Vec<String> {
 /// name is the key), nor do the legacy `primaries.parquet` and
 /// `secondaries.parquet` summaries.
 ///
-/// Each value is a random UUID v4 string from [`new_row_id`]. Every code
-/// path that creates a row sets a fresh one, and edits, renames, and cell
-/// updates keep it. An investment asset has one ID, shared by its
-/// `investments.parquet` and `investments_prices.parquet` rows. Only
-/// [`crate::row_id_migration`] assigns IDs to rows that lack one; every
-/// loader here rejects such a file with [`Error::RowIdsMissing`].
+/// Each value is a random UUID v4 string from [`new_row_id`], except a row
+/// `POST /api/recurring/apply` generates: that ID is derived from the
+/// recurring template and the target month (see
+/// [`RecurringExpenses::pending_for_month`]), so the desktop and the phone
+/// produce the same ID for the same template and month. Edits, renames, and
+/// cell updates keep whichever ID a row already has. An investment asset has
+/// one ID, shared by its `investments.parquet` and `investments_prices.parquet`
+/// rows. Only [`crate::row_id_migration`] assigns IDs to rows that lack one;
+/// every loader here rejects such a file with [`Error::RowIdsMissing`].
 pub const ROW_ID_COLUMN: &str = "row_id";
 
 /// Return a fresh random row ID for [`ROW_ID_COLUMN`].
@@ -156,6 +159,16 @@ fn require_single_row(df: &DataFrame, row_id: &str, kind: &str, place: &str) -> 
              Each row ID must be unique; the data file needs repair."
         ))),
     }
+}
+
+/// Whether any row of `df` already has `row_id` as its [`ROW_ID_COLUMN`]
+/// value.
+fn has_row_id(df: &DataFrame, row_id: &str) -> Result<bool> {
+    Ok(df
+        .column(ROW_ID_COLUMN)?
+        .str()?
+        .iter()
+        .any(|id| id == Some(row_id)))
 }
 
 // ======================================================================
@@ -442,6 +455,43 @@ impl DetailedExpenses {
         currency: &str,
         secondary_category: Option<&str>,
     ) -> Result<String> {
+        let row_id = new_row_id();
+        self.add_row_with_id(
+            &row_id,
+            expense_name,
+            expense_day,
+            expense_amount,
+            primary_category,
+            currency,
+            secondary_category,
+        )?;
+        Ok(row_id)
+    }
+
+    /// Append an expense row under the caller-supplied `row_id` instead of a
+    /// fresh one, save the updated dataframe.
+    ///
+    /// [`Self::add_row`] is the ordinary entry point and generates its own
+    /// ID; this exists so [`RecurringExpenses::insert_resolved`] can give a
+    /// generated row the ID derived from its template and target month.
+    ///
+    /// The caller owns `row_id` uniqueness: this method does not check
+    /// whether `row_id` already appears in `self.expense_df`, it only
+    /// appends. [`require_single_row`] depends on every row's ID being
+    /// unique within the month, so a caller that inserts a duplicate ID
+    /// leaves that row (and the one it collides with) permanently rejected
+    /// by every future edit or delete.
+    #[allow(clippy::too_many_arguments)]
+    fn add_row_with_id(
+        &mut self,
+        row_id: &str,
+        expense_name: &str,
+        expense_day: u32,
+        expense_amount: f64,
+        primary_category: Option<&str>,
+        currency: &str,
+        secondary_category: Option<&str>,
+    ) -> Result<()> {
         let mut primary = primary_category.map(|s| s.to_string());
         let mut secondary = secondary_category.map(|s| s.to_string());
 
@@ -481,7 +531,6 @@ impl DetailedExpenses {
                 ))
             })?;
 
-        let row_id = new_row_id();
         let new_row = DataFrame::new_infer_height(vec![
             Column::new("expense_name".into(), &[expense_name]),
             date_series("expense_date", &[date]).into(),
@@ -495,12 +544,12 @@ impl DetailedExpenses {
                 "secondary_category".into(),
                 &[normalize_category_value(&secondary)],
             ),
-            Column::new(ROW_ID_COLUMN.into(), &[row_id.as_str()]),
+            Column::new(ROW_ID_COLUMN.into(), &[row_id]),
         ])?;
 
         self.expense_df = concat_df_diagonal(&[self.expense_df.clone(), new_row])?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
-        Ok(row_id)
+        Ok(())
     }
 
     /// Succeed when exactly one row of this month has `row_id`; see
@@ -1683,6 +1732,11 @@ fn empty_recurring_df() -> DataFrame {
 /// straight to [`RecurringExpenses::insert_resolved`].
 #[derive(Debug, Clone)]
 pub struct PendingRecurringRow {
+    /// The [`ROW_ID_COLUMN`] value the inserted row must get: the template's
+    /// own `row_id` and the target month, from [`derived_recurring_row_id`].
+    /// Both devices derive the same value for the same template and month,
+    /// so a later sync merges the rows instead of duplicating them.
+    pub row_id: String,
     /// The expense name to insert.
     pub expense_name: String,
     /// Day of month (1..=28) the generated row lands on.
@@ -1695,6 +1749,15 @@ pub struct PendingRecurringRow {
     pub primary_category: String,
     /// Secondary category to assign to the new row.
     pub secondary_category: String,
+}
+
+/// Derive the [`ROW_ID_COLUMN`] value for a row that `/api/recurring/apply`
+/// generates from `template_row_id` for `year`/`month`. Both the desktop and
+/// the phone hold the same template row and compute the same target month,
+/// so they derive the same ID and a later sync merges the rows instead of
+/// duplicating them.
+fn derived_recurring_row_id(template_row_id: &str, year: i32, month: u32) -> String {
+    format!("{template_row_id}:{year:04}-{month:02}")
 }
 
 /// Manage recurring monthly expense definitions, stored per year in
@@ -1781,9 +1844,14 @@ impl RecurringExpenses {
         self.save()
     }
 
-    /// Return every recurring definition not yet present in `de`'s month
-    /// (matched by `expense_name` and the day component of `expense_date`,
-    /// same duplicate check the old single-step `apply_to_month` used).
+    /// Return every recurring definition not yet present in `de`'s month.
+    ///
+    /// Skips a template when the target month already holds a row whose
+    /// [`ROW_ID_COLUMN`] equals [`derived_recurring_row_id`] for that
+    /// template (a row a previous apply generated, on either device), or a
+    /// row with the same `expense_name` and the day component of
+    /// `expense_date` (a row from before derived IDs existed, so it carries
+    /// a random UUID that the first check cannot match).
     pub fn pending_for_month(&self, de: &DetailedExpenses) -> Result<Vec<PendingRecurringRow>> {
         let names = str_col_to_vec(&self.df, "expense_name")?;
         let days: Vec<i64> = self
@@ -1803,21 +1871,23 @@ impl RecurringExpenses {
         let currencies = str_col_to_vec(&self.df, "currency")?;
         let primaries = str_col_to_vec(&self.df, "primary_category")?;
         let secondaries = str_col_to_vec(&self.df, "secondary_category")?;
+        let template_ids = str_col_to_vec(&self.df, ROW_ID_COLUMN)?;
 
         let mut pending = Vec::new();
         for i in 0..names.len() {
             let name = &names[i];
             let day = days[i];
+            let row_id = derived_recurring_row_id(&template_ids[i], de.year, de.month);
 
-            // Check for duplicate: same name and same day-of-month already present.
             let existing = de
                 .expense_df
                 .clone()
                 .lazy()
                 .filter(
-                    col("expense_name")
+                    (col("expense_name")
                         .eq(lit(name.as_str()))
-                        .and(col("expense_date").dt().day().eq(lit(day as i8))),
+                        .and(col("expense_date").dt().day().eq(lit(day as i8))))
+                    .or(col(ROW_ID_COLUMN).eq(lit(row_id.as_str()))),
                 )
                 .collect()?;
             if existing.height() > 0 {
@@ -1825,6 +1895,7 @@ impl RecurringExpenses {
             }
 
             pending.push(PendingRecurringRow {
+                row_id,
                 expense_name: name.clone(),
                 expense_day: day as u32,
                 expense_amount: amounts[i],
@@ -1836,8 +1907,16 @@ impl RecurringExpenses {
         Ok(pending)
     }
 
-    /// Insert `rows` (as produced by [`Self::pending_for_month`]) into `de`,
-    /// and return the inserted names.
+    /// Insert `rows` (as produced by [`Self::pending_for_month`]) into `de`
+    /// under each row's derived ID, and return the inserted names.
+    ///
+    /// Skips a row whose derived ID is already present in `de.expense_df`
+    /// and does not count it in the returned names. This guards against two
+    /// recurring templates sharing a `row_id` (a hand-copied or restored
+    /// `recurring_expenses.parquet`): without the check, both would derive
+    /// the same ID for the month and both would be inserted, leaving the
+    /// month with a duplicate `row_id` that [`require_single_row`] then
+    /// rejects for every future edit or delete of either row.
     pub fn insert_resolved(
         &self,
         de: &mut DetailedExpenses,
@@ -1845,7 +1924,11 @@ impl RecurringExpenses {
     ) -> Result<Vec<String>> {
         let mut added = Vec::new();
         for row in rows {
-            de.add_row(
+            if has_row_id(&de.expense_df, &row.row_id)? {
+                continue;
+            }
+            de.add_row_with_id(
+                &row.row_id,
                 &row.expense_name,
                 row.expense_day,
                 row.expense_amount,
@@ -1868,9 +1951,14 @@ impl RecurringExpenses {
 mod tests {
     use super::*;
 
-    /// Point `XDG_DATA_HOME` (and `HOME`, as a guard) at a fresh temp
-    /// directory so `InvestmentHoldings` never touches the user's real data
-    /// under `~/.local/share/finguard/`.
+    /// Point `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and `HOME` (as a guard) at a
+    /// fresh temp directory so a test never touches the user's real data
+    /// under `~/.local/share/finguard/` or config under `~/.config/finguard/`.
+    ///
+    /// `XDG_CONFIG_HOME` must be set explicitly rather than left to `HOME`'s
+    /// `$HOME/.config` fallback: a caller's environment can already export
+    /// `XDG_CONFIG_HOME`, which would then win over `HOME` and point
+    /// `config::get_config_dir` at the real `/home/dev/.config/finguard`.
     ///
     /// # Safety
     ///
@@ -1881,6 +1969,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         unsafe {
             std::env::set_var("XDG_DATA_HOME", dir.path());
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
             std::env::set_var("HOME", dir.path());
         }
         dir
@@ -2240,6 +2329,219 @@ mod tests {
         assert_eq!(
             str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
             vec!["EUR", "USD"]
+        );
+    }
+
+    /// Applying a month must give every generated row the ID
+    /// `<template row_id>:<year>-<month>`, the ID that lets a later sync
+    /// merge the same generated row from two devices.
+    #[test]
+    #[serial_test::serial]
+    fn apply_recurring_gives_generated_rows_derived_ids() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows");
+        recurring
+            .insert_resolved(&mut de, &pending)
+            .expect("insert pending rows");
+
+        let row_ids = str_col_to_vec(&de.expense_df, ROW_ID_COLUMN).expect("read row_id column");
+        assert_eq!(row_ids, vec![format!("{template_id}:2026-03")]);
+    }
+
+    /// Applying the same month a second time must add nothing: the row
+    /// generated the first time already carries the derived ID, so
+    /// `pending_for_month` skips the template and the row count is unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn apply_recurring_twice_adds_nothing_second_time() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let first_pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows");
+        let first_added = recurring
+            .insert_resolved(&mut de, &first_pending)
+            .expect("insert pending rows");
+        assert_eq!(first_added.len(), 1);
+
+        let second_pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows again");
+        assert!(
+            second_pending.is_empty(),
+            "a second apply must find nothing pending"
+        );
+        assert_eq!(de.expense_df.height(), 1, "the row count must not change");
+    }
+
+    /// A month already holding a row with the template's name and day, but a
+    /// random UUID `row_id` from before derived IDs existed, must still be
+    /// skipped: `pending_for_month` keeps the name-and-day check for exactly
+    /// this case.
+    #[test]
+    #[serial_test::serial]
+    fn apply_recurring_skips_legacy_row_with_random_id() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        de.add_row("Rent", 1, 1_000.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add a legacy row with a random row_id");
+
+        let pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows");
+        assert!(
+            pending.is_empty(),
+            "the name-and-day match must still skip the template"
+        );
+    }
+
+    /// Two `DetailedExpenses` loads of the same month must derive the same
+    /// ID for the same template, independently of each other: this is the
+    /// property sync depends on to merge, rather than duplicate, the rows
+    /// each device generates from the same recurring template.
+    #[test]
+    #[serial_test::serial]
+    fn pending_for_month_derives_same_id_across_instances() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+
+        let de_a = DetailedExpenses::new(2026, 3).expect("load march expenses (device a)");
+        let de_b = DetailedExpenses::new(2026, 3).expect("load march expenses (device b)");
+
+        let pending_a = recurring
+            .pending_for_month(&de_a)
+            .expect("compute pending rows (a)");
+        let pending_b = recurring
+            .pending_for_month(&de_b)
+            .expect("compute pending rows (b)");
+
+        assert_eq!(pending_a.len(), 1);
+        assert_eq!(pending_b.len(), 1);
+        assert_eq!(pending_a[0].row_id, pending_b[0].row_id);
+        assert_eq!(pending_a[0].row_id, format!("{template_id}:2026-03"));
+    }
+
+    /// After a generated row is renamed (still keeping its `row_id`, as
+    /// [`DetailedExpenses::edit_row`] guarantees), the name-and-day check can
+    /// no longer see it, so `pending_for_month` must still skip the template
+    /// through the derived-ID check alone. Deleting that check's `.or(...)`
+    /// branch was confirmed to make this test fail (see the change report).
+    #[test]
+    #[serial_test::serial]
+    fn pending_for_month_skips_generated_row_after_it_is_renamed() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows");
+        let row_id = pending[0].row_id.clone();
+        recurring
+            .insert_resolved(&mut de, &pending)
+            .expect("insert pending rows");
+
+        de.edit_row(
+            &row_id,
+            Some("No Longer Rent"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("rename the generated row, keeping its row_id");
+
+        let second_pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows after the rename");
+        assert!(
+            second_pending.is_empty(),
+            "the derived-ID check must still skip the renamed row"
+        );
+    }
+
+    /// Two recurring templates sharing a `row_id` (for example a
+    /// hand-restored `recurring_expenses.parquet`) must not both land in the
+    /// same month: both derive the same ID for the month, and inserting both
+    /// would leave the month with a duplicate `row_id` that
+    /// `require_single_row` then rejects for every future edit or delete.
+    #[test]
+    #[serial_test::serial]
+    fn insert_resolved_skips_a_second_template_sharing_a_row_id() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add the first recurring template");
+
+        // Simulate a corrupted or hand-restored file: a second template that
+        // shares the first template's row_id instead of getting its own.
+        let duplicate_template = DataFrame::new_infer_height(vec![
+            Column::new("expense_name".into(), &["Internet"]),
+            Column::new("expense_day".into(), &[5i64]),
+            Column::new("expense_amount".into(), &[40.0]),
+            Column::new("currency".into(), &["EUR"]),
+            Column::new("primary_category".into(), &["Housing"]),
+            Column::new("secondary_category".into(), &["Internet"]),
+            Column::new(ROW_ID_COLUMN.into(), &[template_id.as_str()]),
+        ])
+        .expect("build a duplicate-id template row");
+        recurring.df = concat_df_diagonal(&[recurring.df.clone(), duplicate_template])
+            .expect("append the duplicate-id template");
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows");
+        assert_eq!(
+            pending.len(),
+            2,
+            "both templates derive the same ID and are both pending"
+        );
+
+        let added = recurring
+            .insert_resolved(&mut de, &pending)
+            .expect("insert pending rows");
+        assert_eq!(
+            added,
+            vec!["Rent".to_string()],
+            "the second template must be skipped, and not counted as added"
+        );
+        assert_eq!(
+            de.expense_df.height(),
+            1,
+            "only one row may land in the month under the shared id"
         );
     }
 

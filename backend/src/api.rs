@@ -890,10 +890,14 @@ async fn delete_recurring_handler(
 }
 
 /// `POST /api/recurring/apply`: insert every recurring template for
-/// `payload.year` into `payload.month`'s detailed-expenses table, skipping
-/// templates that already have a matching row (same name and day-of-month) so
-/// the endpoint is safe to call more than once for the same month. Returns
-/// the number of rows actually added.
+/// `payload.year` into `payload.month`'s detailed-expenses table. Each
+/// inserted row's ID is derived from its template and the target month, so
+/// the desktop and the phone generate the same ID for the same template and
+/// month. A template is skipped when the month already holds a row with that
+/// derived ID (a previous apply, on either device) or a row with the same
+/// name and day-of-month (from before derived IDs existed). This makes the
+/// endpoint safe to call more than once for the same month. Returns the
+/// number of rows actually added.
 async fn apply_recurring_handler(
     Json(payload): Json<ApplyRecurringPayload>,
 ) -> Result<Json<u32>, AppError> {
