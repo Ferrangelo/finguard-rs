@@ -28,6 +28,10 @@
 //!   `$XDG_DATA_HOME/finguard/sync/`, its hybrid logical clock, and this
 //!   device's id. Every method in [`df_operations`] that saves a change
 //!   appends one entry here, right after the write that saved it.
+//! - [`merge`]: the merge decision engine. Decides what a batch of changes
+//!   from another device does to this device's data, as pure logic over two
+//!   [`sync`] logs: it touches no file and writes nothing. Nothing calls it
+//!   yet.
 //! - [`sync_baseline`]: the startup pass that records the rows a data folder
 //!   already holds, so the log describes the whole current state rather than
 //!   starting mid history. It runs after [`row_id_migration`], writes nothing
@@ -51,6 +55,7 @@ pub mod error;
 pub mod expr;
 pub mod fx;
 mod http_error;
+pub mod merge;
 pub mod paths;
 pub mod plots;
 pub mod row_id_migration;
