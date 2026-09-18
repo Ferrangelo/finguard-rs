@@ -29,9 +29,14 @@ use tokio::sync::{Mutex, MutexGuard};
 
 static WRITE_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// A held data write lock. A crate function that must run under the lock
+/// without taking it, because its caller already holds it for a longer run,
+/// takes a reference to one of these as proof.
+pub type WriteGuard = MutexGuard<'static, ()>;
+
 /// Wait for the data write lock from async code. The data is free again when
 /// the guard drops.
-pub async fn lock() -> MutexGuard<'static, ()> {
+pub async fn lock() -> WriteGuard {
     WRITE_LOCK.lock().await
 }
 
@@ -44,7 +49,7 @@ pub async fn lock() -> MutexGuard<'static, ()> {
 /// [`tokio::sync::Mutex::blocking_lock`] does: blocking a runtime worker
 /// there could stall the very request holding the lock. Move the call to
 /// [`tokio::task::spawn_blocking`] instead.
-pub fn lock_blocking() -> MutexGuard<'static, ()> {
+pub fn lock_blocking() -> WriteGuard {
     WRITE_LOCK.blocking_lock()
 }
 

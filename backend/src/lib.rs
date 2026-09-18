@@ -39,9 +39,16 @@
 //! - [`sync_baseline`]: the startup pass that records the rows a data folder
 //!   already holds, so the log describes the whole current state rather than
 //!   starting mid history. It runs after [`row_id_migration`], writes nothing
-//!   when the log already holds a line, and takes the log's single writer
-//!   lock for the life of the process. Every program that serves this data
-//!   calls it before its first request.
+//!   when its marker says the folder is recorded, never records on a device
+//!   that has a sync peer, and takes the log's single writer lock for the
+//!   life of the process. Every program that serves this data calls it
+//!   before its first request.
+//! - [`sync_peers`]: the devices this one is paired with, stored in the
+//!   config directory beside the device id.
+//! - [`sync_exchange`]: one sync round between the desktop hub and a phone,
+//!   as messages and the functions each side calls at each step, plus the
+//!   log health check, the phone reset from the hub, and the hub repair. It
+//!   opens no connection: the transport carries its messages.
 //! - [`error`]: the crate-wide [`Error`]/[`Result`] pair used by every module.
 //!
 //! Several parts of this crate deliberately reproduce behavior from the
@@ -54,6 +61,7 @@
 
 pub mod api;
 pub mod config;
+mod dbs_backup;
 pub mod df_operations;
 pub mod error;
 pub mod expr;
@@ -66,6 +74,8 @@ pub mod plots;
 pub mod row_id_migration;
 pub mod sync;
 pub mod sync_baseline;
+pub mod sync_exchange;
+pub mod sync_peers;
 pub mod write_lock;
 
 pub use error::{Error, Result};

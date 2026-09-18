@@ -32,7 +32,7 @@ use crate::paths::{
     LIQUIDITY_FILENAME, PRIMARIES_FILENAME, RECURRING_EXPENSES_FILENAME, SECONDARIES_FILENAME,
     get_dbs_root, get_monthly_parquet_path, get_year_summary_path, year_month_from_parquet_path,
 };
-use crate::sync::{self, ChangeOp, ChangeOrigin, ChangeTable};
+use crate::sync::{self, ChangeOp, ChangeOrigin, ChangeTable, IncompleteReason};
 
 // ======================================================================
 // Constants
@@ -429,7 +429,10 @@ fn record(table: ChangeTable, row_id: &str, op: Result<ChangeOp>) {
 /// the change a second time, and rolling the save back would leave the log
 /// describing data no file holds: a failed append can still have put a
 /// complete line on disk (see [`crate::sync::ChangeLog::append`]). A failure
-/// is warned about on stderr instead.
+/// is warned about on stderr instead, and marks the log incomplete (see
+/// [`crate::sync::log_incomplete_path`]), so sync refuses to trust it until a
+/// repair. Writing the marker is best effort too: when it fails, the warning
+/// says so.
 ///
 /// The warning names the table, its year, and the reason the append failed.
 /// That reason is an error message from this crate, from Polars, or from
@@ -454,10 +457,22 @@ fn record_with_origin(
         }
     });
     if let Err(err) = appended {
+        // The marker is what lets sync find out later: without it nothing
+        // records that the log and the data now disagree. Best effort, for
+        // the same reason the append failure itself is only a warning.
+        let marked = match sync::mark_log_incomplete(IncompleteReason::AppendFailed) {
+            Ok(()) => {
+                "The log is marked incomplete, so sync stops until it is repaired.".to_string()
+            }
+            Err(mark_err) => format!(
+                "Marking the log incomplete failed too ({mark_err}), so sync cannot detect this \
+                 gap by itself."
+            ),
+        };
         eprintln!(
             "Change log: the change to {described:?} is saved, but recording it failed ({err}). \
              This device's log no longer describes all of its own data, so a later sync can miss \
-             that change."
+             that change. {marked}"
         );
     }
 }

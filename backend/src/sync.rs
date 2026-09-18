@@ -1,9 +1,13 @@
 //! The sync change log: what changed, on which device, and in what order.
 //!
 //! Every change to a synced table appends one JSON object, on one line, to
-//! `<data_home>/finguard/sync/changelog.jsonl`. Appending is the only write,
-//! so the file stays readable by eye and a failure can damage at most the line
-//! being written. Nothing in this module reads or writes a Parquet file: a
+//! `<data_home>/finguard/sync/changelog.jsonl`. Appending is the only write
+//! in ordinary use, so the file stays readable by eye and a failure can damage
+//! at most the line being written. Two sync repairs in
+//! [`crate::sync_exchange`] also change the file, both through the open
+//! handle: a phone reset empties it (`ChangeLog::empty_for_reset`) and a hub
+//! repair drops its damaged lines (`ChangeLog::rewrite_readable`).
+//! Nothing in this module reads or writes a Parquet file: a
 //! later part calls [`ChangeLog::append`] from the data layer, and a later step
 //! ships the entries between devices.
 //!
@@ -100,6 +104,7 @@ use crate::paths::get_sync_dir;
 
 const CHANGELOG_FILE_NAME: &str = "changelog.jsonl";
 const DEVICE_ID_FILE_NAME: &str = "device_id";
+const LOG_INCOMPLETE_FILE_NAME: &str = "log_incomplete";
 
 /// The longest line a read will hold in memory. A corrupt run of bytes with no
 /// newline in it must not make the reader allocate the rest of the file. An
@@ -735,6 +740,107 @@ impl ChangeLog {
         write_lines(&mut state, &lines)
     }
 
+    /// Empty the log file through this open handle, keeping the clock where
+    /// it is. Only a phone reset from the hub calls this, holding the data
+    /// write lock, right before it stores the hub's whole log.
+    ///
+    /// The file is truncated in place rather than replaced, because
+    /// [`shared_log`] caches this handle by path: a new file renamed over
+    /// the old one would leave the cache appending to an unlinked inode. The
+    /// in-memory clock is untouched, so every stamp issued afterwards is
+    /// still above every stamp this handle issued before. After a restart
+    /// the clock recovers from the stored entries alone, which can put it
+    /// below a stamp that was only on a discarded line; see
+    /// [`crate::sync_exchange::reset_phone_from_hub`] for why that is safe.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Io`] when the truncation or the flush fails. The file
+    /// may then still hold some or all of its lines.
+    pub(crate) fn empty_for_reset(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.file.set_len(0)?;
+        state.file.sync_data()?;
+        state.needs_newline = false;
+        Ok(())
+    }
+
+    /// Rewrite the log to hold every line this version can read, verbatim
+    /// and in the same order, and nothing else: corrupt lines, overlong
+    /// lines, lines a newer version wrote, and an unfinished final line that
+    /// does not parse all go. Returns how many lines were kept and dropped.
+    ///
+    /// Only a hub repair calls this, holding the data write lock. The new
+    /// file is written beside the log, flushed, and renamed over it, so a
+    /// crash leaves either the old log or the complete new one. The open
+    /// handle inside this `ChangeLog` is then swapped for the new file's, so
+    /// [`shared_log`] keeps appending to the file at the path, not to the
+    /// unlinked old inode.
+    ///
+    /// The single writer lock moves with the file: the new handle takes it
+    /// on the temporary file before the rename, so from the moment the new
+    /// file carries the log's name it is already locked, and no other
+    /// process can open and lock it in between. The old handle keeps its
+    /// lock on the old inode until it is dropped at the swap, which protects
+    /// nothing any more because no name leads to that inode.
+    ///
+    /// The clock is not moved back. Dropped lines may have held the largest
+    /// stamps, and the in-memory clock stays above them, so the entries the
+    /// caller appends next, a fresh baseline, carry stamps above every
+    /// dropped line too, and a restart recovers the clock from those.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Io`] when the log cannot be read or the new file
+    /// cannot be written, flushed, or renamed, and
+    /// [`crate::Error::SyncLogLocked`] naming the temporary file when
+    /// another handle holds a lock on it. Before the rename the old log is
+    /// untouched; the temporary file is removed on a failure.
+    pub(crate) fn rewrite_readable(&self) -> Result<LogRewrite> {
+        let path = changelog_path()?;
+        let temp_path = path.with_file_name(format!(".{CHANGELOG_FILE_NAME}.tmp"));
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let (lines, dropped) = readable_lines(&path)?;
+        // A leftover from a repair that crashed before its rename. Nothing
+        // else writes this name, and the old log is still whole.
+        match std::fs::remove_file(&temp_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&temp_path)?;
+        let written = (|| -> Result<()> {
+            lock_single_writer(&file, &temp_path)?;
+            let mut buffer = Vec::new();
+            for line in &lines {
+                buffer.extend_from_slice(line.as_bytes());
+                buffer.push(b'\n');
+            }
+            file.write_all(&buffer)?;
+            file.sync_data()?;
+            std::fs::rename(&temp_path, &path)?;
+            Ok(())
+        })();
+        if let Err(err) = written {
+            // The write error is the one to report. A leftover temporary
+            // file is removed by the next repair.
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err);
+        }
+        sync_parent_dir(&path);
+
+        state.file = file;
+        state.needs_newline = false;
+        Ok(LogRewrite {
+            kept: lines.len(),
+            dropped,
+        })
+    }
+
     fn write_entry(
         &self,
         table: ChangeTable,
@@ -996,6 +1102,204 @@ fn scan_log(path: &Path) -> Result<LogRead> {
 fn clock_ahead_by(max_stamp: Option<Hlc>, wall_ms: i64) -> Option<i64> {
     let ahead = max_stamp?.ms.saturating_sub(wall_ms);
     (ahead > CLOCK_AHEAD_LIMIT_MS).then_some(ahead)
+}
+
+/// What `ChangeLog::rewrite_readable` did, in line counts. Only a hub
+/// repair rewrites the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LogRewrite {
+    /// Lines kept verbatim, one per readable entry.
+    pub kept: usize,
+    /// Lines left out: every line that was not readable as an entry, except
+    /// blank ones, including an unfinished final line that does not parse.
+    pub dropped: usize,
+}
+
+/// The text of every line in `path` that reads as an entry, in file order,
+/// and the number of non-blank lines that do not. A missing file has none.
+fn readable_lines(path: &Path) -> Result<(Vec<String>, usize)> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(err) => return Err(err.into()),
+    };
+    let mut reader = BufReader::new(file);
+    let mut kept = Vec::new();
+    let mut dropped = 0;
+    while let Some(line) = read_line(&mut reader)? {
+        match line.text {
+            Some(text) if text.trim().is_empty() => {}
+            Some(text) if parse_line(&text).is_ok() => kept.push(text),
+            _ => dropped += 1,
+        }
+    }
+    Ok((kept, dropped))
+}
+
+// ------------------------------------------------------------------
+// The "log incomplete" marker
+// ------------------------------------------------------------------
+
+/// Why the log was marked incomplete. Each reason is one line of the marker
+/// file, stored as a fixed word, so the file never holds row data.
+///
+/// Stored as a string, so a reason written by a newer version reads as
+/// [`IncompleteReason::Unknown`] rather than failing. `Unknown` keeps no
+/// text: the marker's contents are reported to the other device, and only
+/// the words this version writes are known to carry nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum IncompleteReason {
+    /// A change reached a data file and recording it in the log failed.
+    AppendFailed,
+    /// The startup baseline had to record the data again on a device with a
+    /// sync peer, and refused, because a re-recording would outrank the
+    /// peer's newer edits. See [`crate::sync_baseline::baseline_change_log`].
+    BaselineRefused,
+    /// This phone is due for a reset from the hub: it was just paired, or a
+    /// reset started and did not finish. Such a phone sends nothing to the
+    /// hub first.
+    ResetPending,
+    /// A hub repair started and did not finish.
+    RepairUnfinished,
+    /// A reason this version does not know.
+    Unknown,
+}
+
+impl IncompleteReason {
+    fn word(&self) -> &'static str {
+        match self {
+            IncompleteReason::AppendFailed => "append_failed",
+            IncompleteReason::BaselineRefused => "baseline_refused",
+            IncompleteReason::ResetPending => "reset_pending",
+            IncompleteReason::RepairUnfinished => "repair_unfinished",
+            IncompleteReason::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<String> for IncompleteReason {
+    fn from(value: String) -> Self {
+        match value.trim() {
+            "append_failed" => IncompleteReason::AppendFailed,
+            "baseline_refused" => IncompleteReason::BaselineRefused,
+            "reset_pending" => IncompleteReason::ResetPending,
+            "repair_unfinished" => IncompleteReason::RepairUnfinished,
+            _ => IncompleteReason::Unknown,
+        }
+    }
+}
+
+impl From<IncompleteReason> for String {
+    fn from(reason: IncompleteReason) -> Self {
+        reason.word().to_string()
+    }
+}
+
+/// Return `<data_home>/finguard/sync/log_incomplete`, creating its directory
+/// if necessary.
+///
+/// While this file exists the log is known not to describe all of this
+/// device's data, and [`crate::sync_exchange::log_health`] reports the log
+/// unreliable. Only a phone reset or a hub repair removes it.
+pub fn log_incomplete_path() -> Result<PathBuf> {
+    Ok(get_sync_dir()?.join(LOG_INCOMPLETE_FILE_NAME))
+}
+
+/// Mark the log incomplete for `reason`, adding the reason as a line unless
+/// the marker already names it, then flush the marker and its folder.
+///
+/// A marker that exists and cannot be read is replaced, through a temporary
+/// file and a rename, by one naming [`IncompleteReason::Unknown`] and
+/// `reason`. `Unknown` stands for whatever the old marker said, so the
+/// replacement never claims less than the old one might have. Without the
+/// replacement, one unreadable marker would fail every later reset at its
+/// first step, and only a reset removes the marker.
+///
+/// # Errors
+///
+/// [`crate::Error::Io`] when the marker cannot be written or flushed, or its
+/// folder cannot be flushed. The folder flush is strict because a reset
+/// relies on the marker surviving a crash before it deletes data. A caller
+/// that must not fail, such as the data layer's record hook, warns instead of
+/// returning the error.
+pub(crate) fn mark_log_incomplete(reason: IncompleteReason) -> Result<()> {
+    let path = log_incomplete_path()?;
+    match read_incomplete_reasons(&path) {
+        Ok(Some(reasons)) if reasons.contains(&reason) => return Ok(()),
+        Ok(_) => {
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+            file.write_all(format!("{}\n", reason.word()).as_bytes())?;
+            file.sync_all()?;
+        }
+        Err(_) => {
+            let temp_path = path.with_file_name(format!(".{LOG_INCOMPLETE_FILE_NAME}.tmp"));
+            let written = (|| -> Result<()> {
+                let mut file = File::create(&temp_path)?;
+                file.write_all(
+                    format!("{}\n{}\n", IncompleteReason::Unknown.word(), reason.word()).as_bytes(),
+                )?;
+                file.sync_all()?;
+                std::fs::rename(&temp_path, &path)?;
+                Ok(())
+            })();
+            if written.is_err() {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            written?;
+        }
+    }
+    if let Some(folder) = path.parent() {
+        crate::df_operations::sync_dir(folder)?;
+    }
+    Ok(())
+}
+
+/// The reasons the log is marked incomplete, or `None` when it is not.
+///
+/// # Errors
+///
+/// [`crate::Error::Io`] when the marker exists and cannot be read. A caller
+/// judging the log's health treats that as marked: see
+/// [`crate::sync_exchange::log_health`].
+pub fn read_log_incomplete() -> Result<Option<Vec<IncompleteReason>>> {
+    read_incomplete_reasons(&log_incomplete_path()?)
+}
+
+fn read_incomplete_reasons(path: &Path) -> Result<Option<Vec<IncompleteReason>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| IncompleteReason::from(line.to_string()))
+                .collect(),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Remove the incomplete marker and flush the folder. Only the last step of
+/// a phone reset or a hub repair calls this: nothing else makes the log
+/// whole again.
+///
+/// # Errors
+///
+/// [`crate::Error::Io`] when the marker exists and cannot be removed, or the
+/// folder cannot be flushed. The log then still reports incomplete, which
+/// is the safe side.
+pub(crate) fn clear_log_incomplete() -> Result<()> {
+    let path = log_incomplete_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    }
+    if let Some(folder) = path.parent() {
+        crate::df_operations::sync_dir(folder)?;
+    }
+    Ok(())
 }
 
 /// Read one line as an entry, or say why it could not be.

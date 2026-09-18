@@ -33,7 +33,10 @@ impl IntoResponse for AppError {
             | Error::Polars(_)
             | Error::NoHomeDir
             | Error::RowIdsMissing(_)
-            | Error::RowIdMigration { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | Error::RowIdMigration { .. }
+            | Error::SyncResetBackup { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::SyncProtocol(_) => StatusCode::BAD_REQUEST,
+            Error::SyncRefused(_) => StatusCode::CONFLICT,
             Error::Network(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::MergeRejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             // Another writer holds the change log. The request can succeed

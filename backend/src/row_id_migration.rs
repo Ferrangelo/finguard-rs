@@ -11,7 +11,7 @@
 //! `dbs` tree to `<data_home>/finguard/backups/<UTC timestamp>-before-row-ids/`
 //! and flushes that copy to disk, and only then rewrites each file that needs
 //! IDs, through a temporary file in the same folder and a rename
-//! ([`df_operations::write_parquet_atomic`]). Only the
+//! ([`crate::df_operations::write_parquet_atomic`]). Only the
 //! `row_id` column changes: every other column, its type, and the row order
 //! stay as they were. A second run finds nothing to do.
 //!
@@ -35,13 +35,14 @@ use std::path::{Path, PathBuf};
 
 use polars::prelude::*;
 
+use crate::dbs_backup;
 use crate::df_operations::{
-    self, ROW_ID_COLUMN, has_column, needs_row_ids, new_row_id, read_parquet, write_parquet_atomic,
+    ROW_ID_COLUMN, has_column, needs_row_ids, new_row_id, read_parquet, write_parquet_atomic,
 };
 use crate::error::{Error, Result};
 use crate::paths::{
     CREDITS_DEBTS_FILENAME, INVESTMENTS_FILENAME, INVESTMENTS_PRICES_FILENAME, LIQUIDITY_FILENAME,
-    PARQUET_SUFFIX, RECURRING_EXPENSES_FILENAME, get_backups_dir, get_dbs_root,
+    PARQUET_SUFFIX, RECURRING_EXPENSES_FILENAME, get_dbs_root,
 };
 
 /// Table names used as keys of [`RowIdMigrationReport::files_migrated`].
@@ -169,7 +170,10 @@ pub fn migrate_row_ids() -> Result<RowIdMigrationReport> {
         return Ok(report);
     }
 
-    report.backup_dir = Some(backup_dbs(&dbs_root)?);
+    report.backup_dir = Some(
+        dbs_backup::backup_dbs(&dbs_root, BACKUP_SUFFIX, "Row ID migration")
+            .map_err(|failure| fail_at(&failure.path, failure.source))?,
+    );
     for write in plan.writes {
         write_parquet_atomic(&write.df, &write.path).map_err(|e| fail_at(&write.path, e))?;
         *report.files_migrated.entry(write.table).or_default() += 1;
@@ -435,111 +439,13 @@ fn fill_row_ids(
     Ok((df, filled))
 }
 
-/// Copy the whole `dbs_root` tree into a new
-/// `<backups>/<UTC timestamp>-before-row-ids/` folder, flush it to disk, and
-/// return its path. Never merges into an existing folder: a name collision
-/// gets a numeric suffix instead.
-fn backup_dbs(dbs_root: &Path) -> Result<PathBuf> {
-    let backups_dir = get_backups_dir().map_err(|e| fail_at(dbs_root, e))?;
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let mut attempt = 1;
-    let backup_dir = loop {
-        let name = if attempt == 1 {
-            format!("{stamp}-{BACKUP_SUFFIX}")
-        } else {
-            format!("{stamp}-{BACKUP_SUFFIX}-{attempt}")
-        };
-        let candidate = backups_dir.join(name);
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => break candidate,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
-            Err(e) => return Err(fail_at(&candidate, e)),
-        }
-    };
-
-    // The backup folder is in the set so a link to `backups/` cannot copy
-    // the backup into itself.
-    let mut open_folders = HashSet::new();
-    for folder in [dbs_root, backup_dir.as_path()] {
-        open_folders.insert(std::fs::canonicalize(folder).map_err(|e| fail_at(folder, e))?);
-    }
-    copy_dir_contents(dbs_root, &backup_dir, &mut open_folders)?;
-
-    // The new folder's entry lives in `backups_dir`, whose own entry may be
-    // new too.
-    sync_dir(&backups_dir)?;
-    if let Some(app_dir) = backups_dir.parent() {
-        sync_dir(app_dir)?;
-    }
-    Ok(backup_dir)
-}
-
-/// Recursively copy everything inside `from` into the existing folder `to`,
-/// flushing each copied file and folder to disk.
-///
-/// Symbolic links are followed. `open_folders` holds the canonical paths of
-/// the folders being copied on the current path, plus the backup folder: a
-/// folder link that resolves to one of them would copy forever, so it is
-/// skipped with a warning. A broken link has no contents and is skipped with
-/// a warning too.
-fn copy_dir_contents(from: &Path, to: &Path, open_folders: &mut HashSet<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(from).map_err(|e| fail_at(from, e))? {
-        let entry = entry.map_err(|e| fail_at(from, e))?;
-        let source = entry.path();
-        let target = to.join(entry.file_name());
-        let metadata = match std::fs::metadata(&source) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                let is_link = std::fs::symlink_metadata(&source)
-                    .is_ok_and(|link| link.file_type().is_symlink());
-                if !is_link {
-                    return Err(fail_at(&source, err));
-                }
-                eprintln!(
-                    "Row ID migration: the backup skipped {}, a broken link.",
-                    source.display()
-                );
-                continue;
-            }
-        };
-        if metadata.is_dir() {
-            let canonical = std::fs::canonicalize(&source).map_err(|e| fail_at(&source, e))?;
-            if open_folders.contains(&canonical) {
-                eprintln!(
-                    "Row ID migration: the backup skipped {}, a link back to a folder it is \
-                     already copying.",
-                    source.display()
-                );
-                continue;
-            }
-            std::fs::create_dir(&target).map_err(|e| fail_at(&target, e))?;
-            open_folders.insert(canonical.clone());
-            let copied = copy_dir_contents(&source, &target, open_folders);
-            open_folders.remove(&canonical);
-            copied?;
-        } else {
-            std::fs::copy(&source, &target).map_err(|e| fail_at(&source, e))?;
-            std::fs::File::open(&target)
-                .and_then(|file| file.sync_all())
-                .map_err(|e| fail_at(&target, e))?;
-        }
-    }
-    sync_dir(to)
-}
-
-/// Flush the entries of the folder `path` to disk, so a file created or
-/// renamed in it survives a crash. See [`df_operations::sync_dir`].
-fn sync_dir(path: &Path) -> Result<()> {
-    df_operations::sync_dir(path).map_err(|e| fail_at(path, e))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::df_operations::{
         Cashflow, CreditsDebts, DetailedExpenses, InvestmentHoldings, Liquidity, RecurringExpenses,
     };
-    use crate::paths::{CASHFLOW_FILENAME, PRIMARIES_FILENAME, get_year_dir};
+    use crate::paths::{CASHFLOW_FILENAME, PRIMARIES_FILENAME, get_backups_dir, get_year_dir};
     use chrono::NaiveDate;
 
     /// Point `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and `HOME` at a fresh temp

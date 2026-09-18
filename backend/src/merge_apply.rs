@@ -150,8 +150,17 @@ impl fmt::Display for MergeReport {
 ///   before the retry still outranks the batch, unless the process restarts
 ///   first (see the comment in the body).
 pub fn apply_remote_batch(remote: &[ChangeEntry]) -> Result<MergeReport> {
-    let _guard = write_lock::lock_blocking();
+    let guard = write_lock::lock_blocking();
+    apply_remote_batch_holding(&guard, remote)
+}
 
+/// [`apply_remote_batch`] for a caller that already holds the data write
+/// lock for a longer run, such as a phone reset from the hub. Taking the
+/// lock again here would wait forever, because it is not reentrant.
+pub(crate) fn apply_remote_batch_holding(
+    _lock: &write_lock::WriteGuard,
+    remote: &[ChangeEntry],
+) -> Result<MergeReport> {
     let log = sync::shared_log()?;
     let read = sync::read_log()?;
     let plan = merge::plan_merge(&read.entries, remote);
