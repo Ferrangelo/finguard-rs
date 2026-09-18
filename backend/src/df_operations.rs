@@ -2367,14 +2367,52 @@ impl RecurringExpenses {
     /// The log is read once here and the same slice is reused for every
     /// template.
     ///
+    /// # Which rows this covers
+    ///
+    /// The question is asked about the derived ID, so it covers every row a
+    /// recurring apply generated once row IDs existed. It does not cover a
+    /// row that was already in a month's file before then:
+    /// [`crate::row_id_migration`] gave that row a fresh random UUID and
+    /// [`crate::sync_baseline`] recorded it as an ordinary row, so deleting
+    /// it records a delete against that UUID, and this function, asking about
+    /// the derived ID, finds nothing and puts the template back in `pending`.
+    /// The row returns once.
+    ///
+    /// That gap closes itself, one cycle per row: the regenerated row carries
+    /// the derived ID, so deleting it a second time sticks for good. The user
+    /// chose on 2026-09-18 to accept the single repeat rather than the
+    /// alternative, widening the identity to `expense_name` and day. Widening
+    /// would silently withhold a hand typed expense that happens to share a
+    /// name and day with a template, and that failure would be permanent and
+    /// invisible, which is worse than one repeat that fixes itself. Do not
+    /// read this function as a complete guarantee for rows older than the
+    /// change log.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] when the change log exists but cannot be read.
     /// Failing is deliberate: a plan built without the log would regenerate
     /// every row the user has ever deleted.
+    ///
+    /// A log that reads but drops lines is reported, not refused. Each lost
+    /// line is a lost change, and a delete on one of them is a row this plan
+    /// generates again, so the counts go to stderr (counts only, never the
+    /// contents) and the plan goes ahead. Refusing would stop apply working
+    /// at all on a damaged log, which costs the user more than the deletes
+    /// those lines held. Part 3 owns the user-facing answer, because it owns
+    /// whether this device is fit to sync at all.
     pub fn plan_for_month(&self, de: &DetailedExpenses) -> Result<RecurringApplyPlan> {
         let candidates = self.rows_for_month(de.year, de.month)?;
         let log = sync::read_log()?;
+        if !log.corrupt_lines.is_empty() {
+            eprintln!(
+                "Change log: {} line(s) could not be read, {} of them too long to read at all. \
+                 Recurring apply is going ahead without them, so a row whose deletion was \
+                 recorded on one of those lines can come back.",
+                log.corrupt_lines.len(),
+                log.oversized_lines.len()
+            );
+        }
         let table = de.change_table();
 
         let mut plan = RecurringApplyPlan::default();
@@ -3205,6 +3243,102 @@ mod tests {
         assert_eq!(plan.skipped[0].expense_name, "Rent");
         assert_eq!(plan.skipped[0].expense_day, 1);
         assert_eq!(de.expense_df.height(), 0, "the month must stay empty");
+    }
+
+    /// One plan must carry both answers at once. Each template is decided on
+    /// its own, so a standing deletion on one must not withhold another
+    /// template that is legitimately due, and the row that is generated must
+    /// be the due one.
+    #[test]
+    #[serial_test::serial]
+    fn plan_for_month_reports_a_deleted_and_a_due_template_together() {
+        let _temp = with_temp_data_home();
+        let (mut recurring, mut de, deleted_template) = march_rent_generated_then_deleted();
+
+        let due_template = recurring
+            .add("Internet", 5, 40.0, "EUR", "Housing", "Internet")
+            .expect("add a second template");
+
+        let plan = recurring.plan_for_month(&de).expect("plan march again");
+        assert_eq!(plan.pending.len(), 1);
+        assert_eq!(plan.pending[0].template_row_id, due_template);
+        assert_eq!(plan.pending[0].row_id, format!("{due_template}:2026-03"));
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].template_row_id, deleted_template);
+        assert_eq!(
+            plan.skipped[0].row_id,
+            format!("{deleted_template}:2026-03")
+        );
+
+        let added = recurring
+            .insert_resolved(&mut de, &plan.pending)
+            .expect("insert pending rows");
+        assert_eq!(added, vec!["Internet".to_string()]);
+        assert_eq!(
+            str_col_to_vec(&de.expense_df, ROW_ID_COLUMN).expect("read row_id column"),
+            vec![format!("{due_template}:2026-03")],
+            "only the due template's row may land in the month"
+        );
+    }
+
+    /// The other half of a reinstate is decided by the merge engine, not by
+    /// this file: the entry it wrote must beat the older delete when the two
+    /// devices meet. The same entry marked as generated must lose to that
+    /// delete instead, which is why [`RecurringExpenses::reinstate_for_month`]
+    /// passes no origin.
+    #[test]
+    #[serial_test::serial]
+    fn a_reinstated_row_beats_the_older_delete_at_the_next_merge() {
+        use crate::merge::{MergeOutcome, RowAction, SkipReason, plan_merge};
+
+        let _temp = with_temp_data_home();
+        let (recurring, mut de, template_id) = march_rent_generated_then_deleted();
+        let row_id = format!("{template_id}:2026-03");
+        recurring
+            .reinstate_for_month(&mut de, &template_id)
+            .expect("reinstate the deleted row");
+
+        // The other device's log stops at the delete; the reinstate is the
+        // one entry this device has to send it.
+        let entries = log_entries();
+        let (local, remote) = entries.split_at(entries.len() - 1);
+        assert_eq!(remote[0].row_id, row_id);
+        assert_eq!(remote[0].origin, None);
+        assert!(
+            local
+                .iter()
+                .any(|entry| entry.row_id == row_id && entry.op == ChangeOp::Delete),
+            "the other device must still hold the delete this reinstate has to beat"
+        );
+
+        let plan = plan_merge(local, remote);
+        assert_eq!(plan.decisions.len(), 1);
+        assert_eq!(plan.decisions[0].outcome, MergeOutcome::Applied);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].row_id, row_id);
+        assert!(
+            matches!(plan.actions[0].action, RowAction::Upsert { .. }),
+            "the reinstated row must be written back"
+        );
+
+        let mut as_generated = remote[0].clone();
+        as_generated.origin = Some(ChangeOrigin::RecurringApply);
+        let held_back = plan_merge(local, &[as_generated]);
+        assert!(
+            matches!(
+                held_back.decisions[0].outcome,
+                MergeOutcome::Skipped(SkipReason::GeneratedRowStaysDeleted(_))
+            ),
+            "the same entry marked generated must lose to the delete: {:?}",
+            held_back.decisions[0].outcome
+        );
+        assert!(
+            !held_back
+                .actions
+                .iter()
+                .any(|action| matches!(action.action, RowAction::Upsert { .. })),
+            "a generated upsert must not write the row back"
+        );
     }
 
     /// A template whose row was never deleted is still due, and nothing is

@@ -3486,6 +3486,64 @@ mod tests {
         assert_eq!(list_september().await.len(), 1, "no duplicate row");
     }
 
+    /// One apply must be able to add a row and report another as skipped in
+    /// the same call. A standing deletion on one template must not withhold
+    /// a template that is legitimately due, and the interface has to show
+    /// both halves of that answer.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn apply_adds_one_row_and_skips_another_in_one_call() {
+        let _temp = with_temp_env_offline();
+        let mut recurring =
+            df_operations::RecurringExpenses::new(2026).expect("load recurring expenses");
+        let deleted_template = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add the first template");
+
+        let apply = || {
+            apply_recurring_handler(Json(ApplyRecurringPayload {
+                year: 2026,
+                month: 9,
+            }))
+        };
+
+        let first = apply()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("the first apply succeeds: {err}"))
+            .0;
+        assert_eq!(first.added, 1);
+
+        delete_expense_handler(
+            Path(format!("{deleted_template}:2026-09")),
+            Query(DeleteExpenseQuery {
+                year: 2026,
+                month: 9,
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("deleting the generated row succeeds: {err}"));
+
+        let due_template = recurring
+            .add("Internet", 5, 40.0, "EUR", "Housing", "Internet")
+            .expect("add a second template");
+
+        let second = apply()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("the second apply succeeds: {err}"))
+            .0;
+        assert_eq!(second.added, 1, "the due template must still be generated");
+        assert_eq!(second.skipped.len(), 1);
+        assert_eq!(second.skipped[0].template_id, deleted_template);
+        assert_eq!(second.skipped[0].name, "Rent");
+
+        let ids: Vec<String> = list_september().await.into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![format!("{due_template}:2026-09")],
+            "only the due template's row may be in the month"
+        );
+    }
+
     /// Changing an asset's currency is recorded like any other cell edit.
     /// This handler used to patch the dataframe itself and save, which no
     /// change log hook could see; the edit belongs to the data layer now.
