@@ -73,6 +73,13 @@ pub enum Error {
         path: std::path::PathBuf,
     },
 
+    /// A batch of changes from another device does not fit this device's
+    /// data: a column a file lacks, a value of the wrong type for its
+    /// column, or a row it cannot address. Nothing was written. The message
+    /// names the table, the column, and the expected type, never a value.
+    #[error("{0}")]
+    MergeRejected(String),
+
     /// The row ID migration failed on `path`. The backend must not serve
     /// requests after this error.
     #[error("row ID migration failed for {}: {source}", path.display())]

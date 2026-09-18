@@ -149,10 +149,9 @@ impl Hlc {
     /// Without it, local stamps only track the local clock, and a device whose
     /// clock reads years ahead wins every conflict until the other clocks
     /// catch up. Use [`ChangeLog::observe_remote`] to apply this to an open
-    /// log: this function only computes the stamp. Nothing calls either yet:
-    /// part 2 decides whether a remote entry is appended to this log. Either
-    /// choice is safe, because [`ChangeLog::open`] recovers from the largest
-    /// stamp in the file.
+    /// log, or [`ChangeLog::append_remote_batch`] to store remote entries and
+    /// observe their stamps in one step: this function only computes the
+    /// stamp.
     pub fn observe(last: Option<Hlc>, remote: Hlc) -> Hlc {
         Hlc::observed_at(last, remote, wall_clock_ms())
     }
@@ -632,9 +631,8 @@ impl ChangeLog {
     /// changes that follow it are appended. Without it, a merge cannot answer
     /// the remote device: this device would keep issuing stamps from its own
     /// wall clock, which is exactly what lets a device with a wrong clock win
-    /// every conflict.
-    ///
-    /// Nothing calls it yet. Part 2 owns the merge that will.
+    /// every conflict. [`crate::merge_apply::apply_remote_batch`] calls it
+    /// once per batch, with the largest stamp in it.
     pub fn observe_remote(&self, remote: Hlc) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.last_stamp = Some(Hlc::observe(state.last_stamp, remote));
@@ -694,6 +692,49 @@ impl ChangeLog {
         self.write_entry(table, row_id.into(), op, Some(origin))
     }
 
+    /// Append entries another device stamped, exactly as they arrived: their
+    /// own stamps, device ids, tables, rows, origins, and operations. This is
+    /// how a merge stores the remote entries
+    /// [`crate::merge::MergePlan::entries_to_store`] lists, so this log can
+    /// later tell a third device what it has seen.
+    ///
+    /// Every entry is encoded and checked before the first line is written,
+    /// so an entry the log would refuse stores none of them. The clock takes
+    /// each entry's stamp in through [`Hlc::observe`] before its line is
+    /// written, so no stamp this log issues afterwards is at or below one the
+    /// file now holds. All the lines go to the file in one write, with an
+    /// unfinished earlier line closed first, as for [`ChangeLog::append`],
+    /// and the file is flushed once. A merge can store a whole history at
+    /// once, and a flush per line would hold the data write lock for one disk
+    /// flush per entry. Returns once that flush is done. An empty slice
+    /// writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`ChangeLog::append`], and with the same warning: an error
+    /// does not mean the lines are absent, and after a failed write some of
+    /// them may be complete in the file. So do not retry the same entries
+    /// and do not undo the data write they follow. A later merge of the same
+    /// batch finds whichever entries did reach the file and stores the rest.
+    /// [`check_storable`] reports the errors that depend only on an entry,
+    /// so a caller can run it before changing any data.
+    pub fn append_remote_batch(&self, entries: &[&ChangeEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let lines = entries
+            .iter()
+            .map(|entry| encode_line(entry))
+            .collect::<Result<Vec<_>>>()?;
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // Every stamp is taken in before the one write that carries them all,
+        // so the clock is past each line before that line can be in the file.
+        for entry in entries {
+            state.last_stamp = Some(Hlc::observe(state.last_stamp, entry.stamp));
+        }
+        write_lines(&mut state, &lines)
+    }
+
     fn write_entry(
         &self,
         table: ChangeTable,
@@ -721,37 +762,80 @@ impl ChangeLog {
             op,
         };
 
-        let mut line = Vec::new();
-        if state.needs_newline {
-            line.push(b'\n');
-        }
-        let start = line.len();
-        serde_json::to_writer(&mut line, &entry)?;
-        // The reader discards a line it cannot hold, and the clock probe
-        // cannot read it either, so writing one would report success for a
-        // change that is lost and takes its stamp with it. Refuse instead.
-        // The stamp is spent, which costs nothing: a gap in the sequence is
-        // fine, only a reused stamp is not.
-        if line.len() - start >= MAX_LINE_BYTES {
-            return Err(Error::InvalidArgument(format!(
-                "this change is {} bytes as one line, and the change log cannot carry a line of \
-                 {MAX_LINE_BYTES} bytes or more",
-                line.len() - start
-            )));
-        }
-        line.push(b'\n');
-
-        // Treat the file as unfinished until both the write and the flush are
-        // done. `write_all` can stop part way through, on a full disk for
-        // example, and the leftover bytes must not run into the next entry.
-        state.needs_newline = true;
-        // One write of one whole line: the file is open in append mode, so a
-        // concurrent writer cannot interleave with it.
-        state.file.write_all(&line)?;
-        state.file.sync_data()?;
-        state.needs_newline = false;
+        // The stamp is spent even when the entry is refused, which costs
+        // nothing: a gap in the sequence is fine, only a reused stamp is not.
+        let line = encode_line(&entry)?;
+        write_line(&mut state, &line)?;
         Ok(entry)
     }
+}
+
+/// Fail when `entry` could not be stored with
+/// [`ChangeLog::append_remote_batch`]:
+/// its table names a month no file can have, it cannot be serialized, or it
+/// is too long for one line. Writes nothing.
+///
+/// A merge runs this on every entry it is about to store before it writes
+/// any Parquet file, so an entry the log would refuse stops the merge while
+/// nothing has changed yet.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidArgument`] or [`crate::Error::Json`], as described
+/// for [`ChangeLog::append`]. The message never holds the entry's values.
+pub fn check_storable(entry: &ChangeEntry) -> Result<()> {
+    encode_line(entry).map(|_| ())
+}
+
+/// `entry` as one line of the log, without its newline, after checking that
+/// its table is valid and the line fits under [`MAX_LINE_BYTES`].
+fn encode_line(entry: &ChangeEntry) -> Result<Vec<u8>> {
+    entry.table.validate()?;
+    let line = serde_json::to_vec(entry)?;
+    // The reader discards a line it cannot hold, and the clock probe cannot
+    // read it either, so writing one would report success for a change that
+    // is lost and takes its stamp with it. Refuse instead.
+    if line.len() >= MAX_LINE_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "this change is {} bytes as one line, and the change log cannot carry a line of \
+             {MAX_LINE_BYTES} bytes or more",
+            line.len()
+        )));
+    }
+    Ok(line)
+}
+
+/// Write `line` and its newline to the log and flush it, closing an
+/// unfinished earlier line first. The caller holds the state lock.
+fn write_line(state: &mut LogState, line: &[u8]) -> Result<()> {
+    write_lines(state, std::slice::from_ref(&line))
+}
+
+/// Write `lines`, each followed by a newline, to the log as one write, then
+/// flush it. An unfinished earlier line is closed first with one newline, and
+/// only when there is one, so the file holds no empty lines of this
+/// function's making. The caller holds the state lock.
+fn write_lines(state: &mut LogState, lines: &[impl AsRef<[u8]>]) -> Result<()> {
+    let length: usize = lines.iter().map(|line| line.as_ref().len() + 1).sum();
+    let mut buffer = Vec::with_capacity(length + 1);
+    if state.needs_newline {
+        buffer.push(b'\n');
+    }
+    for line in lines {
+        buffer.extend_from_slice(line.as_ref());
+        buffer.push(b'\n');
+    }
+
+    // Treat the file as unfinished until both the write and the flush are
+    // done. `write_all` can stop part way through, on a full disk for
+    // example, and the leftover bytes must not run into the next entry.
+    state.needs_newline = true;
+    // One write: the file is open in append mode, so a concurrent writer
+    // cannot interleave with it.
+    state.file.write_all(&buffer)?;
+    state.file.sync_data()?;
+    state.needs_newline = false;
+    Ok(())
 }
 
 /// Take the single writer lock on `file`, failing rather than waiting.
@@ -1762,6 +1846,85 @@ mod tests {
             )
             .expect("append after the refusal");
         assert_eq!(read_log().unwrap().entries, vec![after]);
+    }
+
+    /// Remote entries are stored exactly as they arrived, each on its own
+    /// line even after an unfinished one, and the clock passes the largest
+    /// stamp. A batch holding an entry too long for one line is refused by
+    /// the pre-write check and by the append alike, and none of it reaches
+    /// the file.
+    #[test]
+    #[serial_test::serial]
+    fn remote_entries_are_stored_verbatim_and_move_the_clock() {
+        let _temp = with_temp_env();
+        let path = changelog_path().unwrap();
+        std::fs::write(&path, "{\"stamp\":{\"ms\":1,").unwrap();
+        let log = ChangeLog::open().expect("open log");
+        let remote = ChangeEntry {
+            stamp: far_future(3),
+            device_id: "other-device".to_string(),
+            table: ChangeTable::Liquidity { year: 2026 },
+            row_id: "row-1".to_string(),
+            origin: Some(ChangeOrigin::RecurringApply),
+            op: ChangeOp::Delete,
+        };
+
+        let second = ChangeEntry {
+            stamp: far_future(1),
+            device_id: "third-device".to_string(),
+            table: ChangeTable::Expenses {
+                year: 2026,
+                month: 4,
+            },
+            row_id: "row-9".to_string(),
+            origin: None,
+            op: ChangeOp::Delete,
+        };
+
+        check_storable(&remote).expect("a small entry is storable");
+        log.append_remote_batch(&[&remote, &second])
+            .expect("store the remote entries");
+        let local = log
+            .append(
+                ChangeTable::Recurring { year: 2026 },
+                "row-2",
+                ChangeOp::Delete,
+            )
+            .expect("append a local change");
+
+        let bytes = std::fs::read(&path).unwrap();
+        let cut_off = b"{\"stamp\":{\"ms\":1,";
+        assert!(
+            bytes.starts_with(cut_off) && bytes[cut_off.len()] == b'\n',
+            "one repair newline closes the cut-off line"
+        );
+        assert!(
+            !bytes.windows(2).any(|pair| pair == b"\n\n"),
+            "no empty line anywhere"
+        );
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 4);
+        let read = read_log().unwrap();
+        assert_eq!(read.entries, vec![remote.clone(), second, local.clone()]);
+        // The cut-off first line is closed by the repair newline, so it now
+        // reads as one damaged line, and the new lines stand apart from it.
+        assert_eq!(read.corrupt_lines, vec![1]);
+        assert!(!read.unfinished_tail);
+        assert!(local.stamp > far_future(3));
+
+        let mut row = Map::new();
+        row.insert("note".to_string(), Value::from("x".repeat(MAX_LINE_BYTES)));
+        let oversized = ChangeEntry {
+            stamp: far_future(9),
+            device_id: "other-device".to_string(),
+            table: ChangeTable::Recurring { year: 2026 },
+            row_id: "row-3".to_string(),
+            origin: None,
+            op: ChangeOp::Upsert { row },
+        };
+        let before = std::fs::read(&path).unwrap();
+        assert!(check_storable(&oversized).is_err());
+        assert!(log.append_remote_batch(&[&remote, &oversized]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     /// A stamp far ahead of this machine's clock is adopted, because ignoring

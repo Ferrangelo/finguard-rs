@@ -5,8 +5,7 @@
 //! the batch that arrived from another device, both as slices of
 //! [`ChangeEntry`], and returns a [`MergePlan`]. It opens no file, writes
 //! nothing, and never reads a clock, so every rule below can be tested without
-//! a disk. Carrying the plan out is part 2b's work, and nothing calls this
-//! module yet.
+//! a disk. [`crate::merge_apply::apply_remote_batch`] carries a plan out.
 //!
 //! [`generated_row_stays_deleted`] answers one of these rules on its own, for
 //! the other caller that needs it: `/api/recurring/apply`, which decides what

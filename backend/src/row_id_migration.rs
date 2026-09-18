@@ -10,7 +10,8 @@
 //! the run writes nothing, not even a backup. Otherwise it copies the whole
 //! `dbs` tree to `<data_home>/finguard/backups/<UTC timestamp>-before-row-ids/`
 //! and flushes that copy to disk, and only then rewrites each file that needs
-//! IDs, through a temporary file in the same folder and a rename. Only the
+//! IDs, through a temporary file in the same folder and a rename
+//! ([`df_operations::write_parquet_atomic`]). Only the
 //! `row_id` column changes: every other column, its type, and the row order
 //! stay as they were. A second run finds nothing to do.
 //!
@@ -34,7 +35,9 @@ use std::path::{Path, PathBuf};
 
 use polars::prelude::*;
 
-use crate::df_operations::{ROW_ID_COLUMN, has_column, needs_row_ids, new_row_id, read_parquet};
+use crate::df_operations::{
+    self, ROW_ID_COLUMN, has_column, needs_row_ids, new_row_id, read_parquet, write_parquet_atomic,
+};
 use crate::error::{Error, Result};
 use crate::paths::{
     CREDITS_DEBTS_FILENAME, INVESTMENTS_FILENAME, INVESTMENTS_PRICES_FILENAME, LIQUIDITY_FILENAME,
@@ -168,7 +171,7 @@ pub fn migrate_row_ids() -> Result<RowIdMigrationReport> {
 
     report.backup_dir = Some(backup_dbs(&dbs_root)?);
     for write in plan.writes {
-        write_parquet_atomic(&write.df, &write.path)?;
+        write_parquet_atomic(&write.df, &write.path).map_err(|e| fail_at(&write.path, e))?;
         *report.files_migrated.entry(write.table).or_default() += 1;
         report.rows_given_ids += write.rows_given_ids;
     }
@@ -525,46 +528,9 @@ fn copy_dir_contents(from: &Path, to: &Path, open_folders: &mut HashSet<PathBuf>
 }
 
 /// Flush the entries of the folder `path` to disk, so a file created or
-/// renamed in it survives a crash. Only Unix can open a folder to flush it,
-/// so elsewhere this does nothing.
+/// renamed in it survives a crash. See [`df_operations::sync_dir`].
 fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(path)
-        .and_then(|folder| folder.sync_all())
-        .map_err(|e| fail_at(path, e))?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
-/// Write `df` to `path` through a temporary file in the same folder and a
-/// rename, then flush the folder, so a crash leaves either the old file or
-/// the complete new one.
-fn write_parquet_atomic(df: &DataFrame, path: &Path) -> Result<()> {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temp_path = path.with_file_name(format!(".{file_name}.row-id-migration.tmp"));
-
-    let result = (|| -> Result<()> {
-        let mut file = std::fs::File::create(&temp_path)?;
-        let mut df = df.clone();
-        ParquetWriter::new(&mut file).finish(&mut df)?;
-        file.sync_all()?;
-        std::fs::rename(&temp_path, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        // The write error is the one to report. A leftover temporary file
-        // is harmless: no loader reads a name starting with a dot.
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result.map_err(|e| fail_at(path, e))?;
-    match path.parent() {
-        Some(folder) => sync_dir(folder),
-        None => Ok(()),
-    }
+    df_operations::sync_dir(path).map_err(|e| fail_at(path, e))
 }
 
 #[cfg(test)]

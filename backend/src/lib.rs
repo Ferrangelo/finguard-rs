@@ -30,8 +30,12 @@
 //!   appends one entry here, right after the write that saved it.
 //! - [`merge`]: the merge decision engine. Decides what a batch of changes
 //!   from another device does to this device's data, as pure logic over two
-//!   [`sync`] logs: it touches no file and writes nothing. Nothing calls it
-//!   yet.
+//!   [`sync`] logs: it touches no file and writes nothing.
+//! - [`merge_apply`]: carries a [`merge`] plan out against this device's
+//!   Parquet files and change log, storing the other device's entries
+//!   verbatim. The transport that will call it is later work.
+//! - [`write_lock`]: the process-wide lock that every data-changing request
+//!   and every merge holds, so the two never interleave.
 //! - [`sync_baseline`]: the startup pass that records the rows a data folder
 //!   already holds, so the log describes the whole current state rather than
 //!   starting mid history. It runs after [`row_id_migration`], writes nothing
@@ -56,10 +60,12 @@ pub mod expr;
 pub mod fx;
 mod http_error;
 pub mod merge;
+pub mod merge_apply;
 pub mod paths;
 pub mod plots;
 pub mod row_id_migration;
 pub mod sync;
 pub mod sync_baseline;
+pub mod write_lock;
 
 pub use error::{Error, Result};

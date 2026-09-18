@@ -36,6 +36,7 @@ use crate::df_operations::{
 use crate::fx;
 use crate::http_error::AppError;
 use crate::plots;
+use crate::write_lock;
 
 // ======================================================================
 // JSON Serialisation Models
@@ -1924,6 +1925,10 @@ async fn get_monthly_fx_rates_handler(
 
 /// Build the route table with a permissive CORS layer applied.
 ///
+/// Every request whose method can change data holds the process-wide lock in
+/// [`crate::write_lock`] for its whole run, shared by every router built in
+/// this process and by [`crate::merge_apply::apply_remote_batch`].
+///
 /// CORS is fully permissive (any origin, method, header), which
 /// accommodates the dev frontend running on a different port (`:5173`) and
 /// any other embedder, such as the Android app; this router has no
@@ -2018,6 +2023,10 @@ pub fn router() -> Router {
             get(get_networth_allocation_handler),
         )
         .route("/api/fx/monthly-rates", get(get_monthly_fx_rates_handler))
+        // Outside the routes and inside CORS, so a preflight is answered
+        // without waiting and every data-changing request holds the lock the
+        // merge takes. See `crate::write_lock`.
+        .layer(axum::middleware::from_fn(write_lock::hold_for_writes))
         .layer(cors)
 }
 

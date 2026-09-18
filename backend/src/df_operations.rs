@@ -317,6 +317,58 @@ fn write_parquet(df: &DataFrame, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Write `df` to `path` through a temporary file in the same folder and a
+/// rename, then flush the folder, so a crash leaves either the old file or
+/// the complete new one.
+///
+/// Used by the startup row ID migration and by a merge from another device,
+/// the two writers that change files the user did not just touch. The
+/// handlers still save through [`write_parquet`].
+///
+/// # Errors
+///
+/// [`Error::Io`] or [`Error::Polars`] from creating, writing, flushing, or
+/// renaming the file, or from flushing the folder. After a failure the old
+/// file is still in place, unless the failure was the folder flush, which
+/// comes after the rename.
+pub(crate) fn write_parquet_atomic(df: &DataFrame, path: &std::path::Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp_path = path.with_file_name(format!(".{file_name}.tmp"));
+
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&temp_path)?;
+        let mut df = df.clone();
+        ParquetWriter::new(&mut file).finish(&mut df)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // The write error is the one to report. A leftover temporary file
+        // is harmless: no loader reads a name starting with a dot.
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result?;
+    match path.parent() {
+        Some(folder) => Ok(sync_dir(folder)?),
+        None => Ok(()),
+    }
+}
+
+/// Flush the entries of the folder `path` to disk, so a file created or
+/// renamed in it survives a crash. Only Unix can open a folder to flush it,
+/// so elsewhere this does nothing.
+pub(crate) fn sync_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Return whether `df` contains a column named `name`.
 pub(crate) fn has_column(df: &DataFrame, name: &str) -> bool {
     df.get_column_names().iter().any(|c| c.as_str() == name)
@@ -980,6 +1032,13 @@ impl DetailedExpenses {
     pub fn expense_facts(&self) -> Result<Vec<ExpenseFact>> {
         facts_from_df(&self.expense_df)
     }
+
+    /// Write `expense_df` atomically and record nothing in the change log.
+    /// Only for [`crate::merge_apply`], which stores the other device's
+    /// entries verbatim instead of recording its writes as local changes.
+    pub(crate) fn save_merged(&self) -> Result<()> {
+        write_parquet_atomic(&self.expense_df, &self.expense_df_path)
+    }
 }
 
 // ======================================================================
@@ -1245,6 +1304,14 @@ impl Cashflow {
     /// `Spending`/`Saving`/`Saving %` values an older build already wrote are
     /// left untouched on disk; this method neither reads nor rewrites them.
     pub fn recompute(&mut self) -> Result<()> {
+        self.recompute_income()?;
+        self.save()?;
+        Ok(())
+    }
+
+    /// Recompute the `Income` row from the income values, in memory only.
+    /// [`Self::recompute`] is this followed by a save.
+    pub(crate) fn recompute_income(&mut self) -> Result<()> {
         for month in 1..=12u32 {
             let col_name = format!("{month:02}");
 
@@ -1255,8 +1322,6 @@ impl Cashflow {
             }
             self.set_value("Income", &col_name, income)?;
         }
-
-        self.save()?;
         Ok(())
     }
 
@@ -1268,6 +1333,12 @@ impl Cashflow {
     /// change out of the log and out of any later sync.
     pub fn save(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
+    }
+
+    /// Write `df` atomically and record nothing in the change log. See
+    /// [`DetailedExpenses::save_merged`].
+    pub(crate) fn save_merged(&self) -> Result<()> {
+        write_parquet_atomic(&self.df, &self.path)
     }
 
     /// Return the value at `category`/`col`, or `0.0` if the row is absent.
@@ -1781,6 +1852,18 @@ impl InvestmentHoldings {
         self.save_df()?;
         self.save_df_prices()
     }
+
+    /// Write the holdings frame atomically and record nothing in the change
+    /// log. See [`DetailedExpenses::save_merged`].
+    pub(crate) fn save_merged_holdings(&self) -> Result<()> {
+        write_parquet_atomic(&self.df, &self.path)
+    }
+
+    /// Write the prices frame atomically and record nothing in the change
+    /// log. See [`DetailedExpenses::save_merged`].
+    pub(crate) fn save_merged_prices(&self) -> Result<()> {
+        write_parquet_atomic(&self.df_prices, &self.path_prices)
+    }
 }
 
 // ======================================================================
@@ -1972,6 +2055,12 @@ impl Liquidity {
     pub fn save(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
     }
+
+    /// Write `df` atomically and record nothing in the change log. See
+    /// [`DetailedExpenses::save_merged`].
+    pub(crate) fn save_merged(&self) -> Result<()> {
+        write_parquet_atomic(&self.df, &self.path)
+    }
 }
 
 // ======================================================================
@@ -2122,6 +2211,12 @@ impl CreditsDebts {
     /// sync, so add a method here instead.
     pub fn save(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
+    }
+
+    /// Write `df` atomically and record nothing in the change log. See
+    /// [`DetailedExpenses::save_merged`].
+    pub(crate) fn save_merged(&self) -> Result<()> {
+        write_parquet_atomic(&self.df, &self.path)
     }
 }
 
@@ -2578,6 +2673,12 @@ impl RecurringExpenses {
     /// sync, so add a method here instead.
     pub fn save(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
+    }
+
+    /// Write `df` atomically and record nothing in the change log. See
+    /// [`DetailedExpenses::save_merged`].
+    pub(crate) fn save_merged(&self) -> Result<()> {
+        write_parquet_atomic(&self.df, &self.path)
     }
 }
 
