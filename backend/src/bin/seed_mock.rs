@@ -41,6 +41,32 @@ fn main() -> Result<()> {
 
     println!("Seeding mock data → {}", mock_abs.display());
 
+    // -----------------------------------------------------------------------
+    // 1b. Take the change log before writing a single row.
+    //
+    // Every table method below records what it saved in the change log and
+    // only warns when that fails, so that a user's edit is never lost to a
+    // logging problem. A seeding run has the opposite need: if a backend is
+    // already serving this folder it holds the log's single writer lock,
+    // every record here would fail, and this run would leave hundreds of rows
+    // that no log describes and no later pass repairs. Stop instead.
+    //
+    // Running the baseline on the folder just emptied above records nothing
+    // and takes microseconds. It is here for its two side effects: it takes
+    // the lock, and it marks the baseline done, so the app does not record
+    // the seeded rows a second time on its next start.
+    // -----------------------------------------------------------------------
+    match finguard_rs_backend::sync_baseline::baseline_change_log() {
+        Ok(report) => println!("  {report}"),
+        Err(err) => {
+            eprintln!(
+                "Mock data not seeded, and nothing was written: {err}\nStop any finguard backend \
+                 serving this folder and run again."
+            );
+            std::process::exit(1);
+        }
+    }
+
     let year: i32 = 2025;
 
     // -----------------------------------------------------------------------

@@ -11,12 +11,19 @@
 //! Exception: the synced tables also carry a [`ROW_ID_COLUMN`] column that
 //! the Python application never wrote. See that constant for which tables
 //! have it and how it is maintained.
+//!
+//! Every method here that persists a change also records it in the sync
+//! change log ([`crate::sync`]), right after the write that saved it. See
+//! "Change log hooks" below for the rules those hooks follow, and
+//! [`crate::sync_baseline`] for the startup pass that records the rows a
+//! data folder already holds.
 
 use std::collections::HashSet;
 
 use chrono::NaiveDate;
 use polars::functions::concat_df_diagonal;
 use polars::prelude::*;
+use serde_json::{Map, Value};
 
 use crate::config;
 use crate::error::{Error, Result};
@@ -25,6 +32,7 @@ use crate::paths::{
     LIQUIDITY_FILENAME, PRIMARIES_FILENAME, RECURRING_EXPENSES_FILENAME, SECONDARIES_FILENAME,
     get_dbs_root, get_monthly_parquet_path, get_year_summary_path, year_month_from_parquet_path,
 };
+use crate::sync::{self, ChangeOp, ChangeOrigin, ChangeTable};
 
 // ======================================================================
 // Constants
@@ -60,7 +68,7 @@ fn special_cases() -> &'static [(&'static str, &'static str)] {
 }
 
 /// Row labels for the income categories (user-editable values).
-const INCOME_CATEGORIES: &[&str] = &[
+pub(crate) const INCOME_CATEGORIES: &[&str] = &[
     "Salary",
     "Interests Bank account",
     "Dividendi e Cedole",
@@ -81,7 +89,7 @@ const INVESTMENT_CATEGORIES: &[&str] = &["Stocks/ETF", "Commodities", "Bonds"];
 const LIQUIDITY_CATEGORIES: &[&str] = &["Bank/Broker account", "Cash", "Other"];
 
 /// Month column labels (`"01"`..`"12"`) used in wide yearly tables.
-fn month_labels() -> Vec<String> {
+pub(crate) fn month_labels() -> Vec<String> {
     (1..=12).map(|m| format!("{m:02}")).collect()
 }
 
@@ -315,7 +323,7 @@ pub(crate) fn has_column(df: &DataFrame, name: &str) -> bool {
 }
 
 /// Read a string column into an owned `Vec<String>` (nulls become empty).
-fn str_col_to_vec(df: &DataFrame, name: &str) -> Result<Vec<String>> {
+pub(crate) fn str_col_to_vec(df: &DataFrame, name: &str) -> Result<Vec<String>> {
     Ok(df
         .column(name)?
         .str()?
@@ -332,6 +340,172 @@ fn date_col_to_vec(df: &DataFrame, name: &str) -> Result<Vec<NaiveDate>> {
         .i32()?
         .iter()
         .map(|o| epoch + chrono::Duration::days(o.unwrap_or(0) as i64))
+        .collect())
+}
+
+// ======================================================================
+// Change log hooks
+// ======================================================================
+//
+// Every mutator in this module records what it changed in the sync change
+// log ([`crate::sync`]), immediately after the write that saved it. The hooks
+// sit here rather than in the API handlers because a handler can be added
+// later and forget to log, while nothing reaches a Parquet file without
+// passing through this module.
+//
+// Which shape a change takes is a decision from the step 7 design, not a
+// local choice: an expense and a recurring template are recorded as whole
+// rows ([`ChangeOp::Upsert`], [`ChangeOp::Delete`]) because their fields are
+// edited together as one form, while the net worth tables and cashflow
+// income are recorded per cell ([`ChangeOp::Cell`]) because two devices
+// filling in different months of the same asset is ordinary use, not a
+// conflict. A net worth row that is created or removed still needs a whole
+// row or a delete: those two are the only entries on those tables that are
+// not cells.
+
+/// Record `op` on `row_id` of `table`, after the save that put the change on
+/// disk. See [`record_with_origin`] for the failure contract.
+fn record(table: ChangeTable, row_id: &str, op: Result<ChangeOp>) {
+    record_with_origin(table, row_id, op, None);
+}
+
+/// Record `op` on `row_id` of `table`, marked with `origin` when the user did
+/// not make the change directly. See [`ChangeOrigin`].
+///
+/// This never fails the caller and never undoes the save. The change is
+/// already on disk, so returning the error would invite a retry that writes
+/// the change a second time, and rolling the save back would leave the log
+/// describing data no file holds: a failed append can still have put a
+/// complete line on disk (see [`crate::sync::ChangeLog::append`]). A failure
+/// is warned about on stderr instead.
+///
+/// The warning names the table, its year, and the reason the append failed.
+/// That reason is an error message from this crate, from Polars, or from
+/// `serde_json`: this crate's can name the row ID, and the lower two can
+/// quote the value they could not handle. So the warning is diagnostic output
+/// for the user's own machine and goes nowhere else. It never carries the
+/// entry itself.
+fn record_with_origin(
+    table: ChangeTable,
+    row_id: &str,
+    op: Result<ChangeOp>,
+    origin: Option<ChangeOrigin>,
+) {
+    // The table is moved into the append, and a warning needs it afterwards.
+    // It holds only a year and a month, so this copy costs nothing.
+    let described = table.clone();
+    let appended = op.and_then(|op| {
+        let log = sync::shared_log()?;
+        match origin {
+            Some(origin) => log.append_with_origin(table, row_id, op, origin),
+            None => log.append(table, row_id, op),
+        }
+    });
+    if let Err(err) = appended {
+        eprintln!(
+            "Change log: the change to {described:?} is saved, but recording it failed ({err}). \
+             This device's log no longer describes all of its own data, so a later sync can miss \
+             that change."
+        );
+    }
+}
+
+/// A [`ChangeOp::Cell`] holding a text value, such as a renamed asset.
+fn text_cell(column: &str, value: &str) -> ChangeOp {
+    ChangeOp::Cell {
+        column: column.to_string(),
+        value: Value::from(value),
+    }
+}
+
+/// A [`ChangeOp::Cell`] holding a number, built through
+/// [`crate::sync::cell_number`] so a NaN or an infinity is refused here
+/// instead of reaching the log as a cleared cell.
+fn number_cell(column: &str, value: f64) -> Result<ChangeOp> {
+    Ok(ChangeOp::Cell {
+        column: column.to_string(),
+        value: sync::cell_number(value)?,
+    })
+}
+
+/// A [`ChangeOp::Upsert`] holding every column of the row of `df` whose
+/// [`ROW_ID_COLUMN`] is `row_id`.
+fn upsert_row(df: &DataFrame, row_id: &str) -> Result<ChangeOp> {
+    let index = df
+        .column(ROW_ID_COLUMN)?
+        .str()?
+        .iter()
+        .position(|id| id == Some(row_id))
+        .ok_or_else(|| {
+            Error::NotFound(format!(
+                "the row with id '{row_id}' is not in the table it was just saved to, so the \
+                 change log has no row to record"
+            ))
+        })?;
+    Ok(ChangeOp::Upsert {
+        row: row_json(df, index)?,
+    })
+}
+
+/// Every column of row `index` of `df` as one JSON object.
+///
+/// The keys are the Parquet file's own column names and the values keep the
+/// file's own meaning, because the other device applies the object to the
+/// same schema: text stays a string, a number stays a JSON number, a date
+/// becomes the ISO 8601 day it names (`"2026-03-04"`), and an empty cell
+/// becomes `null`. A column of any other type is an error naming the column
+/// and its type, never its contents.
+pub(crate) fn row_json(df: &DataFrame, index: usize) -> Result<Map<String, Value>> {
+    let mut row = Map::new();
+    for column in df.columns() {
+        let name = column.name().as_str();
+        row.insert(name.to_string(), json_cell(name, column.get(index)?)?);
+    }
+    Ok(row)
+}
+
+/// One cell of `column` as JSON. See [`row_json`] for the encoding.
+fn json_cell(column: &str, value: AnyValue<'_>) -> Result<Value> {
+    Ok(match value {
+        AnyValue::Null => Value::Null,
+        AnyValue::String(text) => Value::from(text),
+        AnyValue::StringOwned(text) => Value::from(text.as_str()),
+        AnyValue::Boolean(flag) => Value::from(flag),
+        AnyValue::Float32(number) => sync::cell_number(number as f64)?,
+        AnyValue::Float64(number) => sync::cell_number(number)?,
+        AnyValue::Int32(number) => Value::from(number),
+        AnyValue::Int64(number) => Value::from(number),
+        AnyValue::Date(days) => Value::from(date_from_days(days).to_string()),
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "the '{column}' column holds {} values, which the change log cannot carry",
+                other.dtype()
+            )));
+        }
+    })
+}
+
+/// The date `days` after the Unix epoch, the meaning of a Polars `Date` cell.
+fn date_from_days(days: i32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a real date")
+        + chrono::Duration::days(days as i64)
+}
+
+/// The [`ROW_ID_COLUMN`] value of every row of `df` where `key_col` equals
+/// `key`.
+///
+/// The wide tables are keyed by name in the API, and [`set_str_where`] and
+/// [`set_f64_where`] update every row that matches, so a change to a name
+/// held by two rows is two changes and gets two entries. Call this before the
+/// change, so a delete still has the IDs of the rows it is about to remove.
+fn row_ids_where(df: &DataFrame, key_col: &str, key: &str) -> Result<Vec<String>> {
+    let keys = df.column(key_col)?.str()?;
+    let ids = df.column(ROW_ID_COLUMN)?.str()?;
+    Ok(keys
+        .iter()
+        .zip(ids.iter())
+        .filter(|(name, _)| *name == Some(key))
+        .filter_map(|(_, id)| id.map(str::to_string))
         .collect())
 }
 
@@ -464,16 +638,22 @@ impl DetailedExpenses {
             primary_category,
             currency,
             secondary_category,
+            None,
         )?;
         Ok(row_id)
     }
 
     /// Append an expense row under the caller-supplied `row_id` instead of a
-    /// fresh one, save the updated dataframe.
+    /// fresh one, save the updated dataframe, and record it in the change log
+    /// under `origin`.
     ///
-    /// [`Self::add_row`] is the ordinary entry point and generates its own
-    /// ID; this exists so [`RecurringExpenses::insert_resolved`] can give a
-    /// generated row the ID derived from its template and target month.
+    /// [`Self::add_row`] is the ordinary entry point: it generates its own ID
+    /// and passes `None` as the origin, because the user typed the row. This
+    /// exists so [`RecurringExpenses::insert_resolved`] can give a generated
+    /// row the ID derived from its template and target month, and mark it
+    /// [`ChangeOrigin::RecurringApply`]. That mark is the only thing telling
+    /// a generated row from a hand typed one, since both carry the same
+    /// derived ID, and it cannot be recovered after the entry is written.
     ///
     /// The caller owns `row_id` uniqueness: this method does not check
     /// whether `row_id` already appears in `self.expense_df`, it only
@@ -491,6 +671,7 @@ impl DetailedExpenses {
         primary_category: Option<&str>,
         currency: &str,
         secondary_category: Option<&str>,
+        origin: Option<ChangeOrigin>,
     ) -> Result<()> {
         let mut primary = primary_category.map(|s| s.to_string());
         let mut secondary = secondary_category.map(|s| s.to_string());
@@ -549,7 +730,21 @@ impl DetailedExpenses {
 
         self.expense_df = concat_df_diagonal(&[self.expense_df.clone(), new_row])?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
+        record_with_origin(
+            self.change_table(),
+            row_id,
+            upsert_row(&self.expense_df, row_id),
+            origin,
+        );
         Ok(())
+    }
+
+    /// Where this month's rows live, for the change log.
+    fn change_table(&self) -> ChangeTable {
+        ChangeTable::Expenses {
+            year: self.year,
+            month: self.month,
+        }
     }
 
     /// Succeed when exactly one row of this month has `row_id`; see
@@ -576,6 +771,7 @@ impl DetailedExpenses {
             .filter(col(ROW_ID_COLUMN).neq(lit(row_id)))
             .collect()?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
+        record(self.change_table(), row_id, Ok(ChangeOp::Delete));
         Ok(())
     }
 
@@ -712,6 +908,11 @@ impl DetailedExpenses {
 
         self.expense_df = df.collect()?;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
+        record(
+            self.change_table(),
+            row_id,
+            upsert_row(&self.expense_df, row_id),
+        );
         Ok(())
     }
 
@@ -1000,6 +1201,12 @@ impl Cashflow {
     /// Set an income-category value for a given month, then recompute and save.
     ///
     /// `category` must be one of the income categories and `month` in 1..=12.
+    ///
+    /// This is the only edit the cashflow table records in the change log,
+    /// and it records one cell: the income category and the month column.
+    /// [`Self::recompute`] derives the `Income` row from these values on
+    /// every device, so recording it too would send a figure the receiver
+    /// recomputes anyway.
     pub fn set_income(&mut self, month: u32, category: &str, value: f64) -> Result<()> {
         if !INCOME_CATEGORIES.contains(&category) {
             return Err(Error::InvalidArgument(format!(
@@ -1014,6 +1221,14 @@ impl Cashflow {
         let col_name = format!("{month:02}");
         self.set_value(category, &col_name, value)?;
         self.recompute()?;
+        // `recompute` is what saves, so the entry follows it. The row ID of a
+        // cashflow change is the category name: that table has no
+        // `row_id` column, and the category is what identifies a row in it.
+        record(
+            ChangeTable::CashflowIncome { year: self.year },
+            category,
+            number_cell(&col_name, value),
+        );
         Ok(())
     }
 
@@ -1046,6 +1261,11 @@ impl Cashflow {
     }
 
     /// Write the cashflow dataframe to disk.
+    ///
+    /// Saving records nothing in the change log. [`Self::set_income`] records
+    /// the one cell it changed, after calling [`Self::recompute`], which
+    /// calls this. Code that edits `df` directly and then saves leaves that
+    /// change out of the log and out of any later sync.
     pub fn save(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
     }
@@ -1230,6 +1450,38 @@ impl InvestmentHoldings {
         str_col_to_vec(&self.df, "asset_name")
     }
 
+    /// Where the holdings rows live, for the change log.
+    fn holdings_table(&self) -> ChangeTable {
+        ChangeTable::Investments { year: self.year }
+    }
+
+    /// Where the price rows live, for the change log. The two files are
+    /// separate tables there, because a receiver writes each one on its own.
+    fn prices_table(&self) -> ChangeTable {
+        ChangeTable::InvestmentsPrices { year: self.year }
+    }
+
+    /// The row IDs an asset has in the holdings frame and in the prices
+    /// frame. Take them before a change, so a delete still has the IDs of the
+    /// rows it removes and a rename still matches on the old name.
+    fn asset_ids(&self, asset_name: &str) -> Result<(Vec<String>, Vec<String>)> {
+        Ok((
+            row_ids_where(&self.df, "asset_name", asset_name)?,
+            row_ids_where(&self.df_prices, "asset_name", asset_name)?,
+        ))
+    }
+
+    /// Record the same change on both frames' rows for one asset, after the
+    /// save. `ids` comes from [`Self::asset_ids`], taken before the change.
+    fn record_asset(&self, ids: &(Vec<String>, Vec<String>), op: &ChangeOp) {
+        for id in &ids.0 {
+            record(self.holdings_table(), id, Ok(op.clone()));
+        }
+        for id in &ids.1 {
+            record(self.prices_table(), id, Ok(op.clone()));
+        }
+    }
+
     /// Add a new asset row (monthly quantities initialised to 0) and save.
     /// The rows appended to `df` and `df_prices` get the same fresh
     /// [`ROW_ID_COLUMN`] value.
@@ -1274,11 +1526,23 @@ impl InvestmentHoldings {
         )?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
         self.df_prices = concat_df_diagonal(&[self.df_prices.clone(), price_row])?;
-        self.save()
+        self.save()?;
+        record(
+            self.holdings_table(),
+            &row_id,
+            upsert_row(&self.df, &row_id),
+        );
+        record(
+            self.prices_table(),
+            &row_id,
+            upsert_row(&self.df_prices, &row_id),
+        );
+        Ok(())
     }
 
     /// Remove an asset row by name from both holdings and prices, then save.
     pub fn remove_asset(&mut self, asset_name: &str) -> Result<()> {
+        let ids = self.asset_ids(asset_name)?;
         self.df = self
             .df
             .clone()
@@ -1291,7 +1555,9 @@ impl InvestmentHoldings {
             .lazy()
             .filter(col("asset_name").neq(lit(asset_name)))
             .collect()?;
-        self.save()
+        self.save()?;
+        self.record_asset(&ids, &ChangeOp::Delete);
+        Ok(())
     }
 
     /// Rename an asset row in both holdings and prices, then save.
@@ -1305,6 +1571,7 @@ impl InvestmentHoldings {
                 "Asset '{new_name}' already exists."
             )));
         }
+        let ids = self.asset_ids(old_name)?;
         self.df = set_str_where(
             self.df.clone(),
             "asset_name",
@@ -1319,7 +1586,9 @@ impl InvestmentHoldings {
             "asset_name",
             new_name,
         )?;
-        self.save()
+        self.save()?;
+        self.record_asset(&ids, &text_cell("asset_name", new_name));
+        Ok(())
     }
 
     /// Update the category for an asset in both frames, then save.
@@ -1332,6 +1601,7 @@ impl InvestmentHoldings {
                 "'{category}' is not a valid category. Choose from: {INVESTMENT_CATEGORIES:?}"
             )));
         }
+        let ids = self.asset_ids(asset_name)?;
         self.df = set_str_where(
             self.df.clone(),
             "asset_name",
@@ -1346,7 +1616,9 @@ impl InvestmentHoldings {
             "category",
             category,
         )?;
-        self.save()
+        self.save()?;
+        self.record_asset(&ids, &text_cell("category", category));
+        Ok(())
     }
 
     /// Update the link URL for an asset in both frames, then save.
@@ -1354,6 +1626,7 @@ impl InvestmentHoldings {
         if !self.asset_names()?.iter().any(|n| n == asset_name) {
             return Err(Error::NotFound(format!("Asset '{asset_name}' not found.")));
         }
+        let ids = self.asset_ids(asset_name)?;
         self.df = set_str_where(self.df.clone(), "asset_name", asset_name, "link", link)?;
         self.df_prices = set_str_where(
             self.df_prices.clone(),
@@ -1362,7 +1635,37 @@ impl InvestmentHoldings {
             "link",
             link,
         )?;
-        self.save()
+        self.save()?;
+        self.record_asset(&ids, &text_cell("link", link));
+        Ok(())
+    }
+
+    /// Update the currency for an asset, then save the holdings frame.
+    ///
+    /// `currency` lives on `df` only, so this writes and records only
+    /// `investments.parquet`; see the type's own docs for why `df_prices`
+    /// carries no currency.
+    pub fn set_currency(&mut self, asset_name: &str, currency: &str) -> Result<()> {
+        if !self.asset_names()?.iter().any(|n| n == asset_name) {
+            return Err(Error::NotFound(format!("Asset '{asset_name}' not found.")));
+        }
+        let ids = row_ids_where(&self.df, "asset_name", asset_name)?;
+        self.df = set_str_where(
+            self.df.clone(),
+            "asset_name",
+            asset_name,
+            "currency",
+            currency,
+        )?;
+        self.save_df()?;
+        for id in &ids {
+            record(
+                self.holdings_table(),
+                id,
+                Ok(text_cell("currency", currency)),
+            );
+        }
+        Ok(())
     }
 
     /// Set the quantity (`"quantity"`) or unit price (`"price"`) for an asset in
@@ -1385,11 +1688,17 @@ impl InvestmentHoldings {
         let col_name = format!("{month:02}");
         match quant_or_price {
             "quantity" => {
+                let ids = row_ids_where(&self.df, "asset_name", asset_name)?;
                 self.df =
                     set_f64_where(self.df.clone(), "asset_name", asset_name, &col_name, value)?;
-                self.save_df()
+                self.save_df()?;
+                for id in &ids {
+                    record(self.holdings_table(), id, number_cell(&col_name, value));
+                }
+                Ok(())
             }
             "price" => {
+                let ids = row_ids_where(&self.df_prices, "asset_name", asset_name)?;
                 self.df_prices = set_f64_where(
                     self.df_prices.clone(),
                     "asset_name",
@@ -1397,7 +1706,11 @@ impl InvestmentHoldings {
                     &col_name,
                     value,
                 )?;
-                self.save_df_prices()
+                self.save_df_prices()?;
+                for id in &ids {
+                    record(self.prices_table(), id, number_cell(&col_name, value));
+                }
+                Ok(())
             }
             other => Err(Error::InvalidArgument(format!(
                 "quant_or_price must be 'quantity' or 'price', got '{other}'"
@@ -1447,16 +1760,23 @@ impl InvestmentHoldings {
     }
 
     /// Write the holdings dataframe to disk.
+    ///
+    /// Saving records nothing in the change log; the methods above record the
+    /// change they made after calling this. Code that edits `df` directly and
+    /// then saves leaves that change out of the log and out of any later
+    /// sync, so add a method here instead.
     pub fn save_df(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
     }
 
-    /// Write the prices dataframe to disk.
+    /// Write the prices dataframe to disk. Records nothing: see
+    /// [`Self::save_df`].
     pub fn save_df_prices(&self) -> Result<()> {
         write_parquet(&self.df_prices, &self.path_prices)
     }
 
-    /// Write both holdings and prices dataframes to disk.
+    /// Write both holdings and prices dataframes to disk. Records nothing:
+    /// see [`Self::save_df`].
     pub fn save(&self) -> Result<()> {
         self.save_df()?;
         self.save_df_prices()
@@ -1503,6 +1823,19 @@ impl Liquidity {
         str_col_to_vec(&self.df, "asset_name")
     }
 
+    /// Where these rows live, for the change log.
+    fn change_table(&self) -> ChangeTable {
+        ChangeTable::Liquidity { year: self.year }
+    }
+
+    /// Record `op` on every row named `asset_name`, after the save. `ids`
+    /// comes from [`row_ids_where`], taken before the change.
+    fn record_rows(&self, ids: &[String], op: &ChangeOp) {
+        for id in ids {
+            record(self.change_table(), id, Ok(op.clone()));
+        }
+    }
+
     /// Add a new liquidity asset row (monthly values initialised to 0) with a
     /// fresh [`ROW_ID_COLUMN`] value, then save.
     pub fn add_asset(&mut self, asset_name: &str, category: &str, currency: &str) -> Result<()> {
@@ -1516,27 +1849,33 @@ impl Liquidity {
                 "Asset '{asset_name}' already exists."
             )));
         }
+        let row_id = new_row_id();
         let new_row = wide_row(
             &[
                 ("asset_name", asset_name),
                 ("category", category),
                 ("currency", currency),
             ],
-            &new_row_id(),
+            &row_id,
         )?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
-        self.save()
+        self.save()?;
+        record(self.change_table(), &row_id, upsert_row(&self.df, &row_id));
+        Ok(())
     }
 
     /// Remove a liquidity asset row by name, then save.
     pub fn remove_asset(&mut self, asset_name: &str) -> Result<()> {
+        let ids = row_ids_where(&self.df, "asset_name", asset_name)?;
         self.df = self
             .df
             .clone()
             .lazy()
             .filter(col("asset_name").neq(lit(asset_name)))
             .collect()?;
-        self.save()
+        self.save()?;
+        self.record_rows(&ids, &ChangeOp::Delete);
+        Ok(())
     }
 
     /// Rename a liquidity asset row, then save.
@@ -1550,6 +1889,7 @@ impl Liquidity {
                 "Asset '{new_name}' already exists."
             )));
         }
+        let ids = row_ids_where(&self.df, "asset_name", old_name)?;
         self.df = set_str_where(
             self.df.clone(),
             "asset_name",
@@ -1557,7 +1897,9 @@ impl Liquidity {
             "asset_name",
             new_name,
         )?;
-        self.save()
+        self.save()?;
+        self.record_rows(&ids, &text_cell("asset_name", new_name));
+        Ok(())
     }
 
     /// Update the category for a liquidity asset, then save.
@@ -1570,6 +1912,7 @@ impl Liquidity {
                 "'{category}' is not a valid category. Choose from: {LIQUIDITY_CATEGORIES:?}"
             )));
         }
+        let ids = row_ids_where(&self.df, "asset_name", asset_name)?;
         self.df = set_str_where(
             self.df.clone(),
             "asset_name",
@@ -1577,7 +1920,27 @@ impl Liquidity {
             "category",
             category,
         )?;
-        self.save()
+        self.save()?;
+        self.record_rows(&ids, &text_cell("category", category));
+        Ok(())
+    }
+
+    /// Update the currency for a liquidity asset, then save.
+    pub fn set_currency(&mut self, asset_name: &str, currency: &str) -> Result<()> {
+        if !self.asset_names()?.iter().any(|n| n == asset_name) {
+            return Err(Error::NotFound(format!("Asset '{asset_name}' not found.")));
+        }
+        let ids = row_ids_where(&self.df, "asset_name", asset_name)?;
+        self.df = set_str_where(
+            self.df.clone(),
+            "asset_name",
+            asset_name,
+            "currency",
+            currency,
+        )?;
+        self.save()?;
+        self.record_rows(&ids, &text_cell("currency", currency));
+        Ok(())
     }
 
     /// Set the value for an asset in a given month (1..=12), then save.
@@ -1591,11 +1954,21 @@ impl Liquidity {
             return Err(Error::NotFound(format!("Asset '{asset_name}' not found.")));
         }
         let col_name = format!("{month:02}");
+        let ids = row_ids_where(&self.df, "asset_name", asset_name)?;
         self.df = set_f64_where(self.df.clone(), "asset_name", asset_name, &col_name, value)?;
-        self.save()
+        self.save()?;
+        for id in &ids {
+            record(self.change_table(), id, number_cell(&col_name, value));
+        }
+        Ok(())
     }
 
     /// Write the liquidity dataframe to disk.
+    ///
+    /// Saving records nothing in the change log; the methods above record the
+    /// change they made after calling this. Code that edits `df` directly and
+    /// then saves leaves that change out of the log and out of any later
+    /// sync, so add a method here instead.
     pub fn save(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
     }
@@ -1648,6 +2021,19 @@ impl CreditsDebts {
         str_col_to_vec(&self.df, "name")
     }
 
+    /// Where these rows live, for the change log.
+    fn change_table(&self) -> ChangeTable {
+        ChangeTable::CreditsDebts { year: self.year }
+    }
+
+    /// Record `op` on every row named `name`, after the save. `ids` comes
+    /// from [`row_ids_where`], taken before the change.
+    fn record_rows(&self, ids: &[String], op: &ChangeOp) {
+        for id in ids {
+            record(self.change_table(), id, Ok(op.clone()));
+        }
+    }
+
     /// Add a new credit/debt row (monthly values initialised to 0) with a
     /// fresh [`ROW_ID_COLUMN`] value, then save.
     pub fn add_entry(&mut self, name: &str, currency: &str) -> Result<()> {
@@ -1656,20 +2042,26 @@ impl CreditsDebts {
                 "Entry '{name}' already exists."
             )));
         }
-        let new_row = wide_row(&[("name", name), ("currency", currency)], &new_row_id())?;
+        let row_id = new_row_id();
+        let new_row = wide_row(&[("name", name), ("currency", currency)], &row_id)?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
-        self.save()
+        self.save()?;
+        record(self.change_table(), &row_id, upsert_row(&self.df, &row_id));
+        Ok(())
     }
 
     /// Remove a credit/debt row by name, then save.
     pub fn remove_entry(&mut self, name: &str) -> Result<()> {
+        let ids = row_ids_where(&self.df, "name", name)?;
         self.df = self
             .df
             .clone()
             .lazy()
             .filter(col("name").neq(lit(name)))
             .collect()?;
-        self.save()
+        self.save()?;
+        self.record_rows(&ids, &ChangeOp::Delete);
+        Ok(())
     }
 
     /// Rename a credit/debt row, then save.
@@ -1683,8 +2075,23 @@ impl CreditsDebts {
                 "Entry '{new_name}' already exists."
             )));
         }
+        let ids = row_ids_where(&self.df, "name", old_name)?;
         self.df = set_str_where(self.df.clone(), "name", old_name, "name", new_name)?;
-        self.save()
+        self.save()?;
+        self.record_rows(&ids, &text_cell("name", new_name));
+        Ok(())
+    }
+
+    /// Update the currency for a credit/debt entry, then save.
+    pub fn set_currency(&mut self, name: &str, currency: &str) -> Result<()> {
+        if !self.entry_names()?.iter().any(|n| n == name) {
+            return Err(Error::NotFound(format!("Entry '{name}' not found.")));
+        }
+        let ids = row_ids_where(&self.df, "name", name)?;
+        self.df = set_str_where(self.df.clone(), "name", name, "currency", currency)?;
+        self.save()?;
+        self.record_rows(&ids, &text_cell("currency", currency));
+        Ok(())
     }
 
     /// Set the outstanding amount for an entry in a given month (1..=12), save.
@@ -1698,11 +2105,21 @@ impl CreditsDebts {
             return Err(Error::NotFound(format!("Entry '{name}' not found.")));
         }
         let col_name = format!("{month:02}");
+        let ids = row_ids_where(&self.df, "name", name)?;
         self.df = set_f64_where(self.df.clone(), "name", name, &col_name, value)?;
-        self.save()
+        self.save()?;
+        for id in &ids {
+            record(self.change_table(), id, number_cell(&col_name, value));
+        }
+        Ok(())
     }
 
     /// Write the credits/debts dataframe to disk.
+    ///
+    /// Saving records nothing in the change log; the methods above record the
+    /// change they made after calling this. Code that edits `df` directly and
+    /// then saves leaves that change out of the log and out of any later
+    /// sync, so add a method here instead.
     pub fn save(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
     }
@@ -1821,7 +2238,13 @@ impl RecurringExpenses {
         ])?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
         self.save()?;
+        record(self.change_table(), &row_id, upsert_row(&self.df, &row_id));
         Ok(row_id)
+    }
+
+    /// Where these rows live, for the change log.
+    fn change_table(&self) -> ChangeTable {
+        ChangeTable::Recurring { year: self.year }
     }
 
     /// Remove the recurring expense whose [`ROW_ID_COLUMN`] is `row_id`, then
@@ -1841,7 +2264,9 @@ impl RecurringExpenses {
             .lazy()
             .filter(col(ROW_ID_COLUMN).neq(lit(row_id)))
             .collect()?;
-        self.save()
+        self.save()?;
+        record(self.change_table(), row_id, Ok(ChangeOp::Delete));
+        Ok(())
     }
 
     /// Return every recurring definition not yet present in `de`'s month.
@@ -1910,6 +2335,13 @@ impl RecurringExpenses {
     /// Insert `rows` (as produced by [`Self::pending_for_month`]) into `de`
     /// under each row's derived ID, and return the inserted names.
     ///
+    /// This is the one place that records a change as
+    /// [`ChangeOrigin::RecurringApply`]. The mark is what lets the merge
+    /// engine keep a generated row the user deleted from coming back next
+    /// month, and a generated row carries the same derived ID as a hand typed
+    /// one, so nothing can tell them apart afterwards if the entry does not
+    /// say so.
+    ///
     /// Skips a row whose derived ID is already present in `de.expense_df`
     /// and does not count it in the returned names. This guards against two
     /// recurring templates sharing a `row_id` (a hand-copied or restored
@@ -1935,6 +2367,7 @@ impl RecurringExpenses {
                 Some(&row.primary_category),
                 &row.currency,
                 Some(&row.secondary_category),
+                Some(ChangeOrigin::RecurringApply),
             )?;
             added.push(row.expense_name.clone());
         }
@@ -1942,6 +2375,11 @@ impl RecurringExpenses {
     }
 
     /// Write the recurring expenses dataframe to disk.
+    ///
+    /// Saving records nothing in the change log; the methods above record the
+    /// change they made after calling this. Code that edits `df` directly and
+    /// then saves leaves that change out of the log and out of any later
+    /// sync, so add a method here instead.
     pub fn save(&self) -> Result<()> {
         write_parquet(&self.df, &self.path)
     }
@@ -1973,6 +2411,27 @@ mod tests {
             std::env::set_var("HOME", dir.path());
         }
         dir
+    }
+
+    /// Every change recorded so far, in the order it was written.
+    fn log_entries() -> Vec<sync::ChangeEntry> {
+        sync::read_log().expect("read the change log").entries
+    }
+
+    /// The [`ROW_ID_COLUMN`] value of `df`'s only row.
+    fn only_row_id(df: &DataFrame) -> String {
+        let ids = str_col_to_vec(df, ROW_ID_COLUMN).expect("read the row ID column");
+        assert_eq!(ids.len(), 1, "this helper expects a single row");
+        ids[0].clone()
+    }
+
+    /// The row an [`ChangeOp::Upsert`] carries, or a failure naming what the
+    /// entry held instead.
+    fn upserted_row(op: &ChangeOp) -> &Map<String, Value> {
+        match op {
+            ChangeOp::Upsert { row } => row,
+            other => panic!("expected an upsert, got {other:?}"),
+        }
     }
 
     /// Pins the wire values `set_quantity_or_price` accepts. This is a
@@ -2790,5 +3249,423 @@ mod tests {
         assert!(matches!(err, Error::AlreadyExists(_)), "{err}");
         assert_eq!(std::fs::read(&recurring_path).unwrap(), recurring_before);
         assert_eq!(rec.df.height(), 2);
+    }
+
+    /// Creating, editing, and deleting one expense records three changes to
+    /// the same row, in that order, each stamped after the one before it.
+    /// This is the shape the merge engine needs: the newest whole row wins,
+    /// and a delete after an edit keeps the row gone.
+    #[test]
+    #[serial_test::serial]
+    fn an_expense_records_its_create_edit_and_delete() {
+        let _temp = with_temp_data_home();
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let row_id = de
+            .add_row("Rent", 4, 1_000.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add the row");
+        de.edit_row(
+            &row_id,
+            Some("Rent March"),
+            None,
+            Some(1_100.0),
+            None,
+            None,
+            None,
+        )
+        .expect("edit the row");
+        de.delete_row(&row_id).expect("delete the row");
+
+        let entries = log_entries();
+        assert_eq!(entries.len(), 3, "one entry per change");
+        for entry in &entries {
+            assert_eq!(entry.row_id, row_id);
+            assert_eq!(
+                entry.table,
+                ChangeTable::Expenses {
+                    year: 2026,
+                    month: 3
+                }
+            );
+            assert_eq!(entry.origin, None, "a typed row carries no origin");
+        }
+        assert!(
+            entries[0].stamp < entries[1].stamp && entries[1].stamp < entries[2].stamp,
+            "stamps must increase: {:?}",
+            entries.iter().map(|e| e.stamp).collect::<Vec<_>>()
+        );
+
+        let created = upserted_row(&entries[0].op);
+        assert_eq!(created["expense_name"], Value::from("Rent"));
+        assert_eq!(created["expense_amount"], Value::from(1_000.0));
+        assert_eq!(created["currency"], Value::from("EUR"));
+        assert_eq!(created["row_id"], Value::from(row_id.as_str()));
+        // A date is carried as the day it names, not as a day count.
+        assert_eq!(created["expense_date"], Value::from("2026-03-04"));
+
+        let edited = upserted_row(&entries[1].op);
+        assert_eq!(edited["expense_name"], Value::from("Rent March"));
+        assert_eq!(edited["expense_amount"], Value::from(1_100.0));
+        assert_eq!(edited["row_id"], Value::from(row_id.as_str()));
+
+        assert_eq!(entries[2].op, ChangeOp::Delete);
+    }
+
+    /// A row `/api/recurring/apply` generates is marked
+    /// `origin: recurring_apply`, and nothing else is. The merge rule that
+    /// keeps a deleted generated row deleted has no other way to tell a
+    /// generated row from a hand typed one: both carry the derived ID.
+    #[test]
+    #[serial_test::serial]
+    fn only_an_applied_recurring_row_is_marked_generated() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add the template");
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows");
+        recurring
+            .insert_resolved(&mut de, &pending)
+            .expect("insert the generated row");
+        de.add_row("Tea", 2, 3.0, Some("Out"), "EUR", Some("Cafe"))
+            .expect("add a typed row");
+
+        let entries = log_entries();
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(entries[0].table, ChangeTable::Recurring { year: 2026 });
+        assert_eq!(entries[0].row_id, template_id);
+        assert_eq!(
+            entries[0].origin, None,
+            "adding a template is a user action"
+        );
+
+        assert_eq!(
+            entries[1].table,
+            ChangeTable::Expenses {
+                year: 2026,
+                month: 3
+            }
+        );
+        assert_eq!(entries[1].row_id, format!("{template_id}:2026-03"));
+        assert_eq!(entries[1].origin, Some(ChangeOrigin::RecurringApply));
+
+        assert_eq!(entries[2].origin, None, "a typed row carries no origin");
+    }
+
+    /// Deleting a recurring template records the delete against the
+    /// template's own table, and leaves the rows it already generated alone.
+    #[test]
+    #[serial_test::serial]
+    fn removing_a_recurring_template_records_a_delete() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add the template");
+        recurring.remove(&template_id).expect("remove the template");
+
+        let entries = log_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].table, ChangeTable::Recurring { year: 2026 });
+        assert_eq!(entries[1].row_id, template_id);
+        assert_eq!(entries[1].op, ChangeOp::Delete);
+    }
+
+    /// A net worth row is created and deleted as a whole row, and every edit
+    /// in between is one cell, under the column name the Parquet file uses.
+    /// A month column is the zero padded number, so the December cell is
+    /// `"12"` and never `"December"` or `12`.
+    #[test]
+    #[serial_test::serial]
+    fn a_liquidity_row_records_a_cell_per_edit() {
+        let _temp = with_temp_data_home();
+
+        let mut liquidity = Liquidity::new(2026).expect("load liquidity");
+        liquidity
+            .add_asset("Main", "Cash", "EUR")
+            .expect("add the account");
+        let row_id = only_row_id(&liquidity.df);
+        liquidity
+            .set_value("Main", 3, 120.5)
+            .expect("set the march value");
+        liquidity
+            .set_category("Main", "Other")
+            .expect("set the category");
+        liquidity
+            .set_currency("Main", "USD")
+            .expect("set the currency");
+        liquidity
+            .rename_asset("Main", "Wallet")
+            .expect("rename the account");
+        liquidity
+            .remove_asset("Wallet")
+            .expect("remove the account");
+
+        let entries = log_entries();
+        assert_eq!(entries.len(), 6, "one entry per change");
+        for entry in &entries {
+            assert_eq!(entry.table, ChangeTable::Liquidity { year: 2026 });
+            assert_eq!(entry.row_id, row_id);
+            assert_eq!(entry.origin, None);
+        }
+
+        let created = upserted_row(&entries[0].op);
+        assert_eq!(created["asset_name"], Value::from("Main"));
+        assert_eq!(created["currency"], Value::from("EUR"));
+        assert_eq!(created["01"], Value::from(0.0));
+        assert_eq!(created["row_id"], Value::from(row_id.as_str()));
+
+        assert_eq!(
+            entries[1].op,
+            ChangeOp::Cell {
+                column: "03".to_string(),
+                value: Value::from(120.5),
+            }
+        );
+        assert_eq!(
+            entries[2].op,
+            ChangeOp::Cell {
+                column: "category".to_string(),
+                value: Value::from("Other"),
+            }
+        );
+        assert_eq!(
+            entries[3].op,
+            ChangeOp::Cell {
+                column: "currency".to_string(),
+                value: Value::from("USD"),
+            }
+        );
+        assert_eq!(
+            entries[4].op,
+            ChangeOp::Cell {
+                column: "asset_name".to_string(),
+                value: Value::from("Wallet"),
+            }
+        );
+        assert_eq!(entries[5].op, ChangeOp::Delete);
+    }
+
+    /// A credit or debt row records the same way a liquidity row does, under
+    /// its own key column, which is `name` rather than `asset_name`.
+    #[test]
+    #[serial_test::serial]
+    fn a_credit_or_debt_row_records_a_cell_per_edit() {
+        let _temp = with_temp_data_home();
+
+        let mut credits_debts = CreditsDebts::new(2026).expect("load credits and debts");
+        credits_debts
+            .add_entry("Mortgage", "EUR")
+            .expect("add the entry");
+        let row_id = only_row_id(&credits_debts.df);
+        credits_debts
+            .set_value("Mortgage", 12, -40_600.0)
+            .expect("set the december value");
+        credits_debts
+            .rename_entry("Mortgage", "House loan")
+            .expect("rename the entry");
+        credits_debts
+            .set_currency("House loan", "USD")
+            .expect("set the currency");
+        credits_debts
+            .remove_entry("House loan")
+            .expect("remove the entry");
+
+        let entries = log_entries();
+        assert_eq!(entries.len(), 5);
+        for entry in &entries {
+            assert_eq!(entry.table, ChangeTable::CreditsDebts { year: 2026 });
+            assert_eq!(entry.row_id, row_id);
+        }
+        assert_eq!(
+            entries[1].op,
+            ChangeOp::Cell {
+                column: "12".to_string(),
+                value: Value::from(-40_600.0),
+            }
+        );
+        assert_eq!(
+            entries[2].op,
+            ChangeOp::Cell {
+                column: "name".to_string(),
+                value: Value::from("House loan"),
+            }
+        );
+        assert_eq!(entries[4].op, ChangeOp::Delete);
+    }
+
+    /// An investment change is recorded against the file it changed. The
+    /// holdings and the prices are two files and two tables, so a quantity
+    /// and a price never overwrite each other, while a shared field such as
+    /// the link is recorded once per file under the asset's one row ID.
+    #[test]
+    #[serial_test::serial]
+    fn an_investment_change_names_the_file_it_changed() {
+        let _temp = with_temp_data_home();
+        let holdings_table = ChangeTable::Investments { year: 2026 };
+        let prices_table = ChangeTable::InvestmentsPrices { year: 2026 };
+
+        let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        holdings
+            .add_asset("VWCE", "Stocks/ETF", "https://example.invalid/vwce", "EUR")
+            .expect("add the asset");
+        let row_id = only_row_id(&holdings.df);
+        assert_eq!(
+            only_row_id(&holdings.df_prices),
+            row_id,
+            "one asset, one row ID in both files"
+        );
+        holdings
+            .set_quantity("VWCE", 1, 10.0)
+            .expect("set the quantity");
+        holdings.set_price("VWCE", 1, 25.5).expect("set the price");
+        holdings
+            .set_currency("VWCE", "USD")
+            .expect("set the currency");
+        holdings
+            .set_link("VWCE", "https://example.invalid/new")
+            .expect("set the link");
+        holdings.remove_asset("VWCE").expect("remove the asset");
+
+        let entries = log_entries();
+        assert!(
+            entries.iter().all(|entry| entry.row_id == row_id),
+            "every entry belongs to the one asset"
+        );
+        let tables: Vec<&ChangeTable> = entries.iter().map(|entry| &entry.table).collect();
+        let ops: Vec<&ChangeOp> = entries.iter().map(|entry| &entry.op).collect();
+
+        assert_eq!(
+            tables,
+            vec![
+                &holdings_table, // the new holdings row
+                &prices_table,   // the new prices row
+                &holdings_table, // the quantity
+                &prices_table,   // the price
+                &holdings_table, // the currency, which lives on holdings only
+                &holdings_table, // the link, on both files
+                &prices_table,
+                &holdings_table, // the delete, on both files
+                &prices_table,
+            ]
+        );
+        assert_eq!(
+            ops[2],
+            &ChangeOp::Cell {
+                column: "01".to_string(),
+                value: Value::from(10.0),
+            }
+        );
+        assert_eq!(
+            ops[3],
+            &ChangeOp::Cell {
+                column: "01".to_string(),
+                value: Value::from(25.5),
+            }
+        );
+        assert_eq!(
+            ops[4],
+            &ChangeOp::Cell {
+                column: "currency".to_string(),
+                value: Value::from("USD"),
+            }
+        );
+        assert_eq!(ops[7], &ChangeOp::Delete);
+        assert_eq!(ops[8], &ChangeOp::Delete);
+    }
+
+    /// An income edit records one cell, keyed by the category name, because
+    /// the cashflow table has no row ID column. The `Income` row that
+    /// `recompute` derives from it records nothing: every device recomputes
+    /// it from the same cells.
+    #[test]
+    #[serial_test::serial]
+    fn an_income_edit_records_one_cell_and_nothing_derived() {
+        let _temp = with_temp_data_home();
+
+        let mut cashflow = Cashflow::new(2026).expect("load cashflow");
+        cashflow
+            .set_income(3, "Salary", 1_000.0)
+            .expect("set the salary");
+        cashflow
+            .set_income(3, "Other", 200.0)
+            .expect("set the other income");
+        assert_eq!(
+            cashflow.get_value("Income", "03").expect("read income"),
+            1_200.0,
+            "the derived row is still computed, it is just not recorded"
+        );
+
+        let entries = log_entries();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert_eq!(entry.table, ChangeTable::CashflowIncome { year: 2026 });
+        }
+        assert_eq!(entries[0].row_id, "Salary");
+        assert_eq!(
+            entries[0].op,
+            ChangeOp::Cell {
+                column: "03".to_string(),
+                value: Value::from(1_000.0),
+            }
+        );
+        assert_eq!(entries[1].row_id, "Other");
+        assert!(
+            entries.iter().all(|entry| entry.row_id != "Income"),
+            "the derived row must record nothing"
+        );
+    }
+
+    /// A change the log cannot record still succeeds and is still saved.
+    ///
+    /// This is the rule the whole hook design rests on. Returning the error
+    /// would tell the user their save failed when it did not, and the obvious
+    /// answer, pressing save again, would write the row twice. The cost is
+    /// that the log can fall behind the data, which the warning on stderr
+    /// reports and part 2 has to allow for.
+    ///
+    /// The log is made unopenable by putting a folder where its file goes,
+    /// which is the closest a test can get to a broken sync folder without
+    /// root.
+    #[test]
+    #[serial_test::serial]
+    fn a_change_the_log_cannot_record_is_still_saved() {
+        let _temp = with_temp_data_home();
+        let log_path = sync::changelog_path().expect("changelog path");
+        std::fs::create_dir(&log_path).expect("put a folder where the log file goes");
+        assert!(
+            sync::read_log().is_err(),
+            "the log has to be unusable, or this test proves nothing"
+        );
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let row_id = de
+            .add_row("Rent", 4, 1_000.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("the row is saved even though it cannot be recorded");
+
+        let reloaded = DetailedExpenses::new(2026, 3).expect("reload march expenses");
+        assert_eq!(reloaded.expense_df.height(), 1, "the row reached the file");
+        assert_eq!(
+            str_col_to_vec(&reloaded.expense_df, ROW_ID_COLUMN).expect("read the row IDs"),
+            vec![row_id.clone()]
+        );
+        // Editing and deleting stay usable too, so the app keeps working
+        // with a broken sync folder rather than failing every save.
+        de.edit_row(&row_id, Some("Rent March"), None, None, None, None, None)
+            .expect("an edit still succeeds");
+        de.delete_row(&row_id).expect("a delete still succeeds");
+        assert_eq!(
+            DetailedExpenses::new(2026, 3)
+                .expect("reload after the delete")
+                .expense_df
+                .height(),
+            0
+        );
     }
 }

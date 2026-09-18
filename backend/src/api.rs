@@ -458,33 +458,6 @@ fn column_dates_day(df: &polars::prelude::DataFrame, name: &str) -> Vec<i32> {
     }
 }
 
-/// Set `target_col` to `value` on every row where `key_col` equals `key`,
-/// leaving other rows unchanged. Does not save; callers persist the mutated
-/// dataframe (e.g. via `liq.save()`) afterward. Used by the metadata-update
-/// handlers to patch a single field (such as `currency`) on an already-loaded
-/// wide table without going through a dedicated setter on the domain type.
-fn set_df_str_where(
-    df: &mut polars::prelude::DataFrame,
-    key_col: &str,
-    key: &str,
-    target_col: &str,
-    value: &str,
-) -> crate::Result<()> {
-    use polars::prelude::*;
-    let updated = df
-        .clone()
-        .lazy()
-        .with_column(
-            when(col(key_col).eq(lit(key)))
-                .then(lit(value))
-                .otherwise(col(target_col))
-                .alias(target_col),
-        )
-        .collect()?;
-    *df = updated;
-    Ok(())
-}
-
 // ======================================================================
 // Handlers
 // ======================================================================
@@ -1343,11 +1316,6 @@ pub struct UpdateInvestmentPayload {
 /// the rename takes effect before any `category`/`link`/`currency` update
 /// below it, so those updates target the asset under its new name.
 ///
-/// Unlike `category` and `link`, `currency` has no dedicated setter on
-/// [`InvestmentHoldings`] (it lives on `df` only), so this handler patches it
-/// directly with [`set_df_str_where`] and saves, matching
-/// [`update_liquidity_meta_handler`].
-///
 /// Returns [`Error::NotFound`] (`404`) if `id` does not exist, or
 /// [`Error::AlreadyExists`] (`409`) if renaming to `payload.name` collides
 /// with an existing asset.
@@ -1369,14 +1337,7 @@ async fn update_investment_meta_handler(
         inv.set_category(&final_name, cat)?;
     }
     if let Some(cur) = &payload.currency {
-        if !str_col_to_vec(&inv.df, "asset_name")?
-            .iter()
-            .any(|n| n == &final_name)
-        {
-            return Err(crate::Error::NotFound(format!("Asset '{final_name}' not found.")).into());
-        }
-        set_df_str_where(&mut inv.df, "asset_name", &final_name, "currency", cur)?;
-        inv.save_df()?;
+        inv.set_currency(&final_name, cur)?;
     }
     if let Some(lnk) = &payload.link {
         inv.set_link(&final_name, lnk)?;
@@ -1511,9 +1472,7 @@ pub struct UpdateLiquidityPayload {
 
 /// `PUT /api/liquidity/:id`: update metadata for the liquidity row named `id`
 /// in `payload.year`. Same field-by-field, rename-first semantics as
-/// [`update_investment_meta_handler`]. Unlike `category` and `name`,
-/// `currency` has no dedicated setter on [`Liquidity`], so this handler
-/// patches it directly with [`set_df_str_where`] and saves explicitly.
+/// [`update_investment_meta_handler`].
 ///
 /// Returns [`Error::NotFound`] (`404`) if `id` does not exist, or
 /// [`Error::AlreadyExists`] (`409`) if renaming to `payload.name` collides
@@ -1536,14 +1495,7 @@ async fn update_liquidity_meta_handler(
         liq.set_category(&final_name, cat)?;
     }
     if let Some(cur) = &payload.currency {
-        if !str_col_to_vec(&liq.df, "asset_name")?
-            .iter()
-            .any(|n| n == &final_name)
-        {
-            return Err(crate::Error::NotFound(format!("Asset '{final_name}' not found.")).into());
-        }
-        set_df_str_where(&mut liq.df, "asset_name", &final_name, "currency", cur)?;
-        liq.save()?;
+        liq.set_currency(&final_name, cur)?;
     }
     Ok(())
 }
@@ -1657,9 +1609,7 @@ pub struct UpdateCreditDebtPayload {
 
 /// `PUT /api/credits_debts/:id`: update metadata for the entry named `id` in
 /// `payload.year`. Same field-by-field, rename-first semantics as
-/// [`update_investment_meta_handler`]; like liquidity, `currency` is patched
-/// directly with [`set_df_str_where`] since [`CreditsDebts`] has no dedicated
-/// currency setter.
+/// [`update_investment_meta_handler`].
 ///
 /// Returns [`Error::NotFound`] (`404`) if `id` does not exist, or
 /// [`Error::AlreadyExists`] (`409`) if renaming to `payload.name` collides
@@ -1679,14 +1629,7 @@ async fn update_credit_debt_meta_handler(
     };
 
     if let Some(cur) = &payload.currency {
-        if !str_col_to_vec(&cd.df, "name")?
-            .iter()
-            .any(|n| n == &final_name)
-        {
-            return Err(crate::Error::NotFound(format!("Entry '{final_name}' not found.")).into());
-        }
-        set_df_str_where(&mut cd.df, "name", &final_name, "currency", cur)?;
-        cd.save()?;
+        cd.set_currency(&final_name, cur)?;
     }
     Ok(())
 }
@@ -3298,5 +3241,112 @@ mod tests {
 
         let names: Vec<String> = list_september().await.into_iter().map(|e| e.name).collect();
         assert_eq!(names, vec!["Rent", "Tea"]);
+    }
+
+    /// `POST /api/recurring/apply` marks every row it generates
+    /// `recurring_apply` in the change log, while a row the user posts
+    /// carries no origin. The merge engine keeps a generated row the user
+    /// deleted from coming back on this mark alone, so losing it here is
+    /// silent: nothing later can tell the two kinds of row apart.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn applying_recurring_rows_marks_them_generated_in_the_change_log() {
+        let _temp = with_temp_env_offline();
+        let mut recurring =
+            df_operations::RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add a template");
+
+        let added = apply_recurring_handler(Json(ApplyRecurringPayload {
+            year: 2026,
+            month: 9,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("apply succeeds: {err}"))
+        .0;
+        assert_eq!(added, 1);
+
+        let _typed = upsert_expense_handler(Json(expense_payload("", "Tea", 4, 3.0)))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("posting an expense succeeds: {err}"));
+
+        let entries = crate::sync::read_log()
+            .expect("read the change log")
+            .entries;
+        let generated = entries
+            .iter()
+            .find(|entry| entry.row_id == format!("{template_id}:2026-09"))
+            .expect("the generated row is recorded");
+        assert_eq!(
+            generated.origin,
+            Some(crate::sync::ChangeOrigin::RecurringApply)
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.origin.is_some())
+                .count(),
+            1,
+            "only the generated row carries an origin"
+        );
+    }
+
+    /// Changing an asset's currency is recorded like any other cell edit.
+    /// This handler used to patch the dataframe itself and save, which no
+    /// change log hook could see; the edit belongs to the data layer now.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn updating_a_currency_is_recorded_as_a_cell() {
+        use axum::response::IntoResponse;
+        let _temp = with_temp_env_offline();
+        let mut liq = Liquidity::new(2026).expect("load liquidity");
+        liq.add_asset("Main", "Cash", "EUR")
+            .expect("add an account");
+
+        update_liquidity_meta_handler(
+            Path("Main".to_string()),
+            Json(UpdateLiquidityPayload {
+                year: 2026,
+                name: None,
+                category: None,
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("the update succeeds: {err}"));
+
+        let entries = crate::sync::read_log()
+            .expect("read the change log")
+            .entries;
+        assert_eq!(entries.len(), 2, "the add and the currency edit");
+        assert_eq!(
+            entries[1].op,
+            crate::sync::ChangeOp::Cell {
+                column: "currency".to_string(),
+                value: serde_json::Value::from("USD"),
+            }
+        );
+        assert_eq!(
+            Liquidity::new(2026).expect("reload liquidity").df.height(),
+            1,
+            "the saved table is unchanged in shape"
+        );
+
+        let missing = update_liquidity_meta_handler(
+            Path("Nothing".to_string()),
+            Json(UpdateLiquidityPayload {
+                year: 2026,
+                name: None,
+                category: None,
+                currency: Some("USD".to_string()),
+            }),
+        )
+        .await
+        .expect_err("an unknown asset is still a 404");
+        assert_eq!(
+            missing.into_response().status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
     }
 }

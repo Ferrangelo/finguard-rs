@@ -28,8 +28,9 @@ pub fn run() {
         )?;
       }
 
-      // `spawn_blocking`, because the migration scans every Parquet file in
-      // every year folder and must not hold up the event loop.
+      // `spawn_blocking`, because the migration and the change log baseline
+      // each scan every Parquet file in every year folder and must not hold
+      // up the event loop.
       let handle = app.handle().clone();
       tauri::async_runtime::spawn_blocking(move || {
         startup.publish(start_backend(&handle));
@@ -70,13 +71,21 @@ fn redirect_backend_paths(app: &tauri::AppHandle) -> Result<(), String> {
   Ok(())
 }
 
-/// Redirect the backend's paths, run the row ID migration, then build the
-/// router the migration clears the way for.
+/// Redirect the backend's paths, run the row ID migration, record the change
+/// log baseline, then build the router those two clear the way for.
 ///
-/// The order is required: every handler that loads a synced table rejects a
+/// The order is required. Every handler that loads a synced table rejects a
 /// file without row IDs, so the migration has to finish before the first
-/// request. A failed step leaves the app serving its message and touching no
-/// data file.
+/// request, and the baseline records rows by ID, so it has to follow the
+/// migration. A failed step leaves the app serving its message and touching
+/// no data file.
+///
+/// The baseline has to run here, at the first start, not whenever it seems
+/// convenient. It records what a data folder already holds, and it does that
+/// once: after the phone records its own first change, adding this call would
+/// come too late, and every row entered before it would stay out of the log
+/// and out of every sync. On a phone that starts empty, which is how the
+/// first pairing is meant to go, it records nothing and costs nothing.
 fn start_backend(app: &tauri::AppHandle) -> ApiBackend {
   if let Err(message) = redirect_backend_paths(app) {
     log::error!("{message}");
@@ -84,15 +93,24 @@ fn start_backend(app: &tauri::AppHandle) -> ApiBackend {
   }
 
   match finguard_rs_backend::row_id_migration::migrate_row_ids() {
-    Ok(report) => {
-      log::info!("{report}");
-      ApiBackend::Ready(finguard_rs_backend::api::router())
-    }
+    Ok(report) => log::info!("{report}"),
     Err(err) => {
       log::error!("Row ID migration failed: {err}");
-      ApiBackend::Unavailable(format!(
+      return ApiBackend::Unavailable(format!(
         "The app cannot use its data: the row ID migration failed: {err}"
-      ))
+      ));
     }
   }
+
+  match finguard_rs_backend::sync_baseline::baseline_change_log() {
+    Ok(report) => log::info!("{report}"),
+    Err(err) => {
+      log::error!("Change log baseline failed: {err}");
+      return ApiBackend::Unavailable(format!(
+        "The app cannot use its data: recording what it already holds failed: {err}"
+      ));
+    }
+  }
+
+  ApiBackend::Ready(finguard_rs_backend::api::router())
 }

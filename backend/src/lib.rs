@@ -2,8 +2,8 @@
 //!
 //! This crate is the library backing the application. The `finguard_rs_backend`
 //! binary built from `src/main.rs` is only startup: it binds the listener,
-//! runs the row ID migration, and serves [`api::router`]. Module
-//! responsibilities:
+//! runs the row ID migration, records the change log baseline, and serves
+//! [`api::router`]. Module responsibilities:
 //!
 //! - [`api`]: the HTTP surface, routes, request/response DTOs, and handlers,
 //!   built as [`api::router`] so any embedder, such as a future Tauri app,
@@ -14,7 +14,8 @@
 //!   files under `$XDG_CONFIG_HOME/finguard/`.
 //! - [`df_operations`]: the domain layer. Loads, mutates, and persists the
 //!   Polars dataframes backing every financial table (expenses, cashflow,
-//!   investments, liquidity, credits/debts).
+//!   investments, liquidity, credits/debts), and records each saved change in
+//!   [`sync`].
 //! - [`plots`]: derives chart-ready series (pie/bar/line data, no styling)
 //!   from the dataframes in [`df_operations`].
 //! - [`expr`]: a small safe arithmetic evaluator for amount input fields.
@@ -25,7 +26,14 @@
 //!   program that serves this data calls it before its first request.
 //! - [`sync`]: the append-only change log under
 //!   `$XDG_DATA_HOME/finguard/sync/`, its hybrid logical clock, and this
-//!   device's id. Nothing writes to it yet.
+//!   device's id. Every method in [`df_operations`] that saves a change
+//!   appends one entry here, right after the write that saved it.
+//! - [`sync_baseline`]: the startup pass that records the rows a data folder
+//!   already holds, so the log describes the whole current state rather than
+//!   starting mid history. It runs after [`row_id_migration`], writes nothing
+//!   when the log already holds a line, and takes the log's single writer
+//!   lock for the life of the process. Every program that serves this data
+//!   calls it before its first request.
 //! - [`error`]: the crate-wide [`Error`]/[`Result`] pair used by every module.
 //!
 //! Several parts of this crate deliberately reproduce behavior from the
@@ -47,5 +55,6 @@ pub mod paths;
 pub mod plots;
 pub mod row_id_migration;
 pub mod sync;
+pub mod sync_baseline;
 
 pub use error::{Error, Result};

@@ -1,24 +1,28 @@
 //! Finguard backend binary: process startup only.
 //!
-//! Binds the listener, runs the row ID migration, then serves
-//! [`finguard_rs_backend::api::router`]. The HTTP route table, request and
-//! response DTOs, and handlers live in [`finguard_rs_backend::api`]; this
-//! binary depends on the library and adds nothing but startup.
+//! Binds the listener, runs the row ID migration, records the change log
+//! baseline, then serves [`finguard_rs_backend::api::router`]. The HTTP route
+//! table, request and response DTOs, and handlers live in
+//! [`finguard_rs_backend::api`]; this binary depends on the library and adds
+//! nothing but startup.
 
 use std::net::SocketAddr;
 
-use finguard_rs_backend::row_id_migration;
+use finguard_rs_backend::{row_id_migration, sync_baseline};
 
-/// Bind the listener, run the row ID migration, then serve
-/// [`finguard_rs_backend::api::router`].
+/// Bind the listener, run the row ID migration, record the change log
+/// baseline, then serve [`finguard_rs_backend::api::router`].
 ///
 /// Binding comes first so that a taken or invalid address stops the process
 /// before any data file is touched. The migration
 /// ([`row_id_migration::migrate_row_ids`]) runs before serving, because every
-/// handler that loads a synced table rejects a file without row IDs.
-/// Requests that arrive during the migration wait in the listen queue. If
-/// binding or the migration fails, the process exits with status 1 and never
-/// serves a request.
+/// handler that loads a synced table rejects a file without row IDs. The
+/// baseline ([`sync_baseline::baseline_change_log`]) runs after it, because a
+/// row recorded before it has an ID could not be merged with the same row on
+/// another device; it also takes the change log's single writer lock for the
+/// life of the process. Requests that arrive during either step wait in the
+/// listen queue. If binding, the migration, or the baseline fails, the
+/// process exits with status 1 and never serves a request.
 ///
 /// `FINGUARD_HOST`/`FINGUARD_PORT` override the default bind address
 /// (`127.0.0.1:3111`); both are read once at startup, not per request.
@@ -43,6 +47,14 @@ async fn main() {
     };
 
     match row_id_migration::migrate_row_ids() {
+        Ok(report) => println!("{report}"),
+        Err(err) => {
+            eprintln!("Finguard server not started: {err}");
+            std::process::exit(1);
+        }
+    }
+
+    match sync_baseline::baseline_change_log() {
         Ok(report) => println!("{report}"),
         Err(err) => {
             eprintln!("Finguard server not started: {err}");
