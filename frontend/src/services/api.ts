@@ -7,6 +7,7 @@
 // changes on either side, update the matching Rust handler/struct and the
 // TypeScript types in `./types.ts` together.
 import type {
+  ApplyRecurringResult,
   Categories,
   CategoryTotals,
   CreditDebtRow,
@@ -24,6 +25,7 @@ import type {
   NetworthAllocation,
   NetworthEvolution,
   RecurringTemplate,
+  ReinstatedRow,
 } from "./types";
 
 // Prefixes every request. Empty by default, which keeps the relative
@@ -169,14 +171,41 @@ export async function deleteRecurring(id: string, year: number): Promise<void> {
 
 /**
  * POST /api/recurring/apply. Materializes every recurring template for
- * `year` into that year and month's expense file (skipping any template
- * already applied that month) and returns the count of expenses added.
+ * `year` into that year and month's expense file and reports what it did:
+ * `added` counts the rows created, and `skipped` lists the templates it
+ * withheld because the user had deleted that generated row. A template whose
+ * row is already in the month is silently left alone, so it is neither added
+ * nor skipped, which keeps the call safe to repeat. Pass a skipped item's
+ * `template_id` to `reinstateRecurring` to create its row after all.
  */
-export async function applyRecurring(year: number, month: number): Promise<number> {
+export async function applyRecurring(year: number, month: number): Promise<ApplyRecurringResult> {
   return apiFetch("/api/recurring/apply", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ year, month }),
+  });
+}
+
+/**
+ * POST /api/recurring/reinstate. Creates the row that `templateId` generates
+ * in `year`/`month`, the one `applyRecurring` reported in its `skipped` list.
+ * `templateId` is a `SkippedRecurring.template_id`, the same value as
+ * `RecurringTemplate.id`.
+ *
+ * A row that already exists is not an error: the call writes nothing and
+ * returns `created: false`. It throws for an unknown template (404), several
+ * templates sharing that id (409), a day the month cannot hold (400), and an
+ * I/O failure (500).
+ */
+export async function reinstateRecurring(
+  year: number,
+  month: number,
+  templateId: string,
+): Promise<ReinstatedRow> {
+  return apiFetch("/api/recurring/reinstate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ year, month, template_id: templateId }),
   });
 }
 

@@ -71,6 +71,53 @@ export interface RecurringTemplate {
 }
 
 /**
+ * Mirrors `ApplyRecurringResultJson` in backend/src/api.rs, the body of
+ * `POST /api/recurring/apply`. `added` counts the rows the call created.
+ * `skipped` lists the templates it refused to generate because the user's
+ * deletion of that generated row still stands, and is empty in the ordinary
+ * case; a template whose row is already in the month is neither added nor
+ * skipped.
+ */
+export interface ApplyRecurringResult {
+  added: number;
+  skipped: SkippedRecurring[];
+}
+
+/**
+ * Mirrors `SkippedRecurringJson` in backend/src/api.rs: one row
+ * `POST /api/recurring/apply` withheld, described well enough for the user
+ * to recognize the expense. `template_id` is the same value as
+ * `RecurringTemplate.id` and is what `reinstateRecurring` in
+ * `services/api.ts` takes. `row_id` is the ID the row would have had; it is
+ * unique within one response, so it also serves as a list key. `day` is 1 to
+ * 28, the range the backend clamps templates to. `currency` is typed as
+ * `Currency` to match `RecurringTemplate.currency`, but the backend column is
+ * a free string, so an older template could in principle carry a code outside
+ * the union.
+ */
+export interface SkippedRecurring {
+  template_id: string;
+  row_id: string;
+  name: string;
+  day: number;
+  amount: number;
+  currency: Currency;
+  primary: string;
+  secondary: string;
+}
+
+/**
+ * Mirrors `ReinstatedRowJson` in backend/src/api.rs, the body of
+ * `POST /api/recurring/reinstate`. `created` is `false` when the month
+ * already held the row and nothing was written, which is a success: the row
+ * is present either way.
+ */
+export interface ReinstatedRow {
+  row_id: string;
+  created: boolean;
+}
+
+/**
  * Frontend shape for a category-mapping rule (auto-assigns primary/secondary
  * categories to an expense whose trimmed, lower-cased name exactly equals `match`).
  * The backend's `MappingRuleJson` names this field `match_str` instead of `match`

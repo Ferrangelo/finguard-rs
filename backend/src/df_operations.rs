@@ -2145,8 +2145,10 @@ fn empty_recurring_df() -> DataFrame {
 /// A recurring template not yet present in a target month, along with the
 /// data needed to insert it.
 ///
-/// Returned by [`RecurringExpenses::pending_for_month`]; pass the list
-/// straight to [`RecurringExpenses::insert_resolved`].
+/// Returned by [`RecurringExpenses::plan_for_month`] in both halves of a
+/// [`RecurringApplyPlan`]. Pass the pending half straight to
+/// [`RecurringExpenses::insert_resolved`]; the skipped half is for showing
+/// the user what apply left out, so it carries the same fields.
 #[derive(Debug, Clone)]
 pub struct PendingRecurringRow {
     /// The [`ROW_ID_COLUMN`] value the inserted row must get: the template's
@@ -2154,6 +2156,12 @@ pub struct PendingRecurringRow {
     /// Both devices derive the same value for the same template and month,
     /// so a later sync merges the rows instead of duplicating them.
     pub row_id: String,
+    /// The [`ROW_ID_COLUMN`] value of the template this row comes from.
+    /// [`RecurringExpenses::reinstate_for_month`] takes it to name a skipped
+    /// row the user asks back, since `row_id` alone cannot be split reliably:
+    /// a template id is a UUID today, but nothing stops an older one from
+    /// holding a `:`.
+    pub template_row_id: String,
     /// The expense name to insert.
     pub expense_name: String,
     /// Day of month (1..=28) the generated row lands on.
@@ -2166,6 +2174,34 @@ pub struct PendingRecurringRow {
     pub primary_category: String,
     /// Secondary category to assign to the new row.
     pub secondary_category: String,
+}
+
+/// What one `/api/recurring/apply` call will and will not generate for a
+/// month. Returned by [`RecurringExpenses::plan_for_month`].
+///
+/// Neither list holds a template whose row the month already has, by derived
+/// ID or by name and day: those are not due at all and are reported nowhere.
+#[derive(Debug, Clone, Default)]
+pub struct RecurringApplyPlan {
+    /// Templates due for the month. Hand this to
+    /// [`RecurringExpenses::insert_resolved`].
+    pub pending: Vec<PendingRecurringRow>,
+    /// Templates due for the month whose generated row the user deleted, and
+    /// whose deletion still stands in the change log. Apply must not generate
+    /// these: that is the whole point of the rule. Show them to the user, who
+    /// can ask for one back through
+    /// [`RecurringExpenses::reinstate_for_month`].
+    pub skipped: Vec<PendingRecurringRow>,
+}
+
+/// What [`RecurringExpenses::reinstate_for_month`] did.
+#[derive(Debug, Clone)]
+pub struct ReinstatedRow {
+    /// The [`ROW_ID_COLUMN`] value of the row in the month, whether this call
+    /// created it or found it already there.
+    pub row_id: String,
+    /// False when the month already held that row and the call wrote nothing.
+    pub created: bool,
 }
 
 /// Derive the [`ROW_ID_COLUMN`] value for a row that `/api/recurring/apply`
@@ -2269,15 +2305,11 @@ impl RecurringExpenses {
         Ok(())
     }
 
-    /// Return every recurring definition not yet present in `de`'s month.
-    ///
-    /// Skips a template when the target month already holds a row whose
-    /// [`ROW_ID_COLUMN`] equals [`derived_recurring_row_id`] for that
-    /// template (a row a previous apply generated, on either device), or a
-    /// row with the same `expense_name` and the day component of
-    /// `expense_date` (a row from before derived IDs existed, so it carries
-    /// a random UUID that the first check cannot match).
-    pub fn pending_for_month(&self, de: &DetailedExpenses) -> Result<Vec<PendingRecurringRow>> {
+    /// Every template of this year as the row it would generate in
+    /// `year`/`month`, in table order and unfiltered: this consults neither
+    /// the target month nor the change log. [`Self::plan_for_month`] does
+    /// that filtering, and [`Self::reinstate_for_month`] picks one row out.
+    fn rows_for_month(&self, year: i32, month: u32) -> Result<Vec<PendingRecurringRow>> {
         let names = str_col_to_vec(&self.df, "expense_name")?;
         let days: Vec<i64> = self
             .df
@@ -2298,49 +2330,175 @@ impl RecurringExpenses {
         let secondaries = str_col_to_vec(&self.df, "secondary_category")?;
         let template_ids = str_col_to_vec(&self.df, ROW_ID_COLUMN)?;
 
-        let mut pending = Vec::new();
-        for i in 0..names.len() {
-            let name = &names[i];
-            let day = days[i];
-            let row_id = derived_recurring_row_id(&template_ids[i], de.year, de.month);
+        Ok((0..names.len())
+            .map(|i| PendingRecurringRow {
+                row_id: derived_recurring_row_id(&template_ids[i], year, month),
+                template_row_id: template_ids[i].clone(),
+                expense_name: names[i].clone(),
+                expense_day: days[i] as u32,
+                expense_amount: amounts[i],
+                currency: currencies[i].clone(),
+                primary_category: primaries[i].clone(),
+                secondary_category: secondaries[i].clone(),
+            })
+            .collect())
+    }
 
+    /// Split this year's recurring definitions into the rows `de`'s month
+    /// still needs and the rows apply must not generate.
+    ///
+    /// A template is due when the target month holds neither a row whose
+    /// [`ROW_ID_COLUMN`] equals [`derived_recurring_row_id`] for that
+    /// template (a row a previous apply generated, on either device) nor a
+    /// row with the same `expense_name` and the day component of
+    /// `expense_date` (a row from before derived IDs existed, so it carries
+    /// a random UUID that the first check cannot match). A template that is
+    /// not due appears in neither half of the plan.
+    ///
+    /// A due template goes to [`RecurringApplyPlan::skipped`] instead of
+    /// [`RecurringApplyPlan::pending`] when
+    /// [`crate::merge::generated_row_stays_deleted`] says the user's deletion
+    /// of that row still stands. The question has to be put to the change
+    /// log, because a deleted row is absent from the month's dataframe, which
+    /// is the very state that makes it look due. Without this, deleting
+    /// March's rent and pressing apply again brings it straight back on a
+    /// device that never syncs.
+    ///
+    /// The log is read once here and the same slice is reused for every
+    /// template.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the change log exists but cannot be read.
+    /// Failing is deliberate: a plan built without the log would regenerate
+    /// every row the user has ever deleted.
+    pub fn plan_for_month(&self, de: &DetailedExpenses) -> Result<RecurringApplyPlan> {
+        let candidates = self.rows_for_month(de.year, de.month)?;
+        let log = sync::read_log()?;
+        let table = de.change_table();
+
+        let mut plan = RecurringApplyPlan::default();
+        for row in candidates {
             let existing = de
                 .expense_df
                 .clone()
                 .lazy()
                 .filter(
-                    (col("expense_name")
-                        .eq(lit(name.as_str()))
-                        .and(col("expense_date").dt().day().eq(lit(day as i8))))
-                    .or(col(ROW_ID_COLUMN).eq(lit(row_id.as_str()))),
+                    (col("expense_name").eq(lit(row.expense_name.as_str())).and(
+                        col("expense_date")
+                            .dt()
+                            .day()
+                            .eq(lit(row.expense_day as i8)),
+                    ))
+                    .or(col(ROW_ID_COLUMN).eq(lit(row.row_id.as_str()))),
                 )
                 .collect()?;
             if existing.height() > 0 {
                 continue;
             }
 
-            pending.push(PendingRecurringRow {
-                row_id,
-                expense_name: name.clone(),
-                expense_day: day as u32,
-                expense_amount: amounts[i],
-                currency: currencies[i].clone(),
-                primary_category: primaries[i].clone(),
-                secondary_category: secondaries[i].clone(),
-            });
+            if crate::merge::generated_row_stays_deleted(&log.entries, &table, &row.row_id) {
+                plan.skipped.push(row);
+            } else {
+                plan.pending.push(row);
+            }
         }
-        Ok(pending)
+        Ok(plan)
     }
 
-    /// Insert `rows` (as produced by [`Self::pending_for_month`]) into `de`
-    /// under each row's derived ID, and return the inserted names.
+    /// The pending half of [`Self::plan_for_month`], for a caller that has
+    /// nowhere to report what apply skipped.
+    pub fn pending_for_month(&self, de: &DetailedExpenses) -> Result<Vec<PendingRecurringRow>> {
+        Ok(self.plan_for_month(de)?.pending)
+    }
+
+    /// Create the row `template_row_id` would generate in `de`'s month, after
+    /// the user confirmed they want back a row [`Self::plan_for_month`]
+    /// skipped.
+    ///
+    /// The change is recorded as an ordinary upsert, with no
+    /// [`ChangeOrigin`], and that is the point of this method rather than an
+    /// oversight. [`crate::merge`] holds a generated upsert back from
+    /// overriding a delete of the same row, so that a mechanical
+    /// regeneration cannot resurrect a deleted row, while an ordinary upsert
+    /// wins on stamp like any other deliberate edit. A user confirming this
+    /// row back is a deliberate edit. Marking it generated would make the
+    /// reinstate lose to the old delete at the next sync, and the row would
+    /// vanish again on both devices.
+    ///
+    /// When the month already holds the derived row ID this writes nothing
+    /// and reports [`ReinstatedRow::created`] as false. Two confirmations of
+    /// the same row, from a double click or a second open tab, then leave one
+    /// row rather than two: a duplicate ID in one month would be far worse
+    /// than a redundant call, because the uniqueness check then rejects every
+    /// later edit or delete of either copy.
+    ///
+    /// The derived ID is the only thing checked. A row the user retyped by
+    /// hand under a fresh ID does not block a reinstate, so a caller should
+    /// only offer this for rows [`Self::plan_for_month`] actually reported as
+    /// skipped, which have already passed the name-and-day check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] when this year has no template with that
+    /// [`ROW_ID_COLUMN`], and [`Error::AlreadyExists`], without writing
+    /// anything, when several templates share it: they derive the same row ID
+    /// for the month, so which one is meant cannot be answered.
+    pub fn reinstate_for_month(
+        &self,
+        de: &mut DetailedExpenses,
+        template_row_id: &str,
+    ) -> Result<ReinstatedRow> {
+        require_single_row(
+            &self.df,
+            template_row_id,
+            "recurring expense",
+            &self.year.to_string(),
+        )?;
+        let row = self
+            .rows_for_month(de.year, de.month)?
+            .into_iter()
+            .find(|row| row.template_row_id == template_row_id)
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "No recurring expense with id '{template_row_id}' in {}.",
+                    self.year
+                ))
+            })?;
+
+        if has_row_id(&de.expense_df, &row.row_id)? {
+            return Ok(ReinstatedRow {
+                row_id: row.row_id,
+                created: false,
+            });
+        }
+
+        de.add_row_with_id(
+            &row.row_id,
+            &row.expense_name,
+            row.expense_day,
+            row.expense_amount,
+            Some(&row.primary_category),
+            &row.currency,
+            Some(&row.secondary_category),
+            None,
+        )?;
+        Ok(ReinstatedRow {
+            row_id: row.row_id,
+            created: true,
+        })
+    }
+
+    /// Insert `rows` (the [`RecurringApplyPlan::pending`] half of
+    /// [`Self::plan_for_month`]) into `de` under each row's derived ID, and
+    /// return the inserted names.
     ///
     /// This is the one place that records a change as
     /// [`ChangeOrigin::RecurringApply`]. The mark is what lets the merge
     /// engine keep a generated row the user deleted from coming back next
     /// month, and a generated row carries the same derived ID as a hand typed
     /// one, so nothing can tell them apart afterwards if the entry does not
-    /// say so.
+    /// say so. [`Self::reinstate_for_month`] deliberately does not use it.
     ///
     /// Skips a row whose derived ID is already present in `de.expense_df`
     /// and does not count it in the returned names. This guards against two
@@ -3002,6 +3160,210 @@ mod tests {
             1,
             "only one row may land in the month under the shared id"
         );
+    }
+
+    /// The state the reinstate tests start from: a 2026 "Rent" template, its
+    /// row generated into March, and that row then deleted by the user.
+    /// Returns the loaded tables and the template's `row_id`; the deleted
+    /// row's id is `<template id>:2026-03`.
+    fn march_rent_generated_then_deleted() -> (RecurringExpenses, DetailedExpenses, String) {
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let plan = recurring.plan_for_month(&de).expect("plan march");
+        recurring
+            .insert_resolved(&mut de, &plan.pending)
+            .expect("insert pending rows");
+        de.delete_row(&format!("{template_id}:2026-03"))
+            .expect("delete the generated row");
+
+        (recurring, de, template_id)
+    }
+
+    /// Applying a month again after the user deleted a row it generated must
+    /// not bring the row back, and must report the template as skipped. The
+    /// deleted row is absent from the month's dataframe, which is exactly
+    /// what used to make it look due, so the answer comes from the change
+    /// log.
+    #[test]
+    #[serial_test::serial]
+    fn plan_for_month_skips_a_generated_row_the_user_deleted() {
+        let _temp = with_temp_data_home();
+        let (recurring, de, template_id) = march_rent_generated_then_deleted();
+
+        let plan = recurring.plan_for_month(&de).expect("plan march again");
+        assert!(
+            plan.pending.is_empty(),
+            "a deleted generated row must not be pending again"
+        );
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].row_id, format!("{template_id}:2026-03"));
+        assert_eq!(plan.skipped[0].template_row_id, template_id);
+        assert_eq!(plan.skipped[0].expense_name, "Rent");
+        assert_eq!(plan.skipped[0].expense_day, 1);
+        assert_eq!(de.expense_df.height(), 0, "the month must stay empty");
+    }
+
+    /// A template whose row was never deleted is still due, and nothing is
+    /// reported as skipped.
+    #[test]
+    #[serial_test::serial]
+    fn plan_for_month_reports_an_untouched_template_as_pending() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+
+        let de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let plan = recurring.plan_for_month(&de).expect("plan march");
+        assert_eq!(plan.pending.len(), 1);
+        assert_eq!(plan.pending[0].row_id, format!("{template_id}:2026-03"));
+        assert!(plan.skipped.is_empty());
+    }
+
+    /// Deleting a generated row must only bind the month it was in. The
+    /// derived ID carries the month, so another month's row is another row
+    /// and stays due.
+    #[test]
+    #[serial_test::serial]
+    fn deleting_a_generated_row_leaves_another_month_due() {
+        let _temp = with_temp_data_home();
+        let (recurring, _march, template_id) = march_rent_generated_then_deleted();
+
+        let april = DetailedExpenses::new(2026, 4).expect("load april expenses");
+        let plan = recurring.plan_for_month(&april).expect("plan april");
+        assert_eq!(plan.pending.len(), 1, "april is untouched and still due");
+        assert_eq!(plan.pending[0].row_id, format!("{template_id}:2026-04"));
+        assert!(plan.skipped.is_empty());
+    }
+
+    /// Reinstating a skipped row creates it under the derived ID and records
+    /// an ordinary upsert with no origin. The missing origin is what makes
+    /// the reinstate survive the next sync: the merge engine holds a
+    /// generated upsert back from overriding the old delete, so marking this
+    /// row generated would make it vanish again on both devices.
+    #[test]
+    #[serial_test::serial]
+    fn reinstating_a_skipped_row_records_an_ordinary_upsert() {
+        let _temp = with_temp_data_home();
+        let (recurring, mut de, template_id) = march_rent_generated_then_deleted();
+        let row_id = format!("{template_id}:2026-03");
+
+        let reinstated = recurring
+            .reinstate_for_month(&mut de, &template_id)
+            .expect("reinstate the deleted row");
+        assert!(reinstated.created);
+        assert_eq!(reinstated.row_id, row_id);
+        assert_eq!(de.expense_df.height(), 1);
+        assert_eq!(
+            str_col_to_vec(&de.expense_df, ROW_ID_COLUMN).expect("read row_id column"),
+            vec![row_id.clone()]
+        );
+
+        let entries = log_entries();
+        let last = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.row_id == row_id)
+            .expect("the reinstated row is recorded");
+        assert_eq!(last.origin, None, "a confirmed reinstate is a user action");
+        assert!(
+            matches!(last.op, ChangeOp::Upsert { .. }),
+            "the reinstate must record the whole row"
+        );
+    }
+
+    /// Applying the month again after a reinstate must neither add a second
+    /// row nor report the template as skipped: the row is back in the
+    /// dataframe, so the template is not due at all.
+    #[test]
+    #[serial_test::serial]
+    fn applying_after_a_reinstate_adds_nothing_and_skips_nothing() {
+        let _temp = with_temp_data_home();
+        let (recurring, mut de, template_id) = march_rent_generated_then_deleted();
+        recurring
+            .reinstate_for_month(&mut de, &template_id)
+            .expect("reinstate the deleted row");
+
+        let plan = recurring.plan_for_month(&de).expect("plan march again");
+        assert!(plan.pending.is_empty());
+        assert!(plan.skipped.is_empty());
+
+        let added = recurring
+            .insert_resolved(&mut de, &plan.pending)
+            .expect("insert pending rows");
+        assert!(added.is_empty());
+        assert_eq!(de.expense_df.height(), 1, "the row must not be duplicated");
+    }
+
+    /// Confirming the same reinstate twice, from a double click or a second
+    /// open tab, must leave one row. A duplicate `row_id` in one month would
+    /// leave both copies rejected by every later edit or delete.
+    #[test]
+    #[serial_test::serial]
+    fn reinstating_twice_creates_one_row() {
+        let _temp = with_temp_data_home();
+        let (recurring, mut de, template_id) = march_rent_generated_then_deleted();
+
+        recurring
+            .reinstate_for_month(&mut de, &template_id)
+            .expect("reinstate the deleted row");
+        let entries_after_first = log_entries().len();
+
+        let second = recurring
+            .reinstate_for_month(&mut de, &template_id)
+            .expect("a second reinstate succeeds");
+        assert!(!second.created, "the second call must write nothing");
+        assert_eq!(de.expense_df.height(), 1);
+        assert_eq!(
+            log_entries().len(),
+            entries_after_first,
+            "a call that writes nothing records nothing"
+        );
+    }
+
+    /// Reinstating an ID no template holds is [`Error::NotFound`], and two
+    /// templates sharing an ID make the request ambiguous, so it is refused
+    /// with [`Error::AlreadyExists`] and nothing is written.
+    #[test]
+    #[serial_test::serial]
+    fn reinstate_refuses_an_unknown_or_duplicated_template() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+
+        let unknown = recurring
+            .reinstate_for_month(&mut de, "no-such-template")
+            .expect_err("an unknown template must be refused");
+        assert!(matches!(unknown, Error::NotFound(_)), "{unknown}");
+
+        let duplicate_template = DataFrame::new_infer_height(vec![
+            Column::new("expense_name".into(), &["Internet"]),
+            Column::new("expense_day".into(), &[5i64]),
+            Column::new("expense_amount".into(), &[40.0]),
+            Column::new("currency".into(), &["EUR"]),
+            Column::new("primary_category".into(), &["Housing"]),
+            Column::new("secondary_category".into(), &["Internet"]),
+            Column::new(ROW_ID_COLUMN.into(), &[template_id.as_str()]),
+        ])
+        .expect("build a duplicate-id template row");
+        recurring.df = concat_df_diagonal(&[recurring.df.clone(), duplicate_template])
+            .expect("append the duplicate-id template");
+
+        let ambiguous = recurring
+            .reinstate_for_month(&mut de, &template_id)
+            .expect_err("a shared template id must be refused");
+        assert!(matches!(ambiguous, Error::AlreadyExists(_)), "{ambiguous}");
+        assert_eq!(de.expense_df.height(), 0, "nothing may be written");
     }
 
     /// Reloading a detailed-expenses table must migrate a legacy `"E"`

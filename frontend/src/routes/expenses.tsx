@@ -25,6 +25,7 @@ import { GlassCard } from "@/components/finguard/GlassCard";
 import { SubTabs } from "@/components/finguard/SubTabs";
 import { Combobox } from "@/components/finguard/Combobox";
 import { ConfirmButton } from "@/components/finguard/ConfirmButton";
+import { SkippedRecurringPanel } from "@/components/finguard/SkippedRecurringPanel";
 import { useChartColors, LEGEND_STYLE } from "@/components/finguard/DarkTooltip";
 import type {
   Categories,
@@ -33,6 +34,7 @@ import type {
   ExpenseWrite,
   MappingRule,
   RecurringTemplate,
+  SkippedRecurring,
 } from "@/services/types";
 import { useTheme } from "@/context/ThemeContext";
 
@@ -1411,6 +1413,21 @@ function RecurringTab() {
   // Categories only feed the add-template form, so a failure here is
   // reported without blocking the rest of the tab.
   const [catsError, setCatsError] = useState<string | null>(null);
+  // What the last apply refused to generate, tagged with the month it ran
+  // for. The rows stay on screen until the next apply, because the user has
+  // to read them and decide; only rows for the currently selected month are
+  // rendered, so switching month cannot show a list against the wrong
+  // heading.
+  const [skipped, setSkipped] = useState<{
+    year: number;
+    month: number;
+    items: SkippedRecurring[];
+  } | null>(null);
+  // `row_id`s of the reinstate requests in flight, so a row cannot be sent
+  // twice while the first request is still open.
+  const [reinstating, setReinstating] = useState<string[]>([]);
+  const skippedHere =
+    skipped && skipped.year === year && skipped.month === month ? skipped.items : [];
 
   useEffect(() => {
     let active = true;
@@ -1458,11 +1475,43 @@ function RecurringTab() {
   // Materializes every recurring template into the current month's expense
   // list (the backend skips templates already applied that month, see
   // api.applyRecurring), then refetches so DetailedTab shows the new rows.
+  // Templates the backend withheld because the user deleted their generated
+  // row come back in `skipped`, listed by SkippedRecurringPanel below rather
+  // than announced in a status message that disappears.
   const apply = async () => {
     notify("loading", "Applying recurring…");
-    const n = await api.applyRecurring(year, month);
-    notify("success", `Added ${n} entries to ${MONTHS[month - 1]} ${year}`);
-    refresh();
+    setSkipped(null);
+    try {
+      const result = await api.applyRecurring(year, month);
+      setSkipped({ year, month, items: result.skipped });
+      const left = result.skipped.length > 0 ? `, ${result.skipped.length} left out` : "";
+      notify("success", `Added ${result.added} entries to ${MONTHS[month - 1]} ${year}${left}`);
+      refresh();
+    } catch (err) {
+      notify("error", errorMessage(err, "Failed to apply recurring templates"));
+    }
+  };
+
+  // Creates one row the apply above left out, after the user confirmed it in
+  // SkippedRecurringPanel. Drops the row from the list and refetches on
+  // success, including when the backend reports `created: false`: the row is
+  // in the month either way, which is what the user asked for.
+  const reinstate = async (item: SkippedRecurring) => {
+    if (!skipped) return;
+    setReinstating((ids) => [...ids, item.row_id]);
+    try {
+      const done = await api.reinstateRecurring(skipped.year, skipped.month, item.template_id);
+      setSkipped((s) => (s ? { ...s, items: s.items.filter((i) => i.row_id !== item.row_id) } : s));
+      notify(
+        "success",
+        done.created ? `Added "${item.name}" back` : `"${item.name}" was already there`,
+      );
+      refresh();
+    } catch (err) {
+      notify("error", errorMessage(err, `Could not add "${item.name}" back`));
+    } finally {
+      setReinstating((ids) => ids.filter((id) => id !== item.row_id));
+    }
   };
 
   return (
@@ -1473,6 +1522,16 @@ function RecurringTab() {
         )}
         {catsError && <ErrorBanner message={`Could not load categories: ${catsError}`} />}
       </div>
+      {skippedHere.length > 0 && (
+        <div className="lg:col-span-2">
+          <SkippedRecurringPanel
+            items={skippedHere}
+            periodLabel={`${MONTHS[month - 1]} ${year}`}
+            busyRowIds={reinstating}
+            onReinstate={reinstate}
+          />
+        </div>
+      )}
       <GlassCard
         title={`${items.length} recurring templates`}
         action={

@@ -323,6 +323,60 @@ pub struct ApplyRecurringPayload {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct ReinstateRecurringPayload {
+    pub year: i32,
+    pub month: u32,
+    /// The `id` of the [`RecurringTemplateJson`] to generate, which is also
+    /// [`SkippedRecurringJson::template_id`].
+    pub template_id: String,
+}
+
+/// The result of one `POST /api/recurring/apply`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ApplyRecurringResultJson {
+    /// How many rows the call added to the month.
+    pub added: u32,
+    /// The templates the call refused to generate because the user's deletion
+    /// of that row still stands. Empty in the ordinary case.
+    pub skipped: Vec<SkippedRecurringJson>,
+}
+
+/// A row `POST /api/recurring/apply` did not generate, with enough of the
+/// expense for the user to recognize it and the two fields
+/// `POST /api/recurring/reinstate` needs back.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SkippedRecurringJson {
+    /// The recurring template's `row_id`, to send back as
+    /// [`ReinstateRecurringPayload::template_id`].
+    pub template_id: String,
+    /// The `row_id` the row would have had, derived from the template and the
+    /// month. Stable across devices, so it also serves as a list key.
+    pub row_id: String,
+    /// The expense name the template carries.
+    pub name: String,
+    /// Day of the month the row would land on.
+    pub day: u32,
+    /// The amount, in `currency`.
+    pub amount: f64,
+    /// The currency `amount` is denominated in.
+    pub currency: String,
+    /// Primary category the row would carry.
+    pub primary: String,
+    /// Secondary category the row would carry.
+    pub secondary: String,
+}
+
+/// The result of one `POST /api/recurring/reinstate`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ReinstatedRowJson {
+    /// The `row_id` of the row in the month, whether this call created it or
+    /// found it already there.
+    pub row_id: String,
+    /// False when the month already held the row and nothing was written.
+    pub created: bool,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct AddRecurringPayload {
     pub year: i32,
     pub name: String,
@@ -866,20 +920,75 @@ async fn delete_recurring_handler(
 /// `payload.year` into `payload.month`'s detailed-expenses table. Each
 /// inserted row's ID is derived from its template and the target month, so
 /// the desktop and the phone generate the same ID for the same template and
-/// month. A template is skipped when the month already holds a row with that
-/// derived ID (a previous apply, on either device) or a row with the same
-/// name and day-of-month (from before derived IDs existed). This makes the
-/// endpoint safe to call more than once for the same month. Returns the
-/// number of rows actually added.
+/// month. A template is passed over when the month already holds a row with
+/// that derived ID (a previous apply, on either device) or a row with the
+/// same name and day-of-month (from before derived IDs existed). This makes
+/// the endpoint safe to call more than once for the same month.
+///
+/// A template whose generated row the user deleted is not generated again,
+/// and is reported in [`ApplyRecurringResultJson::skipped`] instead, with
+/// what `POST /api/recurring/reinstate` needs to put it back.
 async fn apply_recurring_handler(
     Json(payload): Json<ApplyRecurringPayload>,
-) -> Result<Json<u32>, AppError> {
+) -> Result<Json<ApplyRecurringResultJson>, AppError> {
     let rec = RecurringExpenses::new(payload.year)?;
     let mut de = DetailedExpenses::new(payload.year, payload.month)?;
 
-    let pending = rec.pending_for_month(&de)?;
-    let added_names = rec.insert_resolved(&mut de, &pending)?;
-    Ok(Json(added_names.len() as u32))
+    let plan = rec.plan_for_month(&de)?;
+    let added_names = rec.insert_resolved(&mut de, &plan.pending)?;
+    Ok(Json(ApplyRecurringResultJson {
+        added: added_names.len() as u32,
+        skipped: plan.skipped.iter().map(skipped_recurring_json).collect(),
+    }))
+}
+
+/// One skipped row of a [`df_operations::RecurringApplyPlan`] as the API
+/// reports it.
+fn skipped_recurring_json(row: &df_operations::PendingRecurringRow) -> SkippedRecurringJson {
+    SkippedRecurringJson {
+        template_id: row.template_row_id.clone(),
+        row_id: row.row_id.clone(),
+        name: row.expense_name.clone(),
+        day: row.expense_day,
+        amount: row.expense_amount,
+        currency: row.currency.clone(),
+        primary: row.primary_category.clone(),
+        secondary: row.secondary_category.clone(),
+    }
+}
+
+/// `POST /api/recurring/reinstate`: create the row `payload.template_id`
+/// generates in `payload.year`/`payload.month`, which
+/// `POST /api/recurring/apply` reported as skipped because the user had
+/// deleted it.
+///
+/// This is a second call on purpose: the user confirms a named row here, and
+/// a confirmation must not be a flag on the apply that listed it. The row is
+/// recorded as an ordinary change with no origin, so it survives the next
+/// sync as the deliberate edit it is; see
+/// [`RecurringExpenses::reinstate_for_month`].
+///
+/// Calling it again for the same template and month writes nothing and
+/// returns [`ReinstatedRowJson::created`] as false, rather than adding a
+/// second copy or failing.
+///
+/// Returns [`Error::NotFound`] (`404`) when `payload.year` has no template
+/// with that `row_id`, and [`Error::AlreadyExists`] (`409`), without writing
+/// anything, when several templates share it.
+///
+/// [`Error::NotFound`]: crate::Error::NotFound
+/// [`Error::AlreadyExists`]: crate::Error::AlreadyExists
+async fn reinstate_recurring_handler(
+    Json(payload): Json<ReinstateRecurringPayload>,
+) -> Result<Json<ReinstatedRowJson>, AppError> {
+    let rec = RecurringExpenses::new(payload.year)?;
+    let mut de = DetailedExpenses::new(payload.year, payload.month)?;
+
+    let reinstated = rec.reinstate_for_month(&mut de, &payload.template_id)?;
+    Ok(Json(ReinstatedRowJson {
+        row_id: reinstated.row_id,
+        created: reinstated.created,
+    }))
 }
 
 /// `GET /api/mappings`: list every stored expense-name-to-category mapping.
@@ -1850,6 +1959,10 @@ pub fn router() -> Router {
         )
         .route("/api/recurring/:id", delete(delete_recurring_handler))
         .route("/api/recurring/apply", post(apply_recurring_handler))
+        .route(
+            "/api/recurring/reinstate",
+            post(reinstate_recurring_handler),
+        )
         // Mappings
         .route(
             "/api/mappings",
@@ -3258,14 +3371,15 @@ mod tests {
             .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
             .expect("add a template");
 
-        let added = apply_recurring_handler(Json(ApplyRecurringPayload {
+        let applied = apply_recurring_handler(Json(ApplyRecurringPayload {
             year: 2026,
             month: 9,
         }))
         .await
         .unwrap_or_else(|AppError(err)| panic!("apply succeeds: {err}"))
         .0;
-        assert_eq!(added, 1);
+        assert_eq!(applied.added, 1);
+        assert!(applied.skipped.is_empty());
 
         let _typed = upsert_expense_handler(Json(expense_payload("", "Tea", 4, 3.0)))
             .await
@@ -3290,6 +3404,86 @@ mod tests {
             1,
             "only the generated row carries an origin"
         );
+    }
+
+    /// The round trip the expenses page needs: apply, delete the row it
+    /// generated, apply again and find it reported instead of regenerated,
+    /// confirm it back, then apply once more and get a clean result. The
+    /// user's rule is that a generated row they deleted stays deleted, and
+    /// only a deliberate confirmation brings it back.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn apply_reports_a_deleted_row_and_reinstate_puts_it_back() {
+        let _temp = with_temp_env_offline();
+        let mut recurring =
+            df_operations::RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add a template");
+        let row_id = format!("{template_id}:2026-09");
+
+        let apply = || {
+            apply_recurring_handler(Json(ApplyRecurringPayload {
+                year: 2026,
+                month: 9,
+            }))
+        };
+
+        let first = apply()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("the first apply succeeds: {err}"))
+            .0;
+        assert_eq!(first.added, 1);
+        assert!(first.skipped.is_empty());
+
+        delete_expense_handler(
+            Path(row_id.clone()),
+            Query(DeleteExpenseQuery {
+                year: 2026,
+                month: 9,
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("deleting the generated row succeeds: {err}"));
+
+        let second = apply()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("the second apply succeeds: {err}"))
+            .0;
+        assert_eq!(second.added, 0, "the deleted row must not come back");
+        assert_eq!(second.skipped.len(), 1);
+        let skipped = &second.skipped[0];
+        assert_eq!(skipped.template_id, template_id);
+        assert_eq!(skipped.row_id, row_id);
+        assert_eq!(skipped.name, "Rent");
+        assert_eq!(skipped.day, 1);
+        assert_eq!(skipped.currency, "EUR");
+        assert_eq!(skipped.primary, "Housing");
+        assert_eq!(skipped.secondary, "Rent");
+        assert!(list_september().await.is_empty());
+
+        let reinstated = reinstate_recurring_handler(Json(ReinstateRecurringPayload {
+            year: 2026,
+            month: 9,
+            template_id: template_id.clone(),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("the reinstate succeeds: {err}"))
+        .0;
+        assert!(reinstated.created);
+        assert_eq!(reinstated.row_id, row_id);
+        assert_eq!(list_september().await.len(), 1);
+
+        let third = apply()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("the third apply succeeds: {err}"))
+            .0;
+        assert_eq!(third.added, 0);
+        assert!(
+            third.skipped.is_empty(),
+            "a reinstated row is present, so its template is not due"
+        );
+        assert_eq!(list_september().await.len(), 1, "no duplicate row");
     }
 
     /// Changing an asset's currency is recorded like any other cell edit.
