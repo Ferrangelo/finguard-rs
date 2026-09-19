@@ -39,8 +39,10 @@ use crate::df_operations::{
 use crate::fx;
 use crate::http_error::AppError;
 use crate::plots;
+use crate::sync::{self, ChangeOp, ChangeTable};
 use crate::sync_service;
 use crate::write_lock;
+use serde_json::{Map, Value};
 
 // ======================================================================
 // JSON Serialisation Models
@@ -559,13 +561,18 @@ async fn list_years_handler() -> Json<Vec<i32>> {
     Json(discover_years())
 }
 
-/// The reference currencies the frontend currency picker offers. An update
-/// naming any other code is rejected before it reaches disk (see
-/// [`update_currency_settings_handler`]), because every later rate lookup
-/// ([`fx::rate_on`], [`fx::monthly_rates`]) resolves against whatever is
-/// saved here, and an unsupported code would only fail those lookups later,
-/// far from this request and hard to trace back to it.
-const SUPPORTED_REFERENCE_CURRENCIES: [&str; 5] = ["EUR", "USD", "GBP", "CHF", "JPY"];
+fn record_setting_change(table: ChangeTable, row_id: String, op: ChangeOp) {
+    let result = sync::shared_log().and_then(|log| log.append(table, row_id, op));
+    if let Err(err) = result {
+        let marked = match sync::mark_log_incomplete(sync::IncompleteReason::AppendFailed) {
+            Ok(()) => "The log is marked incomplete.".to_string(),
+            Err(mark_err) => format!("Marking the log incomplete failed too ({mark_err})."),
+        };
+        eprintln!("Change log: settings change was saved but recording failed ({err}). {marked}");
+    }
+}
+
+use crate::config::SUPPORTED_REFERENCE_CURRENCIES;
 
 /// `GET /api/settings/currency`: the current reference currency and
 /// in-progress-month rate mode (see [`config::CurrencySettings`]).
@@ -587,6 +594,7 @@ async fn get_currency_settings_handler() -> Result<Json<CurrencySettingsJson>, A
 async fn update_currency_settings_handler(
     Json(payload): Json<CurrencySettingsJson>,
 ) -> Result<Json<CurrencySettingsJson>, AppError> {
+    let previous = config::get_currency_settings().ok();
     let reference_currency = payload.reference_currency.trim().to_uppercase();
     if !SUPPORTED_REFERENCE_CURRENCIES.contains(&reference_currency.as_str()) {
         return Err(crate::Error::InvalidArgument(format!(
@@ -601,6 +609,34 @@ async fn update_currency_settings_handler(
         current_month_rate_mode: payload.current_month_rate_mode,
     };
     config::set_currency_settings(&settings)?;
+    if previous
+        .as_ref()
+        .is_none_or(|previous| previous.reference_currency != settings.reference_currency)
+    {
+        record_setting_change(
+            ChangeTable::CurrencySettings,
+            "reference_currency".into(),
+            ChangeOp::Cell {
+                column: "value".into(),
+                value: Value::from(settings.reference_currency.clone()),
+            },
+        );
+    }
+    if previous
+        .as_ref()
+        .is_none_or(|previous| previous.current_month_rate_mode != settings.current_month_rate_mode)
+    {
+        let value =
+            serde_json::to_value(settings.current_month_rate_mode).map_err(crate::Error::from)?;
+        record_setting_change(
+            ChangeTable::CurrencySettings,
+            "current_month_rate_mode".into(),
+            ChangeOp::Cell {
+                column: "value".into(),
+                value,
+            },
+        );
+    }
     Ok(Json(CurrencySettingsJson {
         reference_currency: settings.reference_currency,
         current_month_rate_mode: settings.current_month_rate_mode,
@@ -1023,6 +1059,11 @@ async fn get_mappings_handler() -> Result<Json<Vec<MappingRuleJson>>, AppError> 
 async fn add_mapping_handler(
     Json(payload): Json<MappingRuleJson>,
 ) -> Result<Json<MappingRuleJson>, AppError> {
+    if payload.match_str.trim().is_empty() {
+        return Err(
+            crate::Error::InvalidArgument("mapping match_str must not be empty".into()).into(),
+        );
+    }
     config::add_mapping(
         &payload.match_str,
         &payload.primary,
@@ -1030,6 +1071,20 @@ async fn add_mapping_handler(
         true,
     )?;
     let key = payload.match_str.trim().to_lowercase();
+    let mut row = Map::new();
+    row.insert(
+        "primary_category".into(),
+        Value::from(payload.primary.trim().to_lowercase()),
+    );
+    row.insert(
+        "secondary_category".into(),
+        Value::from(payload.secondary.trim().to_lowercase()),
+    );
+    record_setting_change(
+        ChangeTable::CategoryMappings,
+        key.clone(),
+        ChangeOp::Upsert { row },
+    );
     Ok(Json(MappingRuleJson {
         id: key.clone(),
         match_str: key,
@@ -1043,6 +1098,11 @@ async fn add_mapping_handler(
 /// Returns [`Error::NotFound`] (`404`) if no mapping exists for that key.
 async fn delete_mapping_handler(Path(id): Path<String>) -> Result<(), AppError> {
     config::remove_mapping(&id)?;
+    record_setting_change(
+        ChangeTable::CategoryMappings,
+        id.trim().to_lowercase(),
+        ChangeOp::Delete,
+    );
     Ok(())
 }
 
@@ -1068,7 +1128,15 @@ async fn add_category_handler(
     Path(kind): Path<String>,
     Json(payload): Json<AddCategoryPayload>,
 ) -> Result<Json<CategoriesJson>, AppError> {
+    if payload.name.trim().is_empty() {
+        return Err(crate::Error::InvalidArgument("category name must not be empty".into()).into());
+    }
     config::add_known_category(&payload.name, &kind)?;
+    record_setting_change(
+        ChangeTable::KnownCategories,
+        format!("{kind}:{}", payload.name),
+        ChangeOp::Upsert { row: Map::new() },
+    );
     let known = config::get_known_categories()?;
     Ok(Json(CategoriesJson {
         primary: known.primary,
@@ -1192,6 +1260,11 @@ async fn delete_category_handler(
 
     config::remove_known_category(&name, &kind)?;
     crate::df_operations::remove_category_from_all_summaries(&name, &kind)?;
+    record_setting_change(
+        ChangeTable::KnownCategories,
+        format!("{kind}:{name}"),
+        ChangeOp::Delete,
+    );
 
     let known = config::get_known_categories()?;
     Ok(Json(CategoriesJson {
@@ -2094,6 +2167,7 @@ pub struct SyncResetPreviewJson {
     /// Changes on the phone the desktop does not have. The reset drops them
     /// from the log; the backup keeps the data they produced.
     pub unsent_entries: usize,
+    pub settings_entries: usize,
 }
 
 /// `POST /api/sync/now` response body.
@@ -2300,6 +2374,7 @@ async fn sync_now_handler(
             year_folders: preview.year_folders,
             unreadable_files: preview.unreadable_files,
             unsent_entries: preview.unsent_entries,
+            settings_entries: preview.settings_entries,
         }),
         backup_folder: done.backup_folder,
     }))
@@ -3185,6 +3260,123 @@ mod tests {
         // Nothing must have been persisted: the default settings still load.
         let settings = config::get_currency_settings().expect("load settings");
         assert_eq!(settings.reference_currency, "EUR");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn settings_handlers_append_their_change_entries() {
+        let _temp = with_temp_env_offline();
+        add_mapping_handler(Json(MappingRuleJson {
+            id: String::new(),
+            match_str: "coffee".into(),
+            primary: "food".into(),
+            secondary: "cafes".into(),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("add mapping: {err}"));
+        delete_mapping_handler(Path("coffee".into()))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("delete mapping: {err}"));
+        add_category_handler(
+            Path("primary".into()),
+            Json(AddCategoryPayload {
+                kind: "primary".into(),
+                name: "Food".into(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("add category: {err}"));
+        delete_category_handler(Path(("primary".into(), "Food".into())))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("delete category: {err}"));
+        update_currency_settings_handler(Json(CurrencySettingsJson {
+            reference_currency: "USD".into(),
+            current_month_rate_mode: config::CurrentMonthRateMode::Live,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("update currency: {err}"));
+
+        let entries = crate::sync::read_log().unwrap().entries;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.table, ChangeTable::CategoryMappings)
+                    && matches!(entry.op, ChangeOp::Upsert { .. }))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.table, ChangeTable::CategoryMappings)
+                    && matches!(entry.op, ChangeOp::Delete))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.table, ChangeTable::KnownCategories)
+                    && matches!(entry.op, ChangeOp::Upsert { .. }))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.table, ChangeTable::KnownCategories)
+                    && matches!(entry.op, ChangeOp::Delete))
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(entry.table, ChangeTable::CurrencySettings))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn currency_update_repairs_a_corrupt_settings_file() {
+        let _temp = with_temp_env_offline();
+        let path = config::get_config_dir().unwrap().join("currency.json");
+        std::fs::write(&path, b"not json").unwrap();
+        let result = update_currency_settings_handler(Json(CurrencySettingsJson {
+            reference_currency: "USD".into(),
+            current_month_rate_mode: config::CurrentMonthRateMode::Live,
+        }))
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            config::get_currency_settings().unwrap().reference_currency,
+            "USD"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn settings_handlers_reject_empty_mapping_and_category_names() {
+        let _temp = with_temp_env_offline();
+        let mapping = add_mapping_handler(Json(MappingRuleJson {
+            id: String::new(),
+            match_str: "  ".into(),
+            primary: "food".into(),
+            secondary: "other".into(),
+        }))
+        .await;
+        assert!(matches!(
+            mapping,
+            Err(AppError(crate::Error::InvalidArgument(_)))
+        ));
+        let category = add_category_handler(
+            Path("primary".into()),
+            Json(AddCategoryPayload {
+                kind: "primary".into(),
+                name: " ".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            category,
+            Err(AppError(crate::Error::InvalidArgument(_)))
+        ));
+        assert!(config::get_all_mappings().unwrap().is_empty());
+        assert!(config::get_known_categories().unwrap().primary.is_empty());
     }
 
     /// A brand-new year has no investment, liquidity, or credits/debts rows

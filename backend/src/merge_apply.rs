@@ -53,9 +53,11 @@ use std::fmt;
 use std::path::PathBuf;
 
 use chrono::NaiveDate;
+use indexmap::IndexMap;
 use polars::prelude::*;
 use serde_json::{Map, Value};
 
+use crate::config::{self, CategoryMapping, CurrencySettings, KnownCategories};
 use crate::df_operations::{
     Cashflow, CreditsDebts, DetailedExpenses, INCOME_CATEGORIES, InvestmentHoldings, Liquidity,
     ROW_ID_COLUMN, RecurringExpenses, has_column, month_labels,
@@ -181,7 +183,47 @@ pub(crate) fn apply_remote_batch_holding(
     }
 
     let mut files = PreparedFiles::default();
-    let written = files.prepare(&plan.actions).and_then(|()| files.write());
+    let mut settings = plan
+        .actions
+        .iter()
+        .any(|action| {
+            matches!(
+                action.table,
+                ChangeTable::CategoryMappings
+                    | ChangeTable::KnownCategories
+                    | ChangeTable::CurrencySettings
+            )
+        })
+        .then(SettingsWriter::load)
+        .transpose()?;
+    let parquet_actions: Vec<MergeAction> = plan
+        .actions
+        .iter()
+        .filter(|action| {
+            !matches!(
+                action.table,
+                ChangeTable::CategoryMappings
+                    | ChangeTable::KnownCategories
+                    | ChangeTable::CurrencySettings
+            )
+        })
+        .cloned()
+        .collect();
+    let written = files
+        .prepare(&parquet_actions)
+        .and_then(|()| {
+            settings
+                .as_mut()
+                .map_or(Ok(()), |settings| settings.prepare(&plan.actions))
+        })
+        .and_then(|()| files.write())
+        .and_then(|files_written| {
+            settings.map_or(Ok(files_written), |settings| {
+                settings
+                    .write()
+                    .map(|settings_written| files_written + settings_written)
+            })
+        });
     // A year folder a load created and nothing was written into, whether
     // because every action was a no-op or because the run failed, would show
     // up in the year list as an empty year.
@@ -225,6 +267,11 @@ impl FileKey {
             ChangeTable::Liquidity { year } => FileKey::Liquidity(year),
             ChangeTable::CreditsDebts { year } => FileKey::CreditsDebts(year),
             ChangeTable::CashflowIncome { year } => FileKey::Cashflow(year),
+            ChangeTable::CategoryMappings
+            | ChangeTable::KnownCategories
+            | ChangeTable::CurrencySettings => {
+                unreachable!("settings actions are separated before file preparation")
+            }
         }
     }
 
@@ -349,6 +396,155 @@ struct PreparedFiles {
     created_year_dirs: Vec<PathBuf>,
 }
 
+#[derive(Clone)]
+struct SettingsWriter {
+    mappings: IndexMap<String, CategoryMapping>,
+    categories: KnownCategories,
+    currency: CurrencySettings,
+    mapping_changed: bool,
+    categories_changed: bool,
+    currency_changed: bool,
+}
+
+impl SettingsWriter {
+    fn load() -> Result<Self> {
+        Ok(Self {
+            mappings: config::get_all_mappings()?,
+            categories: config::get_known_categories()?,
+            currency: config::get_currency_settings()?,
+            mapping_changed: false,
+            categories_changed: false,
+            currency_changed: false,
+        })
+    }
+
+    fn prepare(&mut self, actions: &[MergeAction]) -> Result<()> {
+        for action in actions {
+            match &action.table {
+                ChangeTable::CategoryMappings => match &action.action {
+                    RowAction::Upsert { row } => {
+                        let primary = row
+                            .get("primary_category")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                Error::MergeRejected("mapping primary category is not text".into())
+                            })?;
+                        let secondary = row
+                            .get("secondary_category")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                Error::MergeRejected(
+                                    "mapping secondary category is not text".into(),
+                                )
+                            })?;
+                        self.mappings.insert(
+                            action.row_id.clone(),
+                            CategoryMapping {
+                                primary_category: primary.to_string(),
+                                secondary_category: secondary.to_string(),
+                            },
+                        );
+                        self.mapping_changed = true;
+                    }
+                    RowAction::Delete => {
+                        self.mappings.shift_remove(&action.row_id);
+                        self.mapping_changed = true;
+                    }
+                    RowAction::SetCells { .. } => {
+                        return Err(Error::MergeRejected(
+                            "mapping settings require whole rows".into(),
+                        ));
+                    }
+                },
+                ChangeTable::KnownCategories => {
+                    let (kind, name) = action.row_id.split_once(':').ok_or_else(|| {
+                        Error::MergeRejected("invalid known category row id".into())
+                    })?;
+                    let list = if kind == "primary" {
+                        &mut self.categories.primary
+                    } else {
+                        &mut self.categories.secondary
+                    };
+                    match action.action {
+                        RowAction::Upsert { .. } => {
+                            if !list.contains(&name.to_string()) {
+                                list.push(name.to_string());
+                                list.sort();
+                            }
+                        }
+                        RowAction::Delete => list.retain(|item| item != name),
+                        RowAction::SetCells { .. } => {
+                            return Err(Error::MergeRejected(
+                                "known categories require whole rows".into(),
+                            ));
+                        }
+                    }
+                    self.categories_changed = true;
+                }
+                ChangeTable::CurrencySettings => {
+                    let cells = match &action.action {
+                        RowAction::SetCells { cells } => cells,
+                        RowAction::Upsert { row } => {
+                            let value = row.get("value").cloned().ok_or_else(|| {
+                                Error::MergeRejected("currency setting upsert lacks value".into())
+                            })?;
+                            let field = action.row_id.clone();
+                            self.set_currency(&field, value)?;
+                            self.currency_changed = true;
+                            continue;
+                        }
+                        RowAction::Delete => continue,
+                    };
+                    for cell in cells {
+                        self.set_currency(&action.row_id, cell.value.clone())?;
+                    }
+                    self.currency_changed = true;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn set_currency(&mut self, field: &str, value: Value) -> Result<()> {
+        match field {
+            "reference_currency" => {
+                self.currency.reference_currency = value
+                    .as_str()
+                    .ok_or_else(|| Error::MergeRejected("reference currency is not text".into()))?
+                    .to_string()
+            }
+            "current_month_rate_mode" => {
+                self.currency.current_month_rate_mode = serde_json::from_value(value)
+                    .map_err(|_| Error::MergeRejected("invalid current month rate mode".into()))?
+            }
+            _ => {
+                return Err(Error::MergeRejected(
+                    "unknown currency setting field".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&self) -> Result<usize> {
+        let mut count = 0;
+        if self.mapping_changed {
+            config::write_mappings_for_sync(&self.mappings)?;
+            count += 1;
+        }
+        if self.categories_changed {
+            config::write_known_categories_for_sync(&self.categories)?;
+            count += 1;
+        }
+        if self.currency_changed {
+            config::set_currency_settings(&self.currency)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
 impl PreparedFiles {
     /// Load every targeted file and apply every action to it in memory, in
     /// the plan's order. Writes no file.
@@ -409,6 +605,9 @@ fn describe(table: &ChangeTable) -> String {
         ChangeTable::Liquidity { year } => (LIQUIDITY_FILENAME.to_string(), year),
         ChangeTable::CreditsDebts { year } => (CREDITS_DEBTS_FILENAME.to_string(), year),
         ChangeTable::CashflowIncome { year } => (CASHFLOW_FILENAME.to_string(), year),
+        ChangeTable::CategoryMappings => ("category_mappings.json".to_string(), &0),
+        ChangeTable::KnownCategories => ("known_categories.json".to_string(), &0),
+        ChangeTable::CurrencySettings => ("currency.json".to_string(), &0),
     };
     format!("{file} of {year}")
 }
@@ -958,6 +1157,69 @@ mod tests {
         assert_eq!(f64_at(&cashflow, "category", "Salary", "03"), Some(2500.0));
         assert_eq!(f64_at(&cashflow, "category", "Income", "03"), Some(2500.0));
         assert_eq!(log_entries(), batch);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn settings_batch_writes_config_and_rejects_bad_values_atomically() {
+        let _temp = with_temp_env();
+        let mut mapping = Map::new();
+        mapping.insert("primary_category".into(), Value::from("food"));
+        mapping.insert("secondary_category".into(), Value::from("groceries"));
+        let mut currency = Map::new();
+        currency.insert("value".into(), Value::from("USD"));
+        let batch = vec![
+            remote(
+                1,
+                ChangeTable::CategoryMappings,
+                "coffee",
+                ChangeOp::Upsert { row: mapping },
+            ),
+            remote(
+                2,
+                ChangeTable::KnownCategories,
+                "primary:Food",
+                ChangeOp::Upsert { row: Map::new() },
+            ),
+            remote(
+                3,
+                ChangeTable::CurrencySettings,
+                "reference_currency",
+                ChangeOp::Upsert { row: currency },
+            ),
+        ];
+        let report = apply_remote_batch(&batch).expect("apply settings");
+        assert_eq!(report.files_written, 3);
+        assert_eq!(config::get_all_mappings().unwrap().len(), 1);
+        assert_eq!(
+            config::get_known_categories().unwrap().primary,
+            vec!["Food"]
+        );
+        assert_eq!(
+            config::get_currency_settings().unwrap().reference_currency,
+            "USD"
+        );
+
+        let before = (
+            config::get_all_mappings().unwrap(),
+            config::get_known_categories().unwrap(),
+            config::get_currency_settings().unwrap(),
+            log_bytes(),
+        );
+        let bad = remote(
+            4,
+            ChangeTable::CurrencySettings,
+            "reference_currency",
+            ChangeOp::Cell {
+                column: "value".into(),
+                value: Value::from("CAD"),
+            },
+        );
+        assert!(apply_remote_batch(&[bad]).is_err());
+        assert_eq!(config::get_all_mappings().unwrap(), before.0);
+        assert_eq!(config::get_known_categories().unwrap(), before.1);
+        assert_eq!(config::get_currency_settings().unwrap(), before.2);
+        assert_eq!(log_bytes(), before.3);
     }
 
     /// Upsert replaces the whole row in place, a delete removes it, and a

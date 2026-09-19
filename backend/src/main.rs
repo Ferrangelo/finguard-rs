@@ -62,6 +62,11 @@ async fn main() {
         }
     }
 
+    if let Err(err) = sync_baseline::settings_baseline_change_log() {
+        eprintln!("Finguard server not started: {err}");
+        std::process::exit(1);
+    }
+
     println!("Finguard server running on http://{}", addr);
     axum::serve(listener, finguard_rs_backend::api::router())
         .await

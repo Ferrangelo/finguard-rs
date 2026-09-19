@@ -93,6 +93,7 @@ use polars::prelude::DataFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::config;
 use crate::df_operations::{
     Cashflow, CreditsDebts, DetailedExpenses, INCOME_CATEGORIES, InvestmentHoldings, Liquidity,
     ROW_ID_COLUMN, RecurringExpenses, has_column, month_labels, row_json, str_col_to_vec,
@@ -116,6 +117,33 @@ fn plural(count: usize) -> &'static str {
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 const BASELINE_MARKER_FILE_NAME: &str = "baseline_done";
+const SETTINGS_BASELINE_MARKER_FILE_NAME: &str = "settings_baseline_done";
+const SETTINGS_MAPPINGS_FILE: &str = "category_mappings.json";
+const SETTINGS_CATEGORIES_FILE: &str = "known_categories.json";
+const SETTINGS_CURRENCY_FILE: &str = "currency.json";
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SettingsBaselineMarker {
+    #[serde(default)]
+    skipped_files: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SettingsBaselineReport {
+    pub skipped_files: Vec<String>,
+}
+
+fn handle_settings_append_error(kind: &str, err: Error) -> Result<()> {
+    match err {
+        Error::InvalidArgument(message) => {
+            eprintln!(
+                "Change log: skipped an invalid {kind} during settings baseline ({message})."
+            );
+            Ok(())
+        }
+        err => Err(err),
+    }
+}
 
 /// Which of the conditions that make [`baseline_change_log`] record the data
 /// again fired. On a paired device it records nothing instead, and reports
@@ -346,6 +374,156 @@ pub fn baseline_change_log() -> Result<ChangeLogBaseline> {
         },
     )?;
     Ok(report)
+}
+
+pub fn settings_baseline_change_log() -> Result<()> {
+    if crate::sync_service::role() != crate::sync_service::SyncRole::Hub {
+        return Ok(());
+    }
+    let marker = get_sync_dir()?.join(SETTINGS_BASELINE_MARKER_FILE_NAME);
+    let previous = match std::fs::read_to_string(&marker) {
+        Ok(text) => serde_json::from_str::<SettingsBaselineMarker>(&text).ok(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            eprintln!(
+                "Change log: settings baseline marker could not be read ({err}); retrying all settings."
+            );
+            None
+        }
+    };
+    let files = previous
+        .as_ref()
+        .map(|marker| marker.skipped_files.as_slice())
+        .unwrap_or(&[]);
+    if previous.is_some() && files.is_empty() {
+        return Ok(());
+    }
+    if paired_for_baseline() {
+        let marked = sync::mark_log_incomplete(IncompleteReason::BaselineRefused);
+        eprintln!(
+            "Change log: settings baseline skipped because this device has a sync peer. {marked:?}"
+        );
+        return Ok(());
+    }
+    let log = sync::shared_log()?;
+    let report = record_current_settings(&log, (!files.is_empty()).then_some(files))?;
+    write_baseline_marker(
+        &marker,
+        &SettingsBaselineMarker {
+            skipped_files: report.skipped_files,
+        },
+    )?;
+    Ok(())
+}
+
+pub(crate) fn write_settings_marker_for_repair(report: &SettingsBaselineReport) -> Result<()> {
+    write_baseline_marker(
+        &get_sync_dir()?.join(SETTINGS_BASELINE_MARKER_FILE_NAME),
+        &SettingsBaselineMarker {
+            skipped_files: report.skipped_files.clone(),
+        },
+    )
+}
+
+pub(crate) fn record_current_settings(
+    log: &ChangeLog,
+    only_files: Option<&[String]>,
+) -> Result<SettingsBaselineReport> {
+    let wants = |file: &str| only_files.is_none_or(|files| files.iter().any(|item| item == file));
+    let mut skipped_files = Vec::new();
+    let mappings = if wants(SETTINGS_MAPPINGS_FILE) {
+        match config::get_all_mappings() {
+            Ok(mappings) => mappings,
+            Err(err) => {
+                eprintln!(
+                    "Change log: skipped unreadable category mappings during settings baseline ({err})."
+                );
+                skipped_files.push(SETTINGS_MAPPINGS_FILE.to_string());
+                indexmap::IndexMap::new()
+            }
+        }
+    } else {
+        indexmap::IndexMap::new()
+    };
+    for (name, mapping) in mappings {
+        let mut row = Map::new();
+        row.insert(
+            "primary_category".into(),
+            Value::from(mapping.primary_category),
+        );
+        row.insert(
+            "secondary_category".into(),
+            Value::from(mapping.secondary_category),
+        );
+        if let Err(err) = log.append(
+            ChangeTable::CategoryMappings,
+            name,
+            ChangeOp::Upsert { row },
+        ) {
+            handle_settings_append_error("mapping", err)?;
+        }
+    }
+    let categories = if wants(SETTINGS_CATEGORIES_FILE) {
+        match config::get_known_categories() {
+            Ok(categories) => categories,
+            Err(err) => {
+                eprintln!(
+                    "Change log: skipped unreadable known categories during settings baseline ({err})."
+                );
+                skipped_files.push(SETTINGS_CATEGORIES_FILE.to_string());
+                config::KnownCategories::default()
+            }
+        }
+    } else {
+        config::KnownCategories::default()
+    };
+    for (kind, values) in [
+        ("primary", categories.primary),
+        ("secondary", categories.secondary),
+    ] {
+        for name in values {
+            if let Err(err) = log.append(
+                ChangeTable::KnownCategories,
+                format!("{kind}:{name}"),
+                ChangeOp::Upsert { row: Map::new() },
+            ) {
+                handle_settings_append_error("category", err)?;
+            }
+        }
+    }
+    if wants(SETTINGS_CURRENCY_FILE) {
+        match config::get_currency_settings() {
+            Ok(currency) => {
+                let mut currency_entries = vec![(
+                    "reference_currency",
+                    Value::from(currency.reference_currency),
+                )];
+                if let Ok(value) = serde_json::to_value(currency.current_month_rate_mode) {
+                    currency_entries.push(("current_month_rate_mode", value));
+                } else {
+                    eprintln!("Change log: skipped the rate mode during settings baseline.");
+                }
+                for (field, value) in currency_entries {
+                    let mut row = Map::new();
+                    row.insert("value".into(), value);
+                    if let Err(err) = log.append(
+                        ChangeTable::CurrencySettings,
+                        field,
+                        ChangeOp::Upsert { row },
+                    ) {
+                        handle_settings_append_error("currency setting", err)?;
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "Change log: skipped unreadable currency settings during settings baseline ({err})."
+                );
+                skipped_files.push(SETTINGS_CURRENCY_FILE.to_string());
+            }
+        }
+    }
+    Ok(SettingsBaselineReport { skipped_files })
 }
 
 /// Whether this device has a sync peer, for the guard above. A peers file
@@ -580,17 +758,18 @@ fn retry_skipped(paths: &[PathBuf], report: &mut ChangeLogBaseline) -> Vec<Pendi
 /// it worth writing at all: without it, the crash the marker exists for could
 /// take the marker with it.
 ///
-/// The file's own bytes are flushed, but the folder entry naming it is not,
-/// so a crash in the moment after this can still leave a folder with no
-/// marker. That fails the safe way: the next start finds no marker and
-/// records the folder again, which the module docs explain is harmless.
-fn write_baseline_marker(path: &Path, marker: &BaselineMarker) -> Result<()> {
+/// The file and its containing folder are flushed, so the marker's durable
+/// name and contents agree after a crash.
+fn write_baseline_marker<T: Serialize>(path: &Path, marker: &T) -> Result<()> {
     let mut file = std::fs::File::create(path)?;
     std::io::Write::write_all(
         &mut file,
         format!("{}\n", serde_json::to_string(marker)?).as_bytes(),
     )?;
     file.sync_all()?;
+    if let Some(folder) = path.parent() {
+        crate::df_operations::sync_dir(folder)?;
+    }
     Ok(())
 }
 
@@ -917,6 +1096,9 @@ fn table_name(table: &ChangeTable) -> &'static str {
         ChangeTable::Liquidity { .. } => "liquidity",
         ChangeTable::CreditsDebts { .. } => "credits_debts",
         ChangeTable::CashflowIncome { .. } => "cashflow_income",
+        ChangeTable::CategoryMappings => "category_mappings",
+        ChangeTable::KnownCategories => "known_categories",
+        ChangeTable::CurrencySettings => "currency_settings",
     }
 }
 
@@ -988,6 +1170,151 @@ mod tests {
             ChangeOp::Upsert { row } => row,
             other => panic!("expected an upsert, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hub_settings_baseline_runs_once_and_phone_baseline_skips_settings() {
+        let _temp = with_temp_data_home();
+        crate::sync_service::override_role_for_tests(Some(crate::sync_service::SyncRole::Hub));
+        config::add_mapping("coffee", "food", "cafes", true).unwrap();
+        settings_baseline_change_log().expect("record hub settings");
+        let first = log_entries();
+        assert!(!first.is_empty());
+        settings_baseline_change_log().expect("second settings baseline");
+        assert_eq!(log_entries().len(), first.len());
+
+        let phone = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", phone.path().join("data"));
+            std::env::set_var("XDG_CONFIG_HOME", phone.path().join("config"));
+            std::env::set_var("HOME", phone.path().join("home"));
+        }
+        crate::sync_service::override_role_for_tests(Some(crate::sync_service::SyncRole::Phone));
+        baseline_change_log().expect("phone baseline");
+        settings_baseline_change_log().expect("phone settings baseline");
+        assert!(!log_entries().iter().any(|entry| matches!(
+            entry.table,
+            ChangeTable::CategoryMappings
+                | ChangeTable::KnownCategories
+                | ChangeTable::CurrencySettings
+        )));
+        crate::sync_service::override_role_for_tests(None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn invalid_settings_are_skipped_and_marker_is_written() {
+        let _temp = with_temp_data_home();
+        crate::sync_service::override_role_for_tests(Some(crate::sync_service::SyncRole::Hub));
+        let mut mappings = indexmap::IndexMap::new();
+        mappings.insert(
+            "Uppercase".to_string(),
+            config::CategoryMapping {
+                primary_category: "food".into(),
+                secondary_category: "cafes".into(),
+            },
+        );
+        mappings.insert(
+            "valid".to_string(),
+            config::CategoryMapping {
+                primary_category: "food".into(),
+                secondary_category: "cafes".into(),
+            },
+        );
+        let path = config::get_config_dir()
+            .unwrap()
+            .join("category_mappings.json");
+        config::write_json(&path, &mappings).unwrap();
+        settings_baseline_change_log().expect("invalid settings do not stop startup");
+        assert!(
+            get_sync_dir()
+                .unwrap()
+                .join(SETTINGS_BASELINE_MARKER_FILE_NAME)
+                .exists()
+        );
+        let entries = log_entries();
+        assert!(entries.iter().any(|entry| entry.row_id == "valid"));
+        assert!(!entries.iter().any(|entry| entry.row_id == "Uppercase"));
+        crate::sync_service::override_role_for_tests(None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn settings_baseline_refuses_on_a_paired_device() {
+        let _temp = with_temp_data_home();
+        crate::sync_service::override_role_for_tests(Some(crate::sync_service::SyncRole::Hub));
+        sync_peers::record_peer(sync_peers::PeerRecord::new(
+            "paired-device",
+            sync_peers::PeerRole::Phone,
+        ))
+        .unwrap();
+        config::add_mapping("paired-setting", "food", "other", true).unwrap();
+        settings_baseline_change_log().expect("paired baseline is refused, not fatal");
+        assert!(
+            !get_sync_dir()
+                .unwrap()
+                .join(SETTINGS_BASELINE_MARKER_FILE_NAME)
+                .exists()
+        );
+        assert!(!log_entries().iter().any(|entry| matches!(
+            entry.table,
+            ChangeTable::CategoryMappings
+                | ChangeTable::KnownCategories
+                | ChangeTable::CurrencySettings
+        )));
+        crate::sync_service::override_role_for_tests(None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_settings_file_is_retried_without_duplicate_readable_entries() {
+        let _temp = with_temp_data_home();
+        crate::sync_service::override_role_for_tests(Some(crate::sync_service::SyncRole::Hub));
+        config::add_mapping("valid-setting", "food", "other", true).unwrap();
+        std::fs::write(
+            config::get_config_dir().unwrap().join("currency.json"),
+            b"not json",
+        )
+        .unwrap();
+        settings_baseline_change_log().expect("unreadable settings do not stop startup");
+        assert!(
+            get_sync_dir()
+                .unwrap()
+                .join(SETTINGS_BASELINE_MARKER_FILE_NAME)
+                .exists()
+        );
+        assert!(
+            log_entries()
+                .iter()
+                .any(|entry| entry.row_id == "valid-setting")
+        );
+        let first_count = log_entries().len();
+        config::set_currency_settings(&config::CurrencySettings::default()).unwrap();
+        settings_baseline_change_log().expect("retry readable settings");
+        assert_eq!(
+            log_entries()
+                .iter()
+                .filter(|entry| entry.row_id == "valid-setting")
+                .count(),
+            1
+        );
+        assert!(log_entries().len() > first_count);
+        crate::sync_service::override_role_for_tests(None);
+        crate::sync_service::override_role_for_tests(None);
+    }
+
+    #[test]
+    fn settings_baseline_propagates_io_append_errors() {
+        let error = Error::Io(std::io::Error::other("append failed"));
+        assert!(matches!(
+            handle_settings_append_error("mapping", error),
+            Err(Error::Io(_))
+        ));
+        assert!(
+            handle_settings_append_error("mapping", Error::InvalidArgument("bad value".into()))
+                .is_ok()
+        );
     }
 
     /// Write `df` at `path`, creating the year folder. A test builds its

@@ -256,6 +256,26 @@ async fn a_phone_pairs_resets_and_syncs_with_a_hub_process() {
     post_ok(&client, &format!("{hub_url}/api/liquidity/cell"), cell).await;
     let income = json!({"year": 2026, "month": 1, "category": "Salary", "amount": 2000.0});
     post_ok(&client, &format!("{hub_url}/api/cashflow/income"), income).await;
+    post_ok(
+        &client,
+        &format!("{hub_url}/api/mappings"),
+        json!({"id": "", "match_str": "coffee", "primary": "Food", "secondary": "Cafe"}),
+    )
+    .await;
+    post_ok(
+        &client,
+        &format!("{hub_url}/api/categories/primary"),
+        json!({"kind": "primary", "name": "Travel"}),
+    )
+    .await;
+    let (status, value) = call(
+        &client,
+        reqwest::Method::PUT,
+        &format!("{hub_url}/api/settings/currency"),
+        Some(json!({"reference_currency": "USD", "current_month_rate_mode": "live"})),
+    )
+    .await;
+    assert_eq!(status, 200, "PUT currency: {value}");
 
     // Each side refuses the other's routes.
     let (status, _) = call(
@@ -346,6 +366,18 @@ async fn a_phone_pairs_resets_and_syncs_with_a_hub_process() {
         snapshot(&client, &hub_url).await,
         snapshot(&client, &phone_url).await
     );
+    assert_eq!(
+        get_ok(&client, &format!("{hub_url}/api/mappings")).await,
+        get_ok(&client, &format!("{phone_url}/api/mappings")).await
+    );
+    assert_eq!(
+        get_ok(&client, &format!("{hub_url}/api/categories")).await,
+        get_ok(&client, &format!("{phone_url}/api/categories")).await
+    );
+    assert_eq!(
+        get_ok(&client, &format!("{hub_url}/api/settings/currency")).await,
+        get_ok(&client, &format!("{phone_url}/api/settings/currency")).await
+    );
 
     // Both sides edit, and an ordinary sync brings them together.
     post_ok(
@@ -364,6 +396,26 @@ async fn a_phone_pairs_resets_and_syncs_with_a_hub_process() {
     .await;
     let income = json!({"year": 2026, "month": 2, "category": "Other", "amount": 40.0});
     post_ok(&client, &format!("{phone_url}/api/cashflow/income"), income).await;
+    post_ok(
+        &client,
+        &format!("{phone_url}/api/mappings"),
+        json!({"id": "", "match_str": "tea", "primary": "Food", "secondary": "Cafe"}),
+    )
+    .await;
+    let (status, value) = call(
+        &client,
+        reqwest::Method::PUT,
+        &format!("{phone_url}/api/settings/currency"),
+        Some(json!({"reference_currency": "GBP", "current_month_rate_mode": "previous_month_end"})),
+    )
+    .await;
+    assert_eq!(status, 200, "PUT phone currency: {value}");
+    post_ok(
+        &client,
+        &format!("{hub_url}/api/categories/secondary"),
+        json!({"kind": "secondary", "name": "Travel Cafe"}),
+    )
+    .await;
 
     let round = post_ok(&client, &now_url, json!({})).await;
     assert_eq!(round["outcome"], "exchanged", "{round}");
@@ -373,6 +425,18 @@ async fn a_phone_pairs_resets_and_syncs_with_a_hub_process() {
     assert_eq!(
         snapshot(&client, &hub_url).await,
         snapshot(&client, &phone_url).await
+    );
+    assert_eq!(
+        get_ok(&client, &format!("{hub_url}/api/mappings")).await,
+        get_ok(&client, &format!("{phone_url}/api/mappings")).await
+    );
+    assert_eq!(
+        get_ok(&client, &format!("{hub_url}/api/categories")).await,
+        get_ok(&client, &format!("{phone_url}/api/categories")).await
+    );
+    assert_eq!(
+        get_ok(&client, &format!("{hub_url}/api/settings/currency")).await,
+        get_ok(&client, &format!("{phone_url}/api/settings/currency")).await
     );
 
     // A second sync has nothing to move.

@@ -257,7 +257,7 @@ pub enum RowAction {
     },
 }
 
-/// One row to write, with the table and year that name its file.
+/// One row to write, with the table and location that name its file or config item.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeAction {
     /// The table, carrying the year and, for expenses, the month.
@@ -478,7 +478,9 @@ fn merges_per_cell(table: &ChangeTable) -> bool {
         | ChangeTable::InvestmentsPrices { .. }
         | ChangeTable::Liquidity { .. }
         | ChangeTable::CreditsDebts { .. }
-        | ChangeTable::CashflowIncome { .. } => true,
+        | ChangeTable::CashflowIncome { .. }
+        | ChangeTable::CurrencySettings => true,
+        ChangeTable::CategoryMappings | ChangeTable::KnownCategories => false,
     }
 }
 
@@ -492,6 +494,9 @@ fn merges_per_cell(table: &ChangeTable) -> bool {
 fn has_fixed_rows(table: &ChangeTable) -> bool {
     match table {
         ChangeTable::CashflowIncome { .. } => true,
+        ChangeTable::CategoryMappings
+        | ChangeTable::KnownCategories
+        | ChangeTable::CurrencySettings => false,
         ChangeTable::Expenses { .. }
         | ChangeTable::Recurring { .. }
         | ChangeTable::Investments { .. }
@@ -2016,5 +2021,102 @@ mod tests {
 
         assert_eq!(plan, MergePlan::default());
         assert!(plan.changes_nothing());
+    }
+
+    #[test]
+    fn settings_newest_mapping_and_category_entries_win_per_item() {
+        let mapping = ChangeTable::CategoryMappings;
+        let category = ChangeTable::KnownCategories;
+        let mut old_row = Map::new();
+        old_row.insert("primary_category".into(), Value::from("old"));
+        old_row.insert("secondary_category".into(), Value::from("old"));
+        let mut new_row = Map::new();
+        new_row.insert("primary_category".into(), Value::from("new"));
+        new_row.insert("secondary_category".into(), Value::from("new"));
+        let mapping_plan = plan_merge(
+            &[entry(100, HERE, mapping.clone(), "coffee", upsert(old_row))],
+            &[entry(
+                200,
+                THERE,
+                mapping,
+                "coffee",
+                upsert(new_row.clone()),
+            )],
+        );
+        assert_eq!(mapping_plan.summary.applied, 1);
+        assert!(
+            matches!(mapping_plan.actions[0].action, RowAction::Upsert { ref row } if row == &new_row)
+        );
+        let category_plan = plan_merge(
+            &[entry(
+                100,
+                HERE,
+                category.clone(),
+                "primary:Food",
+                ChangeOp::Upsert { row: Map::new() },
+            )],
+            &[entry(
+                200,
+                THERE,
+                category,
+                "primary:Food",
+                ChangeOp::Delete,
+            )],
+        );
+        assert_eq!(category_plan.summary.applied, 1);
+        assert!(matches!(category_plan.actions[0].action, RowAction::Delete));
+    }
+
+    #[test]
+    fn currency_settings_merge_newest_value_per_field() {
+        let table = ChangeTable::CurrencySettings;
+        let mut reference = Map::new();
+        reference.insert("value".into(), Value::from("EUR"));
+        let mut mode = Map::new();
+        mode.insert("value".into(), Value::from("previous_month_end"));
+        let local = vec![
+            entry(
+                100,
+                HERE,
+                table.clone(),
+                "reference_currency",
+                upsert(reference),
+            ),
+            entry(
+                100,
+                HERE,
+                table.clone(),
+                "current_month_rate_mode",
+                upsert(mode),
+            ),
+        ];
+        let remote = vec![
+            entry(
+                200,
+                THERE,
+                table.clone(),
+                "reference_currency",
+                ChangeOp::Cell {
+                    column: "value".into(),
+                    value: Value::from("USD"),
+                },
+            ),
+            entry(
+                50,
+                THERE,
+                table,
+                "current_month_rate_mode",
+                ChangeOp::Cell {
+                    column: "value".into(),
+                    value: Value::from("live"),
+                },
+            ),
+        ];
+        let plan = plan_merge(&local, &remote);
+        assert_eq!(plan.summary.applied, 1);
+        assert_eq!(plan.summary.skipped, 1);
+        assert!(
+            matches!(plan.actions[0].action, RowAction::SetCells { ref cells } if cells[0].value == Value::from("USD"))
+        );
     }
 }

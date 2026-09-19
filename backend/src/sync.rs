@@ -98,7 +98,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::config::get_config_dir;
+use crate::config::{CurrentMonthRateMode, SUPPORTED_REFERENCE_CURRENCIES, get_config_dir};
 use crate::error::{Error, Result};
 use crate::paths::get_sync_dir;
 
@@ -322,10 +322,8 @@ fn sync_parent_dir(path: &Path) {
 
 /// Which table a change belongs to, and where that table's file is.
 ///
-/// Every variant carries a year, because every table is stored per year under
-/// `<dbs_root>/<year>/`, and only the detailed expenses split further by
-/// month. No row of these tables carries its year as a value, so an entry
-/// without one could not name the file it changed.
+/// Parquet variants carry a year, because those tables are stored under
+/// `<dbs_root>/<year>/`. Settings are config files and therefore carry no year.
 ///
 /// The variants match the files on disk. Adding one also needs a case
 /// wherever the data layer maps a table to a change, and a round trip test
@@ -372,11 +370,14 @@ pub enum ChangeTable {
         /// Year folder holding the file.
         year: i32,
     },
+    CategoryMappings,
+    KnownCategories,
+    CurrencySettings,
 }
 
 impl ChangeTable {
     /// The year folder this table's file lives in.
-    pub fn year(&self) -> i32 {
+    pub fn year(&self) -> Option<i32> {
         match self {
             ChangeTable::Expenses { year, .. }
             | ChangeTable::Recurring { year }
@@ -384,7 +385,10 @@ impl ChangeTable {
             | ChangeTable::InvestmentsPrices { year }
             | ChangeTable::Liquidity { year }
             | ChangeTable::CreditsDebts { year }
-            | ChangeTable::CashflowIncome { year } => *year,
+            | ChangeTable::CashflowIncome { year } => Some(*year),
+            ChangeTable::CategoryMappings
+            | ChangeTable::KnownCategories
+            | ChangeTable::CurrencySettings => None,
         }
     }
 
@@ -407,6 +411,102 @@ impl ChangeTable {
         }
         Ok(())
     }
+}
+
+impl ChangeEntry {
+    pub fn validate(&self) -> Result<()> {
+        self.table.validate()?;
+        match &self.table {
+            ChangeTable::CategoryMappings => {
+                if self.row_id.is_empty() || self.row_id != self.row_id.to_lowercase() {
+                    return Err(Error::InvalidArgument(
+                        "mapping row id must be a lower-case expense name".into(),
+                    ));
+                }
+                if let ChangeOp::Upsert { row } = &self.op {
+                    for field in ["primary_category", "secondary_category"] {
+                        if !row.get(field).is_some_and(Value::is_string) {
+                            return Err(Error::InvalidArgument(format!(
+                                "mapping upsert must contain string field {field}"
+                            )));
+                        }
+                    }
+                } else if !matches!(self.op, ChangeOp::Delete) {
+                    return Err(Error::InvalidArgument(
+                        "mapping changes must be upserts or deletes".into(),
+                    ));
+                }
+            }
+            ChangeTable::KnownCategories => {
+                if !(self.row_id.starts_with("primary:") || self.row_id.starts_with("secondary:"))
+                    || self.row_id.len() <= self.row_id.find(':').unwrap_or(usize::MAX) + 1
+                {
+                    return Err(Error::InvalidArgument(
+                        "known category row id must be primary:<name> or secondary:<name>".into(),
+                    ));
+                }
+                if !matches!(self.op, ChangeOp::Upsert { ref row } if row.is_empty())
+                    && !matches!(self.op, ChangeOp::Delete)
+                {
+                    return Err(Error::InvalidArgument(
+                        "known category changes must be empty upserts or deletes".into(),
+                    ));
+                }
+            }
+            ChangeTable::CurrencySettings => {
+                if !matches!(
+                    self.row_id.as_str(),
+                    "reference_currency" | "current_month_rate_mode"
+                ) {
+                    return Err(Error::InvalidArgument(
+                        "unknown currency setting field".into(),
+                    ));
+                }
+                match &self.op {
+                    ChangeOp::Cell { column, value } if column == "value" => {
+                        validate_currency_value(&self.row_id, value)?;
+                    }
+                    ChangeOp::Upsert { row } => {
+                        let value = row.get("value").ok_or_else(|| {
+                            Error::InvalidArgument("currency upsert must contain value".into())
+                        })?;
+                        validate_currency_value(&self.row_id, value)?;
+                    }
+                    ChangeOp::Delete => {
+                        return Err(Error::InvalidArgument(
+                            "currency settings do not support delete".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgument(
+                            "currency changes must use value cells".into(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn validate_currency_value(field: &str, value: &Value) -> Result<()> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| Error::InvalidArgument("currency setting value must be a string".into()))?;
+    if field == "reference_currency" && !SUPPORTED_REFERENCE_CURRENCIES.contains(&text) {
+        return Err(Error::InvalidArgument(
+            "unsupported reference currency".into(),
+        ));
+    }
+    if field == "current_month_rate_mode"
+        && serde_json::from_value::<CurrentMonthRateMode>(value.clone()).is_err()
+    {
+        return Err(Error::InvalidArgument(
+            "invalid current month rate mode".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// What happened to the row.
@@ -868,6 +968,8 @@ impl ChangeLog {
             op,
         };
 
+        entry.validate()?;
+
         // The stamp is spent even when the entry is refused, which costs
         // nothing: a gap in the sequence is fine, only a reused stamp is not.
         let line = encode_line(&entry)?;
@@ -890,6 +992,7 @@ impl ChangeLog {
 /// [`crate::Error::InvalidArgument`] or [`crate::Error::Json`], as described
 /// for [`ChangeLog::append`]. The message never holds the entry's values.
 pub fn check_storable(entry: &ChangeEntry) -> Result<()> {
+    entry.validate()?;
     encode_line(entry).map(|_| ())
 }
 
@@ -1717,6 +1820,81 @@ mod tests {
         ]
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn settings_entry_validation_rejects_invalid_shapes() {
+        let _temp = with_temp_env();
+        let log = ChangeLog::open().expect("open log");
+        let mut mapping = Map::new();
+        mapping.insert("primary_category".into(), Value::from("primary"));
+        mapping.insert("secondary_category".into(), Value::from("secondary"));
+        assert!(
+            log.append(
+                ChangeTable::CategoryMappings,
+                "Uppercase",
+                ChangeOp::Upsert {
+                    row: mapping.clone()
+                }
+            )
+            .is_err()
+        );
+        mapping.remove("secondary_category");
+        assert!(
+            log.append(
+                ChangeTable::CategoryMappings,
+                "valid",
+                ChangeOp::Upsert { row: mapping }
+            )
+            .is_err()
+        );
+        assert!(
+            log.append(
+                ChangeTable::KnownCategories,
+                "unknown:Name",
+                ChangeOp::Delete
+            )
+            .is_err()
+        );
+        let mut non_empty = Map::new();
+        non_empty.insert("unexpected".into(), Value::from("value"));
+        assert!(
+            log.append(
+                ChangeTable::KnownCategories,
+                "primary:Name",
+                ChangeOp::Upsert { row: non_empty }
+            )
+            .is_err()
+        );
+        let mut currency = Map::new();
+        currency.insert("value".into(), Value::from("CAD"));
+        assert!(
+            log.append(
+                ChangeTable::CurrencySettings,
+                "reference_currency",
+                ChangeOp::Upsert { row: currency }
+            )
+            .is_err()
+        );
+        assert!(
+            log.append(
+                ChangeTable::CurrencySettings,
+                "reference_currency",
+                ChangeOp::Delete
+            )
+            .is_err()
+        );
+        let mut mode = Map::new();
+        mode.insert("value".into(), Value::from("invalid"));
+        assert!(
+            log.append(
+                ChangeTable::CurrencySettings,
+                "current_month_rate_mode",
+                ChangeOp::Upsert { row: mode }
+            )
+            .is_err()
+        );
+    }
+
     /// Every table variant, all in one year folder.
     fn sample_tables(year: i32) -> Vec<ChangeTable> {
         vec![
@@ -1727,6 +1905,9 @@ mod tests {
             ChangeTable::Liquidity { year },
             ChangeTable::CreditsDebts { year },
             ChangeTable::CashflowIncome { year },
+            ChangeTable::CategoryMappings,
+            ChangeTable::KnownCategories,
+            ChangeTable::CurrencySettings,
         ]
     }
 
@@ -1742,11 +1923,43 @@ mod tests {
         let mut written = Vec::new();
         for year in years {
             for (index, table) in sample_tables(year).into_iter().enumerate() {
-                for op in sample_ops() {
-                    written.push(
-                        log.append(table.clone(), format!("row-{year}-{index}"), op)
-                            .expect("append"),
-                    );
+                let operations = match &table {
+                    ChangeTable::CategoryMappings => {
+                        let mut row = Map::new();
+                        row.insert("primary_category".into(), Value::from("primary"));
+                        row.insert("secondary_category".into(), Value::from("secondary"));
+                        vec![ChangeOp::Upsert { row }, ChangeOp::Delete]
+                    }
+                    ChangeTable::KnownCategories => {
+                        vec![ChangeOp::Upsert { row: Map::new() }, ChangeOp::Delete]
+                    }
+                    ChangeTable::CurrencySettings => {
+                        let mut row = Map::new();
+                        row.insert("value".into(), Value::from("USD"));
+                        vec![
+                            ChangeOp::Upsert { row },
+                            ChangeOp::Cell {
+                                column: "value".into(),
+                                value: Value::from("GBP"),
+                            },
+                        ]
+                    }
+                    _ => sample_ops(),
+                };
+                for op in operations {
+                    let row_id = match &table {
+                        ChangeTable::CategoryMappings => format!("sample-{year}-{index}"),
+                        ChangeTable::KnownCategories => format!("primary:Sample-{year}-{index}"),
+                        ChangeTable::CurrencySettings => {
+                            if matches!(op, ChangeOp::Cell { .. }) {
+                                "reference_currency".to_string()
+                            } else {
+                                "reference_currency".to_string()
+                            }
+                        }
+                        _ => format!("row-{year}-{index}"),
+                    };
+                    written.push(log.append(table.clone(), row_id, op).expect("append"));
                 }
             }
         }
@@ -1759,17 +1972,19 @@ mod tests {
         let text = std::fs::read_to_string(changelog_path().unwrap()).unwrap();
         assert_eq!(text.lines().count(), written.len());
         assert!(text.ends_with('\n'));
+        let settings_line = text
+            .lines()
+            .find(|line| line.contains("\"table\":\"category_mappings\""))
+            .expect("a settings line");
+        assert!(!settings_line.contains("\"year\""));
         for entry in &read.entries {
             assert_eq!(entry.device_id, log.device_id());
-            assert!(years.contains(&entry.table.year()));
-            assert!(
-                entry
-                    .row_id
-                    .starts_with(&format!("row-{}", entry.table.year()))
-            );
+            if let Some(year) = entry.table.year() {
+                assert!(years.contains(&year));
+            }
         }
         let tables: HashSet<&ChangeTable> = read.entries.iter().map(|entry| &entry.table).collect();
-        assert_eq!(tables.len(), years.len() * sample_tables(2026).len());
+        assert_eq!(tables.len(), 7 * years.len() + 3);
     }
 
     /// The line keeps the flat, readable shape the format promises, so the

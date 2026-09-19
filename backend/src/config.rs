@@ -25,6 +25,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+/// Reference currencies accepted by the API and settings change log. Rejecting
+/// unsupported codes before persistence keeps later rate lookups from failing
+/// far from the request that introduced the invalid setting.
+pub const SUPPORTED_REFERENCE_CURRENCIES: [&str; 5] = ["EUR", "USD", "GBP", "CHF", "JPY"];
+
 const CONFIG_DIR_NAME: &str = "finguard";
 const CONFIG_FILE_NAME: &str = "category_mappings.json";
 const CATEGORIES_FILE_NAME: &str = "known_categories.json";
@@ -86,7 +91,25 @@ pub(crate) fn write_json<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> 
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
     value.serialize(&mut ser)?;
-    std::fs::write(path, buf)?;
+    let temp = path.with_file_name(format!(
+        ".{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        std::io::Write::write_all(&mut file, &buf)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result?;
+    if let Some(folder) = path.parent() {
+        #[cfg(unix)]
+        std::fs::File::open(folder)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -177,6 +200,10 @@ pub fn get_all_mappings() -> Result<IndexMap<String, CategoryMapping>> {
 /// Delete all mappings (the file is kept but emptied).
 pub fn clear_all_mappings() -> Result<()> {
     save_mappings(&IndexMap::new())
+}
+
+pub(crate) fn write_mappings_for_sync(value: &IndexMap<String, CategoryMapping>) -> Result<()> {
+    save_mappings(value)
 }
 
 // ------------------------------------------------------------------
@@ -291,6 +318,17 @@ pub fn get_currency_settings() -> Result<CurrencySettings> {
 /// Replace the stored currency settings.
 pub fn set_currency_settings(settings: &CurrencySettings) -> Result<()> {
     save_currency_settings(settings)
+}
+
+pub(crate) fn write_known_categories_for_sync(value: &KnownCategories) -> Result<()> {
+    save_known_categories(value)
+}
+
+pub(crate) fn reset_sync_settings() -> Result<()> {
+    clear_all_mappings()?;
+    write_known_categories_for_sync(&KnownCategories::default())?;
+    set_currency_settings(&CurrencySettings::default())?;
+    Ok(())
 }
 
 /// Return the appropriate category list for `kind`. Assumes `kind` is valid.

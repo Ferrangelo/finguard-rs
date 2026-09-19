@@ -75,7 +75,7 @@ use crate::dbs_backup;
 use crate::error::{Error, Result};
 use crate::merge_apply::{self, MergeReport};
 use crate::paths::{get_dbs_root, get_sync_dir};
-use crate::sync::{self, ChangeEntry, Hlc, IncompleteReason, LogRead};
+use crate::sync::{self, ChangeEntry, ChangeTable, Hlc, IncompleteReason, LogRead};
 use crate::sync_baseline::{self, MarkerState};
 use crate::sync_peers::{self, PeerRecord, PeerRole, RequiredReset};
 use crate::write_lock;
@@ -83,7 +83,7 @@ use crate::write_lock;
 /// The version of the messages in this module. Every message carries it, and
 /// a device refuses a message with any other value. Raise it whenever a
 /// message changes shape or meaning.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Suffix of the backup folder a phone reset writes, after the UTC
 /// timestamp.
@@ -985,6 +985,7 @@ pub struct ResetPreview {
     /// Local log entries the hub's summary lacks: changes the reset loses
     /// from the log. The backup still holds the data they produced.
     pub unsent_entries: usize,
+    pub settings_entries: usize,
 }
 
 /// On the phone, before a reset: count what it holds, given the hub's hello.
@@ -1003,6 +1004,18 @@ pub fn phone_reset_preview(hub: &Hello) -> Result<ResetPreview> {
         year_folders: counts.year_folders,
         unreadable_files: counts.unreadable_files,
         unsent_entries: entries_missing_from(&read.entries, &hub.summary).len(),
+        settings_entries: read
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.table,
+                    ChangeTable::CategoryMappings
+                        | ChangeTable::KnownCategories
+                        | ChangeTable::CurrencySettings
+                )
+            })
+            .count(),
     })
 }
 
@@ -1063,6 +1076,9 @@ pub struct ResetReport {
 /// the backup the phone reports unreliable; run the reset again.
 pub fn reset_phone_from_hub(full_log: &FullLog) -> Result<ResetReport> {
     check_version(full_log.version)?;
+    for entry in &full_log.entries {
+        sync::check_storable(entry)?;
+    }
     match sync_peers::find_peer(&full_log.hub_device_id)? {
         Some(peer) if peer.role == PeerRole::Hub => {}
         _ => {
@@ -1090,6 +1106,7 @@ pub fn reset_phone_from_hub(full_log: &FullLog) -> Result<ResetReport> {
 
     let log = sync::shared_log()?;
     log.empty_for_reset()?;
+    crate::config::reset_sync_settings()?;
     let merge = merge_apply::apply_remote_batch_holding(&guard, &full_log.entries)?;
 
     sync_baseline::write_marker_after_reset(merge.entries_stored)?;
@@ -1213,6 +1230,8 @@ pub fn repair_hub_log() -> Result<HubRepairReport> {
     let log = sync::shared_log()?;
     let rewrite = log.rewrite_readable()?;
     let baseline = sync_baseline::record_fresh_baseline(&log)?;
+    let settings = sync_baseline::record_current_settings(&log, None)?;
+    sync_baseline::write_settings_marker_for_repair(&settings)?;
     // Before the incomplete marker goes, so a hub that stops in between
     // still reports unreliable and repairs again.
     require_phone_resets()?;
@@ -1238,7 +1257,7 @@ mod tests {
         Cashflow, DetailedExpenses, Liquidity, ROW_ID_COLUMN, RecurringExpenses,
     };
     use crate::paths::{LIQUIDITY_FILENAME, get_backups_dir, get_year_summary_path};
-    use crate::sync::ChangeTable;
+    use crate::sync::{ChangeOp, ChangeTable};
     use crate::sync_baseline::{baseline_change_log, baseline_marker_path};
 
     /// A static key and an address for pairings these tests make without a
@@ -1362,6 +1381,71 @@ mod tests {
     fn pair_and_reset(hub: &Path, phone: &Path) {
         pair_both(hub, phone);
         reset_round(hub, phone, RoundPlan::PhoneReset { push_first: false });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reset_clears_phone_settings_before_applying_hub_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = root.path().join("hub");
+        let phone = root.path().join("phone");
+        start(&hub);
+        start(&phone);
+        use_device(&hub);
+        crate::config::add_mapping("hub-only", "food", "cafe", true).unwrap();
+        let mut row = serde_json::Map::new();
+        row.insert("primary_category".into(), serde_json::Value::from("food"));
+        row.insert("secondary_category".into(), serde_json::Value::from("cafe"));
+        sync::shared_log()
+            .unwrap()
+            .append(
+                ChangeTable::CategoryMappings,
+                "hub-only",
+                ChangeOp::Upsert { row },
+            )
+            .unwrap();
+        use_device(&phone);
+        crate::config::add_mapping("phone-only", "old", "old", true).unwrap();
+        pair_and_reset(&hub, &phone);
+        use_device(&phone);
+        let mappings = crate::config::get_all_mappings().unwrap();
+        assert!(mappings.contains_key("hub-only"));
+        assert!(!mappings.contains_key("phone-only"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn paired_phone_receives_hub_settings_catchup_in_an_ordinary_exchange() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = root.path().join("hub");
+        let phone = root.path().join("phone");
+        start(&hub);
+        start(&phone);
+        pair_and_reset(&hub, &phone);
+        use_device(&hub);
+        crate::config::add_mapping("upgrade-setting", "food", "other", true).unwrap();
+        let mut row = serde_json::Map::new();
+        row.insert("primary_category".into(), serde_json::Value::from("food"));
+        row.insert(
+            "secondary_category".into(),
+            serde_json::Value::from("other"),
+        );
+        sync::shared_log()
+            .unwrap()
+            .append(
+                ChangeTable::CategoryMappings,
+                "upgrade-setting",
+                ChangeOp::Upsert { row },
+            )
+            .unwrap();
+        let round = exchange(&hub, &phone).unwrap();
+        assert_eq!(round.replied, 1);
+        use_device(&phone);
+        assert!(
+            crate::config::get_all_mappings()
+                .unwrap()
+                .contains_key("upgrade-setting")
+        );
     }
 
     /// Pair `hub` and `phone` on both sides, without the first reset. Ends
@@ -1747,6 +1831,21 @@ mod tests {
         let mut liquidity = Liquidity::new(2026).unwrap();
         liquidity.add_asset("Wallet", "Cash", "EUR").unwrap();
         liquidity.set_value("Wallet", 2, 20.0).unwrap();
+        crate::config::add_mapping("phone-setting", "food", "other", true).unwrap();
+        let mut setting_row = serde_json::Map::new();
+        setting_row.insert("primary_category".into(), serde_json::Value::from("food"));
+        setting_row.insert(
+            "secondary_category".into(),
+            serde_json::Value::from("other"),
+        );
+        sync::shared_log()
+            .unwrap()
+            .append(
+                ChangeTable::CategoryMappings,
+                "phone-setting",
+                ChangeOp::Upsert { row: setting_row },
+            )
+            .unwrap();
         let clock_before = log_entries().last().unwrap().stamp;
         let phone_entries = log_entries().len();
 
@@ -1772,6 +1871,7 @@ mod tests {
         assert_eq!(preview.year_folders, 1);
         assert_eq!(preview.unreadable_files, 0);
         assert_eq!(preview.unsent_entries, phone_entries);
+        assert_eq!(preview.settings_entries, 1);
         let log_path = sync::changelog_path().unwrap();
 
         use_device(&hub);
@@ -1879,6 +1979,12 @@ mod tests {
 
         assert_eq!(repair.lines_dropped, 1);
         assert!(repair.phone_must_reset);
+        assert!(
+            crate::paths::get_sync_dir()
+                .unwrap()
+                .join("settings_baseline_done")
+                .exists()
+        );
         let read = sync::read_log().unwrap();
         assert!(read.corrupt_lines.is_empty());
         assert!(
@@ -1888,7 +1994,7 @@ mod tests {
         );
         assert_eq!(
             repair.lines_kept + repair.rows_recorded + repair.income_cells_recorded,
-            read.entries.len()
+            read.entries.len() - 2
         );
         let march_table = ChangeTable::Expenses {
             year: 2026,
@@ -1978,10 +2084,10 @@ mod tests {
         );
 
         // A newer body shape still fails as a version mismatch.
-        let newer = br#"{"kind":"handshake_v2","version":2,"anything":[1,2]}"#;
+        let newer = br#"{"kind":"handshake_v2","version":3,"anything":[1,2]}"#;
         assert!(matches!(
             SyncMessage::decode(newer),
-            Err(Error::SyncProtocol(message)) if message.contains("version 2")
+            Err(Error::SyncProtocol(message)) if message.contains("version 3")
         ));
         assert!(matches!(
             SyncMessage::decode(br#"{"kind":"push","entries":[]}"#),
@@ -2052,7 +2158,7 @@ mod tests {
         assert_eq!(
             printed,
             format!(
-                "FullLog(FullLog {{ version: 1, hub_device_id: hub, reset_id: Some(\"id\"), \
+                "FullLog(FullLog {{ version: 2, hub_device_id: hub, reset_id: Some(\"id\"), \
                  entries: {} }})",
                 full.entries.len()
             )
@@ -2320,7 +2426,7 @@ mod tests {
         let repair = repair_hub_log().unwrap();
 
         assert_eq!(repair.rows_recorded + repair.income_cells_recorded, 0);
-        assert!(sync::read_log().unwrap().entries.is_empty());
+        assert_eq!(sync::read_log().unwrap().entries.len(), 2);
         for _ in 0..2 {
             use_device(&phone);
             let hello = phone_hello().unwrap();
