@@ -7,6 +7,14 @@ import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 // when the env var is set (see the "build:spa" script in package.json).
 const isSpaBuild = process.env.FINGUARD_SPA === "1";
 
+// Keep the dev server on loopback by default because its /api proxy has no
+// authentication. FINGUARD_DEV_HOST is an explicit opt-in for another address.
+// Lovable's sandbox applies its own host and port after this config, so its
+// preview remains unaffected.
+// Vite already rejects non-localhost hostnames by default and admits every
+// IP-addressed request no matter what allowedHosts lists, so the bind address is the real control.
+const devHost = process.env.FINGUARD_DEV_HOST || "127.0.0.1";
+
 export default defineConfig({
   tanstackStart: isSpaBuild
     ? { spa: { enabled: true, prerender: { outputPath: "/index" } } }
@@ -14,6 +22,7 @@ export default defineConfig({
   vite: {
     server: {
       port: 5173,
+      host: devHost,
       proxy: {
         "/api": {
           // target: "http://127.0.0.1:3111",

@@ -3,11 +3,14 @@ services:
     image: ghcr.io/ferrangelo/finguard-rs-backend:latest
     container_name: finguard-rs-backend
     ports:
-      - "${FINGUARD_PORT:-3111}:${FINGUARD_PORT:-3111}"
+      - "127.0.0.1:${FINGUARD_PORT:-3111}:${FINGUARD_PORT:-3111}"
+      # Sync traffic must remain reachable by phones on the local network.
+      - "${FINGUARD_SYNC_PORT:-3112}:${FINGUARD_SYNC_PORT:-3112}"
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
       FINGUARD_PORT: "${FINGUARD_PORT:-3111}"
+      FINGUARD_SYNC_PORT: "${FINGUARD_SYNC_PORT:-3112}"
       # OVERRIDE the Dockerfile XDG defaults here:
       XDG_DATA_HOME: "/data"
       XDG_CONFIG_HOME: "/config" 
@@ -24,10 +27,12 @@ services:
     restart: unless-stopped
     container_name: finguard-rs-frontend
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     environment:
       # Use the service name, not localhost. Docker's internal DNS resolves this
       - VITE_API_URL=http://backend:${FINGUARD_PORT:-3111}
+      # A published port cannot reach a container's loopback, so the frontend keeps listening on all interfaces inside.
+      - FINGUARD_DEV_HOST=0.0.0.0
     depends_on:
       - backend
 
