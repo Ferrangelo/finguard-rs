@@ -1,7 +1,8 @@
 //! One sync round between the desktop hub and a phone, and the safety checks
-//! around it, with no networking. Part 3b carries the messages defined here
-//! over an encrypted connection and calls the functions below at each step;
-//! it adds no sync logic of its own.
+//! around it, with no networking. [`crate::sync_service`] carries the
+//! messages defined here over the encrypted connection of
+//! [`crate::sync_net`] and calls the functions below at each step; it adds
+//! no sync logic of its own.
 //!
 //! # The round
 //!
@@ -591,8 +592,9 @@ fn check_version(version: u32) -> Result<()> {
 // Pairing
 // ------------------------------------------------------------------
 
-/// On a phone: record `hub_device_id` as this phone's hub, and mark this
-/// phone as due for a reset from it.
+/// On a phone: record `hub_device_id` as this phone's hub, with its Noise
+/// static key `hub_static_key` (64 hex digits) and the `address` the phone
+/// reaches it at, and mark this phone as due for a reset from it.
 ///
 /// The mark comes first. A phone that records the peer and then stops,
 /// before its reset, must not be able to run an ordinary exchange later,
@@ -604,12 +606,16 @@ fn check_version(version: u32) -> Result<()> {
 /// [`Error::Io`] when the mark cannot be written, and the errors of
 /// [`sync_peers::record_peer`]. On an error after the mark the phone is
 /// marked and not paired, which a later pairing repeats safely.
-pub fn pair_with_hub(hub_device_id: &str) -> Result<()> {
+pub fn pair_with_hub(hub_device_id: &str, hub_static_key: &str, address: &str) -> Result<()> {
     sync::mark_log_incomplete(IncompleteReason::ResetPending)?;
-    sync_peers::record_peer(PeerRecord::new(hub_device_id, PeerRole::Hub))
+    let mut record = PeerRecord::new(hub_device_id, PeerRole::Hub);
+    record.static_key = Some(hub_static_key.to_string());
+    record.address = Some(address.to_string());
+    sync_peers::record_peer(record)
 }
 
-/// On the hub: record `phone_device_id` as a paired phone that must reset
+/// On the hub: record `phone_device_id`, with its Noise static key
+/// `phone_static_key` (64 hex digits), as a paired phone that must reset
 /// from this hub before anything else.
 ///
 /// The requirement ([`PeerRecord::reset_required`], marked as a first
@@ -622,8 +628,9 @@ pub fn pair_with_hub(hub_device_id: &str) -> Result<()> {
 /// # Errors
 ///
 /// The errors of [`sync_peers::record_peer`].
-pub fn pair_with_phone(phone_device_id: &str) -> Result<()> {
+pub fn pair_with_phone(phone_device_id: &str, phone_static_key: &str) -> Result<()> {
     let mut record = PeerRecord::new(phone_device_id, PeerRole::Phone);
+    record.static_key = Some(phone_static_key.to_string());
     record.reset_required = Some(RequiredReset::first_pairing());
     sync_peers::record_peer(record)
 }
@@ -1234,6 +1241,11 @@ mod tests {
     use crate::sync::ChangeTable;
     use crate::sync_baseline::{baseline_change_log, baseline_marker_path};
 
+    /// A static key and an address for pairings these tests make without a
+    /// connection. No test here opens one, so neither is ever used.
+    const TEST_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const TEST_ADDRESS: &str = "192.0.2.1:3112";
+
     /// Point `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and `HOME` at three folders
     /// inside `dir`, and force offline FX mode, so no test reads or writes
     /// the real data or config or reaches the network. Two devices are two
@@ -1358,9 +1370,9 @@ mod tests {
         let hub_id = device_id_of(hub);
         let phone_id = device_id_of(phone);
         use_device(hub);
-        pair_with_phone(&phone_id).unwrap();
+        pair_with_phone(&phone_id, TEST_KEY).unwrap();
         use_device(phone);
-        pair_with_hub(&hub_id).unwrap();
+        pair_with_hub(&hub_id, TEST_KEY, TEST_ADDRESS).unwrap();
     }
 
     /// A round that ends in a phone reset, following `expected`.
@@ -1739,9 +1751,9 @@ mod tests {
         let phone_entries = log_entries().len();
 
         use_device(&hub);
-        pair_with_phone(&phone_id).unwrap();
+        pair_with_phone(&phone_id, TEST_KEY).unwrap();
         use_device(&phone);
-        pair_with_hub(&hub_id).unwrap();
+        pair_with_hub(&hub_id, TEST_KEY, TEST_ADDRESS).unwrap();
         let hello = phone_hello().unwrap();
         assert!(hello.health.reset_pending());
         use_device(&hub);
@@ -2246,7 +2258,7 @@ mod tests {
         let phone_id = hello.device_id.clone();
 
         use_device(&hub);
-        pair_with_phone(&phone_id).unwrap();
+        pair_with_phone(&phone_id, TEST_KEY).unwrap();
         let (hub_hello, plan) = hub_answer_hello(&hello).unwrap();
 
         assert_eq!(plan, RoundPlan::PhoneReset { push_first: false });

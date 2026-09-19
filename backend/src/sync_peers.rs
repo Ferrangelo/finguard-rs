@@ -6,8 +6,9 @@
 //! of its data.
 //!
 //! The file is one JSON object with a `peers` list. Each record holds the
-//! peer's device id, its role, and when it was paired. Part 3b adds keys to
-//! a record, so both the file and each record keep every field this version
+//! peer's device id, its role, and when it was paired, and after pairing
+//! the peer's static key and, on a phone, the hub's address. Later versions
+//! may add keys to a record, so both the file and each record keep every field this version
 //! does not know: a read followed by a rewrite writes them back unchanged.
 //! Every write goes through a temporary file in the same folder, a flush,
 //! and a rename, so a crash leaves either the old file or the new one.
@@ -91,6 +92,17 @@ pub struct PeerRecord {
     /// happened. Absent on the file when not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_reset: Option<String>,
+    /// The peer's long-term Noise static public key, as 64 lowercase hex
+    /// digits, learned in the pairing handshake. Every later sync connection
+    /// accepts only this key for this peer; see [`crate::sync_net`]. Absent
+    /// on the file when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_key: Option<String>,
+    /// Set on a phone, for its hub: the address, `host:port`, the phone
+    /// paired through and connects to for every sync. Absent on the file
+    /// when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     /// Every field this version does not know, kept so a rewrite does not
     /// drop what a later version stored, such as the peer's keys.
     #[serde(flatten)]
@@ -106,6 +118,8 @@ impl PeerRecord {
             paired_at_ms: chrono::Utc::now().timestamp_millis(),
             reset_required: None,
             completed_reset: None,
+            static_key: None,
+            address: None,
             extra: Map::new(),
         }
     }
@@ -214,7 +228,8 @@ pub fn is_paired() -> Result<bool> {
 /// cannot erase the rest. Unknown top level fields of the file are kept too.
 /// [`PeerRecord::reset_required`] and [`PeerRecord::completed_reset`] keep
 /// their old value when `record` leaves them unset, so pairing a device again
-/// never clears a reset the hub still requires.
+/// never clears a reset the hub still requires. [`PeerRecord::static_key`]
+/// and [`PeerRecord::address`] keep their old value the same way.
 ///
 /// # Errors
 ///
@@ -251,18 +266,46 @@ pub fn record_peer(record: PeerRecord) -> Result<()> {
             extra.extend(record.extra);
             let reset_required = record.reset_required.or(existing.reset_required.take());
             let completed_reset = record.completed_reset.or(existing.completed_reset.take());
+            let static_key = record.static_key.or(existing.static_key.take());
+            let address = record.address.or(existing.address.take());
             *existing = PeerRecord {
                 device_id: record.device_id,
                 role: record.role,
                 paired_at_ms: record.paired_at_ms,
                 reset_required,
                 completed_reset,
+                static_key,
+                address,
                 extra,
             };
         }
         None => file.peers.push(record),
     }
     write_peers_file(&path, &file)
+}
+
+/// Remove the record of `device_id`, unpairing that device on this side.
+/// Returns whether a record was removed. Unknown fields of the other records
+/// and of the file are kept as in [`record_peer`]; a missing record writes
+/// nothing.
+///
+/// # Errors
+///
+/// The errors of [`load_peers`], and those of writing the file as in
+/// [`record_peer`].
+pub fn remove_peer(device_id: &str) -> Result<bool> {
+    let _guard = PEERS_FILE_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let path = sync_peers_path()?;
+    let mut file = read_peers_file(&path)?;
+    let before = file.peers.len();
+    file.peers.retain(|peer| peer.device_id != device_id);
+    if file.peers.len() == before {
+        return Ok(false);
+    }
+    write_peers_file(&path, &file)?;
+    Ok(true)
 }
 
 /// Change the stored records with `change`, and rewrite the file when it
@@ -448,6 +491,36 @@ mod tests {
         let peer = find_peer("phone-1").unwrap().unwrap();
         assert_eq!(peer.reset_required, Some(required));
         assert_eq!(peer.completed_reset.as_deref(), Some("done-1"));
+    }
+
+    /// The key and address fields are stored, kept when a later record
+    /// leaves them unset, and removing a peer keeps the others and their
+    /// unknown fields.
+    #[test]
+    #[serial_test::serial]
+    fn keys_and_addresses_are_kept_and_a_peer_can_be_removed() {
+        let _temp = with_temp_env();
+        let path = sync_peers_path().unwrap();
+        std::fs::write(
+            &path,
+            br#"{"peers":[{"device_id":"tab-1","role":"tablet","paired_at_ms":6,"later":"x"}]}"#,
+        )
+        .unwrap();
+        let mut record = PeerRecord::new("hub-1", PeerRole::Hub);
+        record.static_key = Some("ab".repeat(32));
+        record.address = Some("192.0.2.4:3112".to_string());
+        record_peer(record).unwrap();
+
+        record_peer(PeerRecord::new("hub-1", PeerRole::Hub)).unwrap();
+        let hub = find_peer("hub-1").unwrap().unwrap();
+        assert_eq!(hub.static_key, Some("ab".repeat(32)));
+        assert_eq!(hub.address.as_deref(), Some("192.0.2.4:3112"));
+
+        assert!(remove_peer("hub-1").unwrap());
+        assert!(!remove_peer("hub-1").unwrap(), "already gone");
+        assert!(find_peer("hub-1").unwrap().is_none());
+        let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["peers"][0]["later"], Value::from("x"));
     }
 
     /// A peers file that cannot be read makes every pairing fail with a

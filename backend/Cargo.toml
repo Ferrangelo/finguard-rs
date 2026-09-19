@@ -35,6 +35,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 uuid = { version = "1", features = ["v4"] }
+# Sync transport: the Noise protocol for the encrypted channel, and SPAKE2
+# to turn the 6-digit pairing code into the key of the pairing handshake.
+# Exact pins, because a crypto crate update is a decision, not a refresh.
+snow = "=0.10.0"
+spake2 = "=0.4.0"
 
 [dev-dependencies]
 tempfile = "3"

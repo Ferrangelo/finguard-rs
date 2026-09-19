@@ -48,7 +48,15 @@
 //! - [`sync_exchange`]: one sync round between the desktop hub and a phone,
 //!   as messages and the functions each side calls at each step, plus the
 //!   log health check, the phone reset from the hub, and the hub repair. It
-//!   opens no connection: the transport carries its messages.
+//!   opens no connection: [`sync_service`] carries its messages.
+//! - [`sync_keys`]: this device's long-term Noise static keypair, stored in
+//!   the config directory, and key fingerprints.
+//! - [`sync_net`]: the encrypted sync connection: framing, the SPAKE2 and
+//!   Noise pairing handshake, and the Noise handshake of every later sync.
+//!   It moves bytes and touches no data.
+//! - [`sync_service`]: sync as the app runs it: the desktop's listener and
+//!   pairing codes, the phone's pairing and Sync now, and the status behind
+//!   the `/api/sync/*` routes.
 //! - [`error`]: the crate-wide [`Error`]/[`Result`] pair used by every module.
 //!
 //! Several parts of this crate deliberately reproduce behavior from the
@@ -75,7 +83,10 @@ pub mod row_id_migration;
 pub mod sync;
 pub mod sync_baseline;
 pub mod sync_exchange;
+pub mod sync_keys;
+pub mod sync_net;
 pub mod sync_peers;
+pub mod sync_service;
 pub mod write_lock;
 
 pub use error::{Error, Result};

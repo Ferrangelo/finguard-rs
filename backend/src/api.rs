@@ -20,13 +20,16 @@
 //! future Tauri app, can depend on this crate and call [`router`] the same
 //! way.
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header::HOST};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
     extract::{Path, Query},
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
 
 use crate::config;
 use crate::df_operations::{
@@ -36,6 +39,7 @@ use crate::df_operations::{
 use crate::fx;
 use crate::http_error::AppError;
 use crate::plots;
+use crate::sync_service;
 use crate::write_lock;
 
 // ======================================================================
@@ -1920,23 +1924,457 @@ async fn get_monthly_fx_rates_handler(
 }
 
 // ======================================================================
+// Sync
+// ======================================================================
+//
+// The DTOs below follow the same frontend contract as the ones at the top of
+// this file. The handlers are thin wrappers around `crate::sync_service`.
+
+/// `GET /api/sync/status` response body.
+#[derive(Serialize, Debug)]
+pub struct SyncStatusJson {
+    /// `"hub"` on the desktop, `"phone"` on the Android app.
+    pub role: String,
+    pub device_id: String,
+    /// This device's static key fingerprint, such as `"1a2b-3c4d-5e6f-7a8b"`.
+    pub key_fingerprint: String,
+    pub peers: Vec<SyncPeerJson>,
+    /// Set when the peers file cannot be read; `peers` is then empty. The
+    /// text says how to recover.
+    pub peers_error: Option<String>,
+    pub log_health: SyncLogHealthJson,
+    /// The listener, on the hub only; `null` on a phone.
+    pub listener: Option<SyncListenerJson>,
+    /// The last round since the backend started, or `null`.
+    pub last_sync: Option<SyncLastJson>,
+}
+
+/// One paired device in [`SyncStatusJson`].
+#[derive(Serialize, Debug)]
+pub struct SyncPeerJson {
+    pub device_id: String,
+    /// `"hub"`, `"phone"`, or a role a later version wrote.
+    pub role: String,
+    pub paired_at_ms: i64,
+    /// The fingerprint of the peer's static key, or `null` when none is
+    /// stored.
+    pub key_fingerprint: Option<String>,
+    /// On a phone, for its hub: the address it syncs with. Otherwise `null`.
+    pub address: Option<String>,
+}
+
+/// The local change log's health, in words and counts, no values.
+#[derive(Serialize, Debug)]
+pub struct SyncLogHealthJson {
+    pub reliable: bool,
+    /// One sentence per problem. Empty for a reliable log.
+    pub problems: Vec<String>,
+    /// How far the newest change is dated ahead of this device's clock, in
+    /// whole hours, when that is more than a day.
+    pub clock_ahead_hours: Option<i64>,
+    /// Set when the health could not be judged at all; `reliable` is then
+    /// `false`.
+    pub error: Option<String>,
+}
+
+/// The hub's listener: `POST /api/sync/listen` response body, and
+/// [`SyncStatusJson::listener`].
+#[derive(Serialize, Debug)]
+pub struct SyncListenerJson {
+    pub listening: bool,
+    pub port: u16,
+    /// A guess at `"ip:port"` for the phone to type, or `null`. Show it as a
+    /// guess: see `crate::sync_service::address_hint`.
+    pub address_hint: Option<String>,
+    /// Why the listener could not open, such as a port in use, or `null`.
+    pub bind_error: Option<String>,
+    /// When the active pairing code expires, or `null` when none is active,
+    /// for example after three wrong codes.
+    pub pair_code_expires_at_ms: Option<i64>,
+    /// Seconds the listener stays open after the last heartbeat.
+    pub stops_after_seconds: u64,
+}
+
+/// What the other device did with the changes this one pushed.
+#[derive(Serialize, Debug)]
+pub struct SyncPeerCountsJson {
+    pub applied: usize,
+    pub skipped: usize,
+    pub unplaceable: usize,
+    pub already_known: usize,
+}
+
+/// What one round moved, in counts, from this device's point of view.
+#[derive(Serialize, Debug)]
+pub struct SyncCountsJson {
+    /// Change log entries this device sent.
+    pub sent: usize,
+    /// Change log entries this device received.
+    pub received: usize,
+    /// Received entries that changed or confirmed this device's data.
+    pub applied: usize,
+    /// Received entries stored but set aside.
+    pub skipped: usize,
+    /// Received entries this device could not place.
+    pub unplaceable: usize,
+    /// On the phone, when it pushed: what the hub did with the push.
+    pub peer: Option<SyncPeerCountsJson>,
+}
+
+/// [`SyncStatusJson::last_sync`].
+#[derive(Serialize, Debug)]
+pub struct SyncLastJson {
+    pub finished_at_ms: i64,
+    pub peer_device_id: Option<String>,
+    /// `"exchanged"`, `"reset_needed"`, `"reset_done"`, or `"failed"`.
+    pub outcome: String,
+    /// `"exchange"`, `"phone_reset"`, `"hub_repair"`, or `null` when the
+    /// round failed before both sides agreed on a plan.
+    pub plan: Option<String>,
+    pub counts: SyncCountsJson,
+    /// For a failed round: what went wrong, naming no value.
+    pub error: Option<String>,
+}
+
+/// `POST /api/sync/pair-code` response body.
+#[derive(Serialize, Debug)]
+pub struct SyncPairCodeJson {
+    /// Six digits, leading zeros kept.
+    pub code: String,
+    pub expires_at_ms: i64,
+    /// Wrong codes after which this code stops working.
+    pub attempts_allowed: u32,
+}
+
+/// `POST /api/sync/pair` request body.
+#[derive(Deserialize, Debug)]
+pub struct SyncPairPayload {
+    /// The desktop's `"host"` or `"host:port"`; the port defaults to 3112.
+    pub address: String,
+    /// The 6 digits the desktop shows.
+    pub code: String,
+}
+
+/// `POST /api/sync/pair` response body.
+#[derive(Serialize, Debug)]
+pub struct SyncPairResultJson {
+    pub hub_device_id: String,
+    /// Compare with the `key_fingerprint` the desktop's status shows.
+    pub hub_key_fingerprint: String,
+    /// The address stored for later syncs, with its port.
+    pub address: String,
+}
+
+/// `POST /api/sync/now` request body. The body may be absent, which means
+/// `{ "confirm_reset": false }`.
+#[derive(Deserialize, Debug, Default)]
+pub struct SyncNowPayload {
+    #[serde(default)]
+    pub confirm_reset: bool,
+}
+
+/// What a phone reset would replace, in counts.
+#[derive(Serialize, Debug)]
+pub struct SyncResetPreviewJson {
+    /// Rows per table name, such as `"expenses"` or `"liquidity"`, over
+    /// every year. For `"cashflow_income"`, the income cells that are not
+    /// zero.
+    pub rows_per_table: std::collections::BTreeMap<String, usize>,
+    pub year_folders: usize,
+    /// Table files that could not be read and are not counted.
+    pub unreadable_files: usize,
+    /// Changes on the phone the desktop does not have. The reset drops them
+    /// from the log; the backup keeps the data they produced.
+    pub unsent_entries: usize,
+}
+
+/// `POST /api/sync/now` response body.
+#[derive(Serialize, Debug)]
+pub struct SyncNowResultJson {
+    /// `"exchanged"`, `"reset_needed"`, or `"reset_done"`.
+    pub outcome: String,
+    /// `"exchange"`, `"phone_reset"`, or `"hub_repair"`.
+    pub plan: String,
+    /// For a reset plan: whether the phone's changes go to the desktop
+    /// before the reset. `false` for an exchange.
+    pub push_first: bool,
+    pub counts: SyncCountsJson,
+    /// Set with `"reset_needed"`: show it and ask before sending
+    /// `confirm_reset: true`.
+    pub reset_preview: Option<SyncResetPreviewJson>,
+    /// Set with `"reset_done"`: the backup folder's name, under the app's
+    /// `backups` folder, holding the phone's data from before the reset.
+    pub backup_folder: Option<String>,
+}
+
+impl From<sync_service::ListenerStatus> for SyncListenerJson {
+    fn from(status: sync_service::ListenerStatus) -> Self {
+        SyncListenerJson {
+            listening: status.listening,
+            port: status.port,
+            address_hint: status.address_hint,
+            bind_error: status.bind_error,
+            pair_code_expires_at_ms: status.pair_code_expires_at_ms,
+            stops_after_seconds: sync_service::LISTEN_GRACE.as_secs(),
+        }
+    }
+}
+
+impl From<sync_service::SyncCounts> for SyncCountsJson {
+    fn from(counts: sync_service::SyncCounts) -> Self {
+        SyncCountsJson {
+            sent: counts.sent,
+            received: counts.received,
+            applied: counts.applied,
+            skipped: counts.skipped,
+            unplaceable: counts.unplaceable,
+            peer: counts.peer.map(|peer| SyncPeerCountsJson {
+                applied: peer.applied,
+                skipped: peer.skipped,
+                unplaceable: peer.unplaceable,
+                already_known: peer.already_known,
+            }),
+        }
+    }
+}
+
+impl From<sync_service::SyncStatus> for SyncStatusJson {
+    fn from(status: sync_service::SyncStatus) -> Self {
+        let peers = status
+            .peers
+            .into_iter()
+            .map(|peer| SyncPeerJson {
+                key_fingerprint: peer
+                    .static_key
+                    .as_deref()
+                    .and_then(crate::sync_keys::key_from_hex)
+                    .map(|key| crate::sync_keys::fingerprint(&key)),
+                device_id: peer.device_id,
+                role: String::from(peer.role),
+                paired_at_ms: peer.paired_at_ms,
+                address: peer.address,
+            })
+            .collect();
+        let log_health = match (status.log_health, status.log_health_error) {
+            (Some(health), _) => SyncLogHealthJson {
+                reliable: health.is_reliable(),
+                problems: health.problems.iter().map(ToString::to_string).collect(),
+                clock_ahead_hours: health
+                    .clock_ahead_of_wall_by
+                    .map(|ms| ms / (60 * 60 * 1000)),
+                error: None,
+            },
+            (None, error) => SyncLogHealthJson {
+                reliable: false,
+                problems: Vec::new(),
+                clock_ahead_hours: None,
+                error: Some(error.unwrap_or_else(|| "the log's health is unknown".to_string())),
+            },
+        };
+        SyncStatusJson {
+            role: status.role.as_str().to_string(),
+            device_id: status.device_id,
+            key_fingerprint: status.key_fingerprint,
+            peers,
+            peers_error: status.peers_error,
+            log_health,
+            listener: status.listener.map(SyncListenerJson::from),
+            last_sync: status.last_sync.map(|last| SyncLastJson {
+                finished_at_ms: last.finished_at_ms,
+                peer_device_id: last.peer_device_id,
+                outcome: last.outcome.as_str().to_string(),
+                plan: last
+                    .plan
+                    .map(|plan| sync_service::plan_name(plan).to_string()),
+                counts: last.counts.into(),
+                error: last.error,
+            }),
+        }
+    }
+}
+
+/// Run blocking `work` on tokio's blocking pool.
+async fn run_blocking<T, F>(work: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> crate::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| {
+            AppError(crate::Error::Io(std::io::Error::other(format!(
+                "a request stopped unexpectedly: {err}"
+            ))))
+        })?
+        .map_err(AppError)
+}
+
+/// `GET /api/sync/status`: this device's role, key fingerprint, peers, log
+/// health, listener (hub only), and last round. Both roles.
+async fn sync_status_handler() -> Result<Json<SyncStatusJson>, AppError> {
+    let status = run_blocking(sync_service::status).await?;
+    Ok(Json(status.into()))
+}
+
+/// `POST /api/sync/listen`: the desktop Sync page's heartbeat. Opens the
+/// sync port if it is closed and keeps it open for about a minute. A port
+/// that cannot be opened is reported in `bind_error` with status 200. Hub
+/// only: a phone gets `409`.
+async fn sync_listen_handler() -> Result<Json<SyncListenerJson>, AppError> {
+    Ok(Json(sync_service::heartbeat().await?.into()))
+}
+
+/// `POST /api/sync/pair-code`: show a new pairing code, replacing any
+/// active one. Hub only: a phone gets `409`.
+async fn sync_pair_code_handler() -> Result<Json<SyncPairCodeJson>, AppError> {
+    let issued = sync_service::new_pair_code()?;
+    Ok(Json(SyncPairCodeJson {
+        code: issued.code,
+        expires_at_ms: issued.expires_at_ms,
+        attempts_allowed: issued.attempts_allowed,
+    }))
+}
+
+/// `POST /api/sync/pair`: pair this phone with the desktop at
+/// `payload.address` using `payload.code`, in one call, because the code is
+/// needed in the connection's first message. Phone only: the desktop gets
+/// `409`. A wrong code is `409` too.
+async fn sync_pair_handler(
+    Json(payload): Json<SyncPairPayload>,
+) -> Result<Json<SyncPairResultJson>, AppError> {
+    let paired = sync_service::pair(&payload.address, &payload.code).await?;
+    Ok(Json(SyncPairResultJson {
+        hub_device_id: paired.hub_device_id,
+        hub_key_fingerprint: paired.hub_key_fingerprint,
+        address: paired.address,
+    }))
+}
+
+/// `POST /api/sync/now`: run one round with the paired desktop. A missing,
+/// malformed, or non-JSON body means `confirm_reset: false`; a valid body with
+/// `confirm_reset: true` confirms a required phone reset. Without confirmation,
+/// a reset-needed round changes nothing and answers `"reset_needed"` with the
+/// counts to show. Phone only: the desktop gets `409`.
+async fn sync_now_handler(
+    payload: Option<Json<SyncNowPayload>>,
+) -> Result<Json<SyncNowResultJson>, AppError> {
+    let confirm_reset = payload
+        .map(|Json(payload)| payload.confirm_reset)
+        .unwrap_or(false);
+    let done = sync_service::sync_now(confirm_reset).await?;
+    let push_first = match done.plan {
+        crate::sync_exchange::RoundPlan::Exchange => false,
+        crate::sync_exchange::RoundPlan::PhoneReset { push_first }
+        | crate::sync_exchange::RoundPlan::HubRepair { push_first } => push_first,
+    };
+    Ok(Json(SyncNowResultJson {
+        outcome: done.outcome.as_str().to_string(),
+        plan: sync_service::plan_name(done.plan).to_string(),
+        push_first,
+        counts: done.counts.into(),
+        reset_preview: done.reset_preview.map(|preview| SyncResetPreviewJson {
+            rows_per_table: preview.rows_per_table,
+            year_folders: preview.year_folders,
+            unreadable_files: preview.unreadable_files,
+            unsent_entries: preview.unsent_entries,
+        }),
+        backup_folder: done.backup_folder,
+    }))
+}
+
+/// `DELETE /api/sync/peers/:device_id`: unpair that device on this side.
+/// Both roles. `404` when it is not paired.
+async fn sync_unpair_handler(Path(device_id): Path<String>) -> Result<(), AppError> {
+    run_blocking(move || sync_service::unpair(&device_id)).await
+}
+
+// ======================================================================
 // Server Initialization
 // ======================================================================
 
-/// Build the route table with a permissive CORS layer applied.
+/// Reject network requests addressed to an unexpected host.
+async fn require_allowed_host(request: Request<Body>, next: Next) -> Response {
+    match request_host(&request) {
+        Ok(Some(host))
+            if allowed_hosts()
+                .iter()
+                .any(|allowed| host_name(&host) == *allowed) =>
+        {
+            next.run(request).await
+        }
+        Ok(None) => next.run(request).await,
+        Ok(Some(_)) | Err(()) => {
+            (StatusCode::FORBIDDEN, "request host is not allowed").into_response()
+        }
+    }
+}
+
+fn request_host(request: &Request<Body>) -> Result<Option<String>, ()> {
+    if let Some(value) = request.headers().get(HOST) {
+        return value
+            .to_str()
+            .map(|host| Some(host.to_string()))
+            .map_err(|_| ());
+    }
+    Ok(request
+        .uri()
+        .authority()
+        .map(|authority| authority.as_str().to_string()))
+}
+
+fn allowed_hosts() -> Vec<String> {
+    if let Ok(configured) = std::env::var("FINGUARD_ALLOWED_HOSTS") {
+        return configured
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(host_name)
+            .collect();
+    }
+    let mut hosts = ["localhost", "127.0.0.1", "::1", "backend"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if let Ok(configured) = std::env::var("FINGUARD_HOST") {
+        let configured = configured.trim().to_ascii_lowercase();
+        if let Some(host) = configured_ip_host(&configured) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+fn configured_ip_host(configured: &str) -> Option<String> {
+    let address = configured.parse::<std::net::IpAddr>().ok()?;
+    (!address.is_unspecified()).then(|| host_name(configured))
+}
+
+fn host_name(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest
+            .split(']')
+            .next()
+            .map_or_else(|| host.clone(), str::to_string);
+    }
+    if host.matches(':').count() == 1 {
+        return host
+            .rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|char| char.is_ascii_digit()))
+            .map_or(host.clone(), |(name, _)| name.to_string());
+    }
+    host
+}
+
+/// Build the route table with the write lock and host guard applied.
 ///
 /// Every request whose method can change data holds the process-wide lock in
 /// [`crate::write_lock`] for its whole run, shared by every router built in
-/// this process and by [`crate::merge_apply::apply_remote_batch`].
+/// this process and by [`crate::merge_apply::apply_remote_batch`]. The
+/// `/api/sync/*` routes are the exception, added after that layer: see the
+/// comment at their place in the table.
 ///
-/// CORS is fully permissive (any origin, method, header), which
-/// accommodates the dev frontend running on a different port (`:5173`) and
-/// any other embedder, such as the Android app; this router has no
-/// authentication or origin restriction of its own, so serving it beyond a
-/// trusted local network or reverse proxy would let any origin call the API.
 pub fn router() -> Router {
-    let cors = CorsLayer::permissive();
-
     Router::new()
         // Configuration / global APIs
         .route("/api/years", get(list_years_handler))
@@ -2023,11 +2461,24 @@ pub fn router() -> Router {
             get(get_networth_allocation_handler),
         )
         .route("/api/fx/monthly-rates", get(get_monthly_fx_rates_handler))
-        // Outside the routes and inside CORS, so a preflight is answered
-        // without waiting and every data-changing request holds the lock the
-        // merge takes. See `crate::write_lock`.
+        // Outside the sync routes, so every data-changing request holds the
+        // lock the merge takes. See `crate::write_lock`.
         .layer(axum::middleware::from_fn(write_lock::hold_for_writes))
-        .layer(cors)
+        // Sync, added after the write-lock layer so it does not cover these.
+        // `/api/sync/pair` and `/api/sync/now` wait on the other device for
+        // up to minutes, and the sync steps they run take the lock
+        // themselves, blocking: holding it here would stall every save
+        // meanwhile and deadlock at the first step that applies data. The
+        // other sync routes write no data file. See `crate::sync_service`.
+        // They answer on this API port only; the sync port speaks nothing
+        // but the Noise protocol.
+        .route("/api/sync/status", get(sync_status_handler))
+        .route("/api/sync/listen", post(sync_listen_handler))
+        .route("/api/sync/pair-code", post(sync_pair_code_handler))
+        .route("/api/sync/pair", post(sync_pair_handler))
+        .route("/api/sync/now", post(sync_now_handler))
+        .route("/api/sync/peers/:device_id", delete(sync_unpair_handler))
+        .layer(axum::middleware::from_fn(require_allowed_host))
 }
 
 #[cfg(test)]
@@ -3608,6 +4059,37 @@ mod tests {
         assert_eq!(
             missing.into_response().status(),
             axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn host_guard_rejects_invalid_headers_and_uses_authority() {
+        let invalid = Request::builder()
+            .header(
+                HOST,
+                axum::http::HeaderValue::from_bytes(b"\x80evil").unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert!(request_host(&invalid).is_err());
+
+        let authority = Request::builder()
+            .uri("http://attacker.example/api/years")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            request_host(&authority).unwrap().as_deref(),
+            Some("attacker.example")
+        );
+    }
+
+    #[test]
+    fn host_guard_skips_unspecified_configured_addresses() {
+        assert_eq!(configured_ip_host("0.0.0.0"), None);
+        assert_eq!(configured_ip_host("::"), None);
+        assert_eq!(
+            configured_ip_host("127.0.0.1"),
+            Some("127.0.0.1".to_string())
         );
     }
 }
