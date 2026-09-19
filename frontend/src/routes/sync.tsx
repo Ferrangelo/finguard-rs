@@ -666,6 +666,7 @@ function PhoneView({ status, refresh }: { status: SyncStatus; refresh: () => Pro
 }
 
 function canAutoConfirm(preview: NonNullable<SyncNowResult["reset_preview"]>) {
+  // Settings entries are shown separately and do not represent data that the reset loses.
   return (
     Object.values(preview.rows_per_table).every((count) => count === 0) &&
     preview.unsent_entries === 0 &&
@@ -696,6 +697,9 @@ function RoundResult({ result, onConfirm }: { result: SyncNowResult; onConfirm: 
             . Year folders: {result.reset_preview.year_folders}. Unreadable files:{" "}
             {result.reset_preview.unreadable_files}. Unsent entries:{" "}
             {result.reset_preview.unsent_entries}.
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Settings entries in log: {result.reset_preview.settings_entries}.
           </p>
           <div className="mt-3">
             <ConfirmButton

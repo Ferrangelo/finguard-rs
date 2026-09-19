@@ -411,6 +411,7 @@ export interface SyncResetPreview {
   year_folders: number;
   unreadable_files: number;
   unsent_entries: number;
+  settings_entries: number;
 }
 
 export interface SyncNowResult {
