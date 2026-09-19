@@ -82,6 +82,7 @@ pub mod plots;
 pub mod row_id_migration;
 pub mod sync;
 pub mod sync_baseline;
+pub mod sync_discovery;
 pub mod sync_exchange;
 pub mod sync_keys;
 pub mod sync_net;

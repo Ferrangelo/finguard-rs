@@ -6,6 +6,7 @@ import { ConfirmButton } from "@/components/finguard/ConfirmButton";
 import * as api from "@/services/api";
 import type {
   SyncCounts,
+  SyncDiscoveryReply,
   SyncLast,
   SyncListener,
   SyncNowResult,
@@ -387,6 +388,9 @@ function HubView({
           <p className="mt-3 text-xs text-muted-foreground">
             Phones should compare their returned fingerprint with this value.
           </p>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Discoverable while this page is open.
+          </p>
         </GlassCard>
       </div>
       <GlassCard title={`Paired phones (${status.peers.length})`}>
@@ -436,6 +440,43 @@ function PhoneView({ status, refresh }: { status: SyncStatus; refresh: () => Pro
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [round, setRound] = useState<SyncNowResult | null>(null);
+  const [discoveries, setDiscoveries] = useState<SyncDiscoveryReply[]>([]);
+  const [discovering, setDiscovering] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+
+  const discover = async () => {
+    setDiscovering(true);
+    setDiscoveryError(null);
+    try {
+      setDiscoveries(await api.discoverSync());
+    } catch (err) {
+      setDiscoveryError(err instanceof Error ? err.message : "Could not search for desktops.");
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  useEffect(() => {
+    if (hub) return;
+    let active = true;
+    setDiscovering(true);
+    setDiscoveryError(null);
+    void api
+      .discoverSync()
+      .then((found) => {
+        if (active) setDiscoveries(found);
+      })
+      .catch((err) => {
+        if (active)
+          setDiscoveryError(err instanceof Error ? err.message : "Could not search for desktops.");
+      })
+      .finally(() => {
+        if (active) setDiscovering(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [hub]);
 
   const pair = async () => {
     const trimmedAddress = address.trim();
@@ -496,6 +537,51 @@ function PhoneView({ status, refresh }: { status: SyncStatus; refresh: () => Pro
             <p className="text-sm text-muted-foreground">
               Enter the desktop's address and the six-digit code shown on its Sync page.
             </p>
+            <div className="rounded-md border border-border/60 bg-surface/30 p-3 text-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-muted-foreground">
+                  {discovering ? "Searching for desktops..." : "Nearby desktops"}
+                </span>
+                <button
+                  type="button"
+                  disabled={discovering}
+                  onClick={() => void discover()}
+                  className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs hover:border-primary/60 disabled:opacity-50"
+                >
+                  <RefreshCw className="h-3 w-3" /> {discovering ? "Searching" : "Retry"}
+                </button>
+              </div>
+              {discoveries.length > 0 ? (
+                <div className="mt-2 space-y-2">
+                  {discoveries.map((found) => (
+                    <button
+                      type="button"
+                      key={`${found.address}-${found.device_id}`}
+                      onClick={() => setAddress(found.address)}
+                      className="block w-full rounded border border-border/60 p-2 text-left hover:border-primary/60"
+                    >
+                      <span className="block font-medium">{found.address}</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {found.device_id} · Fingerprint: {found.key_fingerprint}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                !discovering &&
+                !discoveryError && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    No desktop found. Use the address box below, and make sure the desktop's Sync
+                    page is open.
+                  </p>
+                )
+              )}
+              {discoveryError && (
+                <div className="mt-2">
+                  <ErrorBanner message={discoveryError} />
+                </div>
+              )}
+            </div>
             <div className="flex flex-col gap-2 sm:flex-row">
               <input
                 value={address}

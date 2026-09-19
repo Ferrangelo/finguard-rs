@@ -2065,6 +2065,14 @@ pub struct SyncPairResultJson {
     pub address: String,
 }
 
+/// One hub found by `POST /api/sync/discover`.
+#[derive(Serialize, Debug)]
+pub struct SyncDiscoveryReplyJson {
+    pub address: String,
+    pub device_id: String,
+    pub key_fingerprint: String,
+}
+
 /// `POST /api/sync/now` request body. The body may be absent, which means
 /// `{ "confirm_reset": false }`.
 #[derive(Deserialize, Debug, Default)]
@@ -2248,6 +2256,21 @@ async fn sync_pair_handler(
         hub_key_fingerprint: paired.hub_key_fingerprint,
         address: paired.address,
     }))
+}
+
+/// `POST /api/sync/discover`: find open desktops on the local network.
+/// Phone only: the desktop gets `409`; no reply is a successful empty list.
+async fn sync_discover_handler() -> Result<Json<Vec<SyncDiscoveryReplyJson>>, AppError> {
+    let hubs = crate::sync_discovery::probe().await?;
+    Ok(Json(
+        hubs.into_iter()
+            .map(|hub| SyncDiscoveryReplyJson {
+                address: hub.address,
+                device_id: hub.device_id,
+                key_fingerprint: hub.key_fingerprint,
+            })
+            .collect(),
+    ))
 }
 
 /// `POST /api/sync/now`: run one round with the paired desktop. A missing,
@@ -2476,6 +2499,7 @@ pub fn router() -> Router {
         .route("/api/sync/listen", post(sync_listen_handler))
         .route("/api/sync/pair-code", post(sync_pair_code_handler))
         .route("/api/sync/pair", post(sync_pair_handler))
+        .route("/api/sync/discover", post(sync_discover_handler))
         .route("/api/sync/now", post(sync_now_handler))
         .route("/api/sync/peers/:device_id", delete(sync_unpair_handler))
         .layer(axum::middleware::from_fn(require_allowed_host))

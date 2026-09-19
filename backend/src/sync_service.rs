@@ -396,6 +396,13 @@ pub fn address_hint(bind: SocketAddr) -> Option<String> {
     Some(SocketAddr::new(ip, bind.port()).to_string())
 }
 
+pub(crate) fn listener_remaining() -> Duration {
+    hub_state()
+        .last_heartbeat
+        .map(|beat| (beat + LISTEN_GRACE).saturating_duration_since(Instant::now()))
+        .unwrap_or_default()
+}
+
 /// The listener's state now.
 fn listener_status() -> ListenerStatus {
     let bind = sync_bind_address();
@@ -451,7 +458,7 @@ pub async fn heartbeat() -> Result<ListenerStatus> {
                     .local_addr()
                     .map_err(|err| format!("cannot read the sync port: {err}"))?
                     .port();
-                Ok((listener, port))
+                Ok((listener, SocketAddr::new(address.ip(), port)))
             }),
         Err(reason) => Err(reason),
     };
@@ -459,11 +466,12 @@ pub async fn heartbeat() -> Result<ListenerStatus> {
         let mut state = hub_state();
         state.starting = false;
         match bound {
-            Ok((listener, port)) => {
-                state.listening_on = Some(port);
+            Ok((listener, bind_address)) => {
+                state.listening_on = Some(bind_address.port());
                 state.bind_error = None;
-                println!("Sync: listening for phones on port {port}");
+                println!("Sync: listening for phones on port {}", bind_address.port());
                 tokio::spawn(accept_loop(listener));
+                tokio::spawn(start_discovery(bind_address));
             }
             Err(reason) => {
                 eprintln!("Sync: {reason}");
@@ -472,6 +480,19 @@ pub async fn heartbeat() -> Result<ListenerStatus> {
         }
     }
     Ok(listener_status())
+}
+
+async fn start_discovery(bind_address: SocketAddr) {
+    let identity = tokio::task::spawn_blocking(|| {
+        let key = sync_keys::local_keypair()?;
+        Ok::<_, Error>((sync::device_id()?, key.fingerprint()))
+    })
+    .await;
+    let Ok(Ok((device_id, fingerprint))) = identity else {
+        eprintln!("Sync discovery: cannot load desktop identity");
+        return;
+    };
+    crate::sync_discovery::serve_until_listener_closes(bind_address, device_id, fingerprint).await;
 }
 
 /// Accept connections until [`LISTEN_GRACE`] has passed since the last
@@ -814,7 +835,8 @@ async fn connect(address: &str, limits: &Limits) -> Result<TcpStream> {
     let unreachable = |why: String| {
         Error::Network(format!(
             "cannot reach the desktop at {address}: {why}. Check that its Sync page is open and \
-             that both devices are on the same network."
+             that both devices are on the same network, and that the desktop firewall allows \
+             inbound TCP on the sync port."
         ))
     };
     match tokio::time::timeout(limits.handshake, TcpStream::connect(address)).await {
@@ -1641,6 +1663,31 @@ mod tests {
         assert_eq!(normalize_address("desk.local:9").unwrap(), "desk.local:9");
         assert!(normalize_address("").is_err());
         assert!(normalize_address("a b").is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn listener_remaining_is_zero_after_grace() {
+        hub_state().last_heartbeat = Some(Instant::now() - LISTEN_GRACE - Duration::from_secs(1));
+        assert!(listener_remaining().is_zero());
+        hub_state().last_heartbeat = None;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn discovery_responder_exits_after_grace() {
+        hub_state().last_heartbeat = Some(Instant::now() - LISTEN_GRACE - Duration::from_secs(1));
+        let bind = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::sync_discovery::serve_until_listener_closes(bind, "id".into(), "fp".into()),
+        )
+        .await;
+        assert!(result.is_ok());
+        hub_state().last_heartbeat = None;
     }
 
     /// Every message survives encoding, and an error text loses control

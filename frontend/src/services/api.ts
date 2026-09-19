@@ -26,6 +26,7 @@ import type {
   NetworthEvolution,
   RecurringTemplate,
   ReinstatedRow,
+  SyncDiscoveryResult,
   SyncListener,
   SyncNowResult,
   SyncPairCode,
@@ -621,6 +622,11 @@ export async function pairSync(address: string, code: string): Promise<SyncPairR
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ address, code }),
   });
+}
+
+/** POST /api/sync/discover. Finds open desktops, or returns an empty list. */
+export async function discoverSync(): Promise<SyncDiscoveryResult> {
+  return apiFetch("/api/sync/discover", { method: "POST" });
 }
 
 /** POST /api/sync/now. Runs a phone sync round, optionally confirming reset. */

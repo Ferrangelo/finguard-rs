@@ -397,6 +397,15 @@ export interface SyncPairResult {
   address: string;
 }
 
+/** Mirrors `SyncDiscoveryReplyJson` in api.rs. */
+export interface SyncDiscoveryReply {
+  address: string;
+  device_id: string;
+  key_fingerprint: string;
+}
+
+export type SyncDiscoveryResult = SyncDiscoveryReply[];
+
 export interface SyncResetPreview {
   rows_per_table: Record<string, number>;
   year_folders: number;
