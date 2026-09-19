@@ -325,6 +325,94 @@ export interface NetworthAllocation {
   unavailable_currencies?: string[];
 }
 
+export interface SyncPeer {
+  device_id: string;
+  role: string;
+  paired_at_ms: number;
+  key_fingerprint: string | null;
+  address: string | null;
+}
+
+export interface SyncLogHealth {
+  reliable: boolean;
+  problems: string[];
+  clock_ahead_hours: number | null;
+  error: string | null;
+}
+
+export interface SyncListener {
+  listening: boolean;
+  port: number;
+  address_hint: string | null;
+  bind_error: string | null;
+  pair_code_expires_at_ms: number | null;
+  stops_after_seconds: number;
+}
+
+export interface SyncPeerCounts {
+  applied: number;
+  skipped: number;
+  unplaceable: number;
+  already_known: number;
+}
+
+export interface SyncCounts {
+  sent: number;
+  received: number;
+  applied: number;
+  skipped: number;
+  unplaceable: number;
+  peer: SyncPeerCounts | null;
+}
+
+export interface SyncLast {
+  finished_at_ms: number;
+  peer_device_id: string | null;
+  outcome: string;
+  plan: string | null;
+  counts: SyncCounts;
+  error: string | null;
+}
+
+export interface SyncStatus {
+  role: string;
+  device_id: string;
+  key_fingerprint: string;
+  peers: SyncPeer[];
+  peers_error: string | null;
+  log_health: SyncLogHealth;
+  listener: SyncListener | null;
+  last_sync: SyncLast | null;
+}
+
+export interface SyncPairCode {
+  code: string;
+  expires_at_ms: number;
+  attempts_allowed: number;
+}
+
+export interface SyncPairResult {
+  hub_device_id: string;
+  hub_key_fingerprint: string;
+  address: string;
+}
+
+export interface SyncResetPreview {
+  rows_per_table: Record<string, number>;
+  year_folders: number;
+  unreadable_files: number;
+  unsent_entries: number;
+}
+
+export interface SyncNowResult {
+  outcome: string;
+  plan: string;
+  push_first: boolean;
+  counts: SyncCounts;
+  reset_preview: SyncResetPreview | null;
+  backup_folder: string | null;
+}
+
 // StatusKind and StatusMessage are frontend-only UI state (shown in the
 // header's StatusPill); they have no backend counterpart.
 export type StatusKind = "idle" | "loading" | "success" | "error";

@@ -8,6 +8,7 @@ import {
   LineChart,
   PieChart,
   Layers,
+  RefreshCw,
 } from "lucide-react";
 import { useApp } from "@/context/AppContext";
 import { MONTHS } from "@/services/api";
@@ -20,6 +21,7 @@ const TABS = [
   { to: "/cashflow", label: "Cashflow", icon: LineChart },
   { to: "/networth", label: "NetWorth", icon: PieChart },
   { to: "/categories", label: "Categories", icon: Layers },
+  { to: "/sync", label: "Sync", icon: RefreshCw },
 ] as const;
 
 /**

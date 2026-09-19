@@ -9,12 +9,18 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as SyncRouteImport } from './routes/sync'
 import { Route as NetworthRouteImport } from './routes/networth'
 import { Route as ExpensesRouteImport } from './routes/expenses'
 import { Route as CategoriesRouteImport } from './routes/categories'
 import { Route as CashflowRouteImport } from './routes/cashflow'
 import { Route as IndexRouteImport } from './routes/index'
 
+const SyncRoute = SyncRouteImport.update({
+  id: '/sync',
+  path: '/sync',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const NetworthRoute = NetworthRouteImport.update({
   id: '/networth',
   path: '/networth',
@@ -47,6 +53,7 @@ export interface FileRoutesByFullPath {
   '/categories': typeof CategoriesRoute
   '/expenses': typeof ExpensesRoute
   '/networth': typeof NetworthRoute
+  '/sync': typeof SyncRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -54,6 +61,7 @@ export interface FileRoutesByTo {
   '/categories': typeof CategoriesRoute
   '/expenses': typeof ExpensesRoute
   '/networth': typeof NetworthRoute
+  '/sync': typeof SyncRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -62,13 +70,27 @@ export interface FileRoutesById {
   '/categories': typeof CategoriesRoute
   '/expenses': typeof ExpensesRoute
   '/networth': typeof NetworthRoute
+  '/sync': typeof SyncRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/cashflow' | '/categories' | '/expenses' | '/networth'
+  fullPaths:
+    | '/'
+    | '/cashflow'
+    | '/categories'
+    | '/expenses'
+    | '/networth'
+    | '/sync'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/cashflow' | '/categories' | '/expenses' | '/networth'
-  id: '__root__' | '/' | '/cashflow' | '/categories' | '/expenses' | '/networth'
+  to: '/' | '/cashflow' | '/categories' | '/expenses' | '/networth' | '/sync'
+  id:
+    | '__root__'
+    | '/'
+    | '/cashflow'
+    | '/categories'
+    | '/expenses'
+    | '/networth'
+    | '/sync'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -77,10 +99,18 @@ export interface RootRouteChildren {
   CategoriesRoute: typeof CategoriesRoute
   ExpensesRoute: typeof ExpensesRoute
   NetworthRoute: typeof NetworthRoute
+  SyncRoute: typeof SyncRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/sync': {
+      id: '/sync'
+      path: '/sync'
+      fullPath: '/sync'
+      preLoaderRoute: typeof SyncRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/networth': {
       id: '/networth'
       path: '/networth'
@@ -125,6 +155,7 @@ const rootRouteChildren: RootRouteChildren = {
   CategoriesRoute: CategoriesRoute,
   ExpensesRoute: ExpensesRoute,
   NetworthRoute: NetworthRoute,
+  SyncRoute: SyncRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

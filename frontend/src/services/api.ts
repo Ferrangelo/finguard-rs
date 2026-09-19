@@ -26,6 +26,11 @@ import type {
   NetworthEvolution,
   RecurringTemplate,
   ReinstatedRow,
+  SyncListener,
+  SyncNowResult,
+  SyncPairCode,
+  SyncPairResult,
+  SyncStatus,
 } from "./types";
 
 // Prefixes every request. Empty by default, which keeps the relative
@@ -592,6 +597,44 @@ export async function getNetworthAllocation(
   month: number,
 ): Promise<NetworthAllocation | null> {
   return apiFetch(`/api/networth/allocation?year=${year}&month=${month}`);
+}
+
+/** GET /api/sync/status. Returns this device's sync role and current state. */
+export async function getSyncStatus(): Promise<SyncStatus> {
+  return apiFetch("/api/sync/status");
+}
+
+/** POST /api/sync/listen. Sends the hub listener heartbeat. */
+export async function syncListen(): Promise<SyncListener> {
+  return apiFetch("/api/sync/listen", { method: "POST" });
+}
+
+/** POST /api/sync/pair-code. Issues a replacement pairing code on the hub. */
+export async function issueSyncPairCode(): Promise<SyncPairCode> {
+  return apiFetch("/api/sync/pair-code", { method: "POST" });
+}
+
+/** POST /api/sync/pair. Pairs this phone with a hub. */
+export async function pairSync(address: string, code: string): Promise<SyncPairResult> {
+  return apiFetch("/api/sync/pair", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ address, code }),
+  });
+}
+
+/** POST /api/sync/now. Runs a phone sync round, optionally confirming reset. */
+export async function syncNow(confirmReset = false): Promise<SyncNowResult> {
+  return apiFetch("/api/sync/now", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm_reset: confirmReset }),
+  });
+}
+
+/** DELETE /api/sync/peers/:device_id. Removes a pairing on this device. */
+export async function unpairSync(deviceId: string): Promise<void> {
+  await apiFetch(`/api/sync/peers/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
 }
 
 // Full and abbreviated month labels, indexed 0 (January) to 11 (December).
