@@ -1448,6 +1448,89 @@ mod tests {
         );
     }
 
+    fn currency_repair_sequence(
+        skip_currency_recording: bool,
+    ) -> (crate::config::CurrencySettings, MergeReport) {
+        let root = tempfile::tempdir().unwrap();
+        let hub = root.path().join("hub");
+        let phone = root.path().join("phone");
+        start(&hub);
+        start(&phone);
+        pair_and_reset(&hub, &phone);
+        exchange(&hub, &phone).expect("the initial ordinary exchange");
+
+        use_device(&hub);
+        let desired = crate::config::CurrencySettings {
+            reference_currency: "USD".to_string(),
+            current_month_rate_mode: crate::config::CurrentMonthRateMode::Live,
+        };
+        crate::config::set_currency_settings(&desired).unwrap();
+        if skip_currency_recording {
+            std::fs::write(
+                crate::config::get_config_dir()
+                    .unwrap()
+                    .join("currency.json"),
+                b"not json",
+            )
+            .unwrap();
+        }
+        crate::sync_baseline::settings_baseline_change_log().unwrap();
+        assert_eq!(
+            sync::read_log_incomplete().unwrap(),
+            Some(vec![IncompleteReason::BaselineRefused])
+        );
+        reset_round(&hub, &phone, RoundPlan::HubRepair { push_first: true });
+        use_device(&hub);
+        crate::config::set_currency_settings(&desired).unwrap();
+        for (field, value) in [
+            ("reference_currency", serde_json::Value::from("USD")),
+            ("current_month_rate_mode", serde_json::Value::from("live")),
+        ] {
+            sync::shared_log()
+                .unwrap()
+                .append(
+                    ChangeTable::CurrencySettings,
+                    field,
+                    ChangeOp::Cell {
+                        column: "value".to_string(),
+                        value,
+                    },
+                )
+                .unwrap();
+        }
+
+        let round = exchange(&hub, &phone).expect("the ordinary exchange after repair");
+        assert!(round.replied > 0, "currency cells were not sent");
+        use_device(&phone);
+        (crate::config::get_currency_settings().unwrap(), round.phone)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn skipped_currency_recording_is_repaired_by_cells() {
+        let (settings, report) = currency_repair_sequence(true);
+
+        assert_eq!(settings.reference_currency, "USD");
+        assert_eq!(
+            settings.current_month_rate_mode,
+            crate::config::CurrentMonthRateMode::Live
+        );
+        assert_eq!(report.summary.unplaceable, 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recorded_currency_baseline_still_repairs_by_cells() {
+        let (settings, report) = currency_repair_sequence(false);
+
+        assert_eq!(settings.reference_currency, "USD");
+        assert_eq!(
+            settings.current_month_rate_mode,
+            crate::config::CurrentMonthRateMode::Live
+        );
+        assert_eq!(report.summary.unplaceable, 0);
+    }
+
     /// Pair `hub` and `phone` on both sides, without the first reset. Ends
     /// on the phone.
     fn pair_both(hub: &Path, phone: &Path) {

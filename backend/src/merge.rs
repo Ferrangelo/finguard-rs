@@ -202,9 +202,10 @@ pub enum MergeOutcome {
     /// built out of one column is the row nobody typed that the whole row rule
     /// exists to prevent.
     ///
-    /// [`ChangeTable::CashflowIncome`] is never unplaceable: its rows are the
-    /// fixed income categories, they always exist, and the baseline records
-    /// them cell by cell with no row level entry at all.
+    /// [`ChangeTable::CashflowIncome`] is never unplaceable because its fixed
+    /// categories are recorded cell by cell. [`ChangeTable::CurrencySettings`]
+    /// is never unplaceable because serde defaults create both fields regardless
+    /// of any entry.
     Unplaceable,
 }
 
@@ -248,8 +249,8 @@ pub enum RowAction {
     ///
     /// Only for per cell tables, and only where the row is known to exist:
     /// either an upsert on one side or the other creates it and this device
-    /// already holds that row, or the table's rows are the fixed income
-    /// categories. A cell for a row nothing creates is
+    /// already holds that row, or the table's rows are fixed income categories
+    /// or currency settings fields. A cell for a row nothing creates is
     /// [`MergeOutcome::Unplaceable`] instead and produces no action at all.
     SetCells {
         /// The columns to write.
@@ -486,17 +487,15 @@ fn merges_per_cell(table: &ChangeTable) -> bool {
 
 /// Whether the table's rows exist without any entry saying so.
 ///
-/// True only for [`ChangeTable::CashflowIncome`], whose rows are the fixed
-/// income categories of `cashflow.parquet`: no route creates or removes one,
-/// and the baseline records them cell by cell. Every other table's rows come
-/// from an upsert, so a cell edit of a row with no upsert anywhere is
-/// [`MergeOutcome::Unplaceable`] rather than an ordinary edit.
+/// True for tables whose rows exist by construction. Cashflow rows are the fixed
+/// income categories of `cashflow.parquet`, and currency settings always have
+/// both fields because the file is optional and serde defaults apply. Every
+/// other table's rows come from an upsert, so a cell edit of a row with no
+/// upsert anywhere is [`MergeOutcome::Unplaceable`] rather than an ordinary edit.
 fn has_fixed_rows(table: &ChangeTable) -> bool {
     match table {
-        ChangeTable::CashflowIncome { .. } => true,
-        ChangeTable::CategoryMappings
-        | ChangeTable::KnownCategories
-        | ChangeTable::CurrencySettings => false,
+        ChangeTable::CashflowIncome { .. } | ChangeTable::CurrencySettings => true,
+        ChangeTable::CategoryMappings | ChangeTable::KnownCategories => false,
         ChangeTable::Expenses { .. }
         | ChangeTable::Recurring { .. }
         | ChangeTable::Investments { .. }
@@ -2118,5 +2117,47 @@ mod tests {
         assert!(
             matches!(plan.actions[0].action, RowAction::SetCells { ref cells } if cells[0].value == Value::from("USD"))
         );
+    }
+
+    #[test]
+    fn currency_cells_land_without_row_level_entries() {
+        let table = ChangeTable::CurrencySettings;
+        let local = vec![entry(
+            100,
+            HERE,
+            table.clone(),
+            "reference_currency",
+            ChangeOp::Cell {
+                column: "value".into(),
+                value: Value::from("EUR"),
+            },
+        )];
+        let remote = vec![entry(
+            200,
+            THERE,
+            table,
+            "current_month_rate_mode",
+            ChangeOp::Cell {
+                column: "value".into(),
+                value: Value::from("live"),
+            },
+        )];
+
+        let plan = plan_merge(&local, &remote);
+
+        assert_eq!(plan.summary.applied, 1);
+        assert_eq!(plan.summary.unplaceable, 0);
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [MergeAction {
+                table: ChangeTable::CurrencySettings,
+                row_id,
+                action: RowAction::SetCells { cells }
+            }] if row_id == "current_month_rate_mode"
+                && cells == &[CellValue {
+                    column: "value".into(),
+                    value: Value::from("live"),
+                }]
+        ));
     }
 }
