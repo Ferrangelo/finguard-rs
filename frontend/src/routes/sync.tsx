@@ -14,6 +14,8 @@ import type {
   SyncStatus,
 } from "@/services/types";
 
+const HEARTBEAT_INTERVAL_MS = 5_000;
+
 export const Route = createFileRoute("/sync")({
   head: () => ({ meta: [{ title: "Sync · Finguard" }] }),
   component: SyncPage,
@@ -278,7 +280,7 @@ function SyncPage() {
     void heartbeat();
     const interval = window.setInterval(() => {
       void heartbeat();
-    }, 20_000);
+    }, HEARTBEAT_INTERVAL_MS);
     return () => {
       heartbeatActive = false;
       heartbeatInflightRef.current = false;
