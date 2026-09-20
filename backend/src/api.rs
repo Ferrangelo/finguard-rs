@@ -2020,6 +2020,9 @@ pub struct SyncStatusJson {
     pub listener: Option<SyncListenerJson>,
     /// The last round since the backend started, or `null`.
     pub last_sync: Option<SyncLastJson>,
+    /// On the hub, settings files that could not be recorded. Empty on a phone
+    /// and when all settings were recorded.
+    pub settings_sync_pending: Vec<String>,
 }
 
 /// One paired device in [`SyncStatusJson`].
@@ -2271,6 +2274,7 @@ impl From<sync_service::SyncStatus> for SyncStatusJson {
                 counts: last.counts.into(),
                 error: last.error,
             }),
+            settings_sync_pending: status.settings_sync_pending,
         }
     }
 }

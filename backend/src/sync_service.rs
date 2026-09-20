@@ -1290,6 +1290,9 @@ pub struct SyncStatus {
     pub listener: Option<ListenerStatus>,
     /// The last round since the process started.
     pub last_sync: Option<LastSync>,
+    /// On the hub: settings files that could not be recorded. Empty on a phone
+    /// and when all settings were recorded.
+    pub settings_sync_pending: Vec<String>,
 }
 
 /// This device's sync status. Blocking: it reads the log and the config
@@ -1322,6 +1325,11 @@ pub fn status() -> Result<SyncStatus> {
         log_health_error,
         listener: (role == SyncRole::Hub).then(listener_status),
         last_sync: last_sync(),
+        settings_sync_pending: if role == SyncRole::Hub {
+            crate::sync_baseline::settings_baseline_pending().unwrap_or_default()
+        } else {
+            Vec::new()
+        },
     })
 }
 

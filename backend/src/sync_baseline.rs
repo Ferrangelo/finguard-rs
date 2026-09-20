@@ -416,6 +416,20 @@ pub fn settings_baseline_change_log() -> Result<()> {
     Ok(())
 }
 
+/// Return settings files that the hub could not record during its baseline.
+/// Missing, unreadable, and older marker formats are treated as no pending
+/// settings so status remains available when the marker itself is damaged.
+pub fn settings_baseline_pending() -> Result<Vec<String>> {
+    let marker = get_sync_dir()?.join(SETTINGS_BASELINE_MARKER_FILE_NAME);
+    let text = match std::fs::read_to_string(marker) {
+        Ok(text) => text,
+        Err(_) => return Ok(Vec::new()),
+    };
+    Ok(serde_json::from_str::<SettingsBaselineMarker>(&text)
+        .map(|marker| marker.skipped_files)
+        .unwrap_or_default())
+}
+
 pub(crate) fn write_settings_marker_for_repair(report: &SettingsBaselineReport) -> Result<()> {
     write_baseline_marker(
         &get_sync_dir()?.join(SETTINGS_BASELINE_MARKER_FILE_NAME),
@@ -1161,6 +1175,47 @@ mod tests {
     /// Every change recorded so far, in the order it was written.
     fn log_entries() -> Vec<sync::ChangeEntry> {
         sync::read_log().expect("read the change log").entries
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn settings_baseline_pending_reads_skipped_files_and_ignores_missing_marker() {
+        let _temp = with_temp_data_home();
+        assert!(settings_baseline_pending().unwrap().is_empty());
+        let marker = get_sync_dir()
+            .unwrap()
+            .join(SETTINGS_BASELINE_MARKER_FILE_NAME);
+        std::fs::write(
+            marker,
+            serde_json::to_vec(&SettingsBaselineMarker {
+                skipped_files: vec![SETTINGS_MAPPINGS_FILE.to_string()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings_baseline_pending().unwrap(),
+            vec![SETTINGS_MAPPINGS_FILE.to_string()]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sync_status_reports_pending_settings_only_on_the_hub() {
+        let _temp = with_temp_data_home();
+        let marker = get_sync_dir()
+            .unwrap()
+            .join(SETTINGS_BASELINE_MARKER_FILE_NAME);
+        std::fs::write(marker, br#"{"skipped_files":["currency.json"]}"#).unwrap();
+
+        crate::sync_service::override_role_for_tests(Some(crate::sync_service::SyncRole::Hub));
+        let hub = crate::api::SyncStatusJson::from(crate::sync_service::status().unwrap());
+        assert_eq!(hub.settings_sync_pending, vec!["currency.json"]);
+
+        crate::sync_service::override_role_for_tests(Some(crate::sync_service::SyncRole::Phone));
+        let phone = crate::api::SyncStatusJson::from(crate::sync_service::status().unwrap());
+        assert!(phone.settings_sync_pending.is_empty());
+        crate::sync_service::override_role_for_tests(None);
     }
 
     /// The row an [`ChangeOp::Upsert`] carries, or a failure naming what the

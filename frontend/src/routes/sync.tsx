@@ -424,6 +424,12 @@ function HubView({
         {unpairError && <ErrorBanner message={unpairError} />}
         {status.peers_error && <ErrorBanner message={status.peers_error} />}
       </GlassCard>
+      {status.settings_sync_pending.map((file) => (
+        <p key={file} className="text-sm text-warning">
+          Settings are not fully syncing: {file} could not be read. Fix or remove the file, then
+          restart the desktop. The first sync afterwards repairs it.
+        </p>
+      ))}
       <LogHealth status={status} />
       <GlassCard title="Last round">
         <LastRound last={status.last_sync} />

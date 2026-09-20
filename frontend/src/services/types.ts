@@ -383,6 +383,7 @@ export interface SyncStatus {
   log_health: SyncLogHealth;
   listener: SyncListener | null;
   last_sync: SyncLast | null;
+  settings_sync_pending: string[];
 }
 
 export interface SyncPairCode {
