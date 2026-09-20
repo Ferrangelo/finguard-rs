@@ -60,7 +60,7 @@
 //! - [`error`]: the crate-wide [`Error`]/[`Result`] pair used by every module.
 //!
 //! Several parts of this crate deliberately reproduce behavior from the
-//! original Python application at `/home/anferrar/Projects/finguard` byte for
+//! original Python application at <https://github.com/Ferrangelo/finguard> byte for
 //! byte, most notably category-name normalization
 //! ([`df_operations::normalize_category_value`]) and banker's rounding
 //! ([`plots`] module). The on-disk Parquet

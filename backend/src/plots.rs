@@ -16,7 +16,7 @@
 //! on a `.5` boundary.
 //!
 //! This is a deliberate reproduction of `round(...)` calls in the original
-//! Python `plots.py` at `/home/anferrar/Projects/finguard`, not an
+//! Python `plots.py` in <https://github.com/Ferrangelo/finguard>, not an
 //! independent design choice: charts rendered from this module must show the
 //! same numbers a user would see in the Python app for the same data.
 //!

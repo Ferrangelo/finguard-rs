@@ -26,7 +26,7 @@
 //! that tests can override `XDG_DATA_HOME` / `HOME` between invocations.
 //!
 //! This layout and naming convention are a compatibility boundary shared with
-//! the original Python application at `/home/anferrar/Projects/finguard`:
+//! the original Python application at <https://github.com/Ferrangelo/finguard>:
 //! both projects read and write the same directory tree, so a change here
 //! must stay readable by (or be mirrored into) that project.
 

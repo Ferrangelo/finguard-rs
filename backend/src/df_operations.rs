@@ -3,7 +3,7 @@
 //!
 //! All tables are stored as parquet files under the standard XDG data path
 //! (see [`crate::paths`]). Schemas are kept byte-compatible with the Python
-//! application at `/home/anferrar/Projects/finguard` so the two can read each
+//! application at <https://github.com/Ferrangelo/finguard> so the two can read each
 //! other's parquet files: renaming, retyping, or reordering a column here is a
 //! cross-project data-contract change, not a local refactor, and must be
 //! checked against that project first.
@@ -40,7 +40,7 @@ use crate::sync::{self, ChangeOp, ChangeOrigin, ChangeTable, IncompleteReason};
 
 /// Special-case category-name mappings (lower-cased key → canonical display
 /// value). Mirrors the Python `_SPECIAL_CASES` dict in
-/// `/home/anferrar/Projects/finguard/src/finguard/df_operations.py` entry for
+/// `src/finguard/df_operations.py` in <https://github.com/Ferrangelo/finguard>, entry for
 /// entry, including its irregular internal capitalization (e.g. `"MrStuff"`,
 /// `"TechDonations"`). These spellings already exist in user data and in the
 /// Python UI, so this list must stay a literal copy rather than a
@@ -2708,7 +2708,7 @@ mod tests {
     /// `XDG_CONFIG_HOME` must be set explicitly rather than left to `HOME`'s
     /// `$HOME/.config` fallback: a caller's environment can already export
     /// `XDG_CONFIG_HOME`, which would then win over `HOME` and point
-    /// `config::get_config_dir` at the real `/home/dev/.config/finguard`.
+    /// `config::get_config_dir` at the real `$HOME/.config/finguard`.
     ///
     /// # Safety
     ///
