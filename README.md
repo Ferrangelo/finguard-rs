@@ -1,15 +1,13 @@
 # FinGuard-rs
-I could not find a personal finance apps that did everything my (Mr. Rip's) spreadsheets did, so I built my own.
 
-Personal finance management tool with a modern web dashboard for tracking investments, expenses, cashflow, liquidity, and net worth. Everything is stored locally as Parquet files with zero cloud dependencies.
+No app exists that accomplishes everything my spreadsheets handled in a simple way, so I built my own.
 
-Tool for my personal finance management with a modern web dashboard.
+Personal finance management with a modern web dashboard.
 It monitors investments, expenses, cashflow, liquidity, and net worth. Everything is stored locally as Parquet files with zero cloud dependencies.
 
 It follows a scheme similar to [Mr Rip spreadsheets](https://retireinprogress.com/how-i-track-my-finances-using-spreadsheets-part-1-why-and-what/).
 
-**This is a rewrite in Rust of the original Python project [Finguard](https://github.com/Ferrangelo/finguard).** It features a modern React frontend and a performant Axum backend. All data processing uses [Polars](https://pola.rs/) for efficiency and Parquet for storage.
-Backend rewritten in rust, while the typescript + React frontend has been coded using [Lovable](https://lovable.dev/)
+Backend in rust, the typescript + React frontend.
 
 ## Features
 
@@ -214,6 +212,8 @@ finguard-rs/
 ```
 
 ## References
+
+**This is a rewrite in Rust of the original Python project [Finguard](https://github.com/Ferrangelo/finguard).** It features a modern React frontend and a performant Axum backend. All data processing uses [Polars](https://pola.rs/) for efficiency and Parquet for storage.
 
 - **Original Python Project**: [finguard](https://github.com/Ferrangelo/finguard)
 - **Frontend Framework**: [TanStack Start](https://tanstack.com/start/latest)
