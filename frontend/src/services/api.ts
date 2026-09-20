@@ -601,13 +601,13 @@ export async function getNetworthAllocation(
 }
 
 /** GET /api/sync/status. Returns this device's sync role and current state. */
-export async function getSyncStatus(): Promise<SyncStatus> {
-  return apiFetch("/api/sync/status");
+export async function getSyncStatus(signal?: AbortSignal): Promise<SyncStatus> {
+  return apiFetch("/api/sync/status", { signal });
 }
 
 /** POST /api/sync/listen. Sends the hub listener heartbeat. */
-export async function syncListen(): Promise<SyncListener> {
-  return apiFetch("/api/sync/listen", { method: "POST" });
+export async function syncListen(signal?: AbortSignal): Promise<SyncListener> {
+  return apiFetch("/api/sync/listen", { method: "POST", signal });
 }
 
 /** POST /api/sync/pair-code. Issues a replacement pairing code on the hub. */

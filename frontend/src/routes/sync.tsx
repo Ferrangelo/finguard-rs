@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { Check, Copy, RefreshCw } from "lucide-react";
 import { GlassCard } from "@/components/finguard/GlassCard";
 import { ConfirmButton } from "@/components/finguard/ConfirmButton";
+import { useApp } from "@/context/AppContext";
 import * as api from "@/services/api";
 import type {
   SyncCounts,
@@ -209,6 +210,9 @@ function SyncPage() {
   } | null>(null);
   const activeRef = useRef(true);
   const pairCodeRequestedRef = useRef(false);
+  const { refresh: refreshApp } = useApp();
+  const lastSyncSeenRef = useRef<number | null | undefined>(undefined);
+  const heartbeatInflightRef = useRef(false);
 
   const loadStatus = async () => {
     try {
@@ -236,17 +240,39 @@ function SyncPage() {
   useEffect(() => {
     if (status?.role !== "hub") return;
     let heartbeatActive = true;
-    const heartbeat = async () => {
+    const runHeartbeat = async () => {
+      // Each fetch gets its own 10 s timeout, so a hung request rejects
+      // instead of wedging the heartbeat loop behind the in-flight guard.
       try {
-        const listener = await api.syncListen();
+        const listener = await api.syncListen(AbortSignal.timeout(10_000));
         if (heartbeatActive && activeRef.current) {
           setStatus((current) => (current ? { ...current, listener } : current));
           setError(null);
+        }
+        // The listen endpoint returns listener info only, so fetch full
+        // status here to keep last_sync live after incoming rounds.
+        try {
+          const full = await api.getSyncStatus(AbortSignal.timeout(10_000));
+          if (heartbeatActive && activeRef.current) {
+            setStatus((current) => (current ? { ...current, ...full, listener } : current));
+          }
+        } catch {
+          // Ignore a failed status fetch. The listener heartbeat above
+          // already succeeded, so keep its update and error state.
         }
       } catch (err) {
         if (heartbeatActive && activeRef.current)
           setError(err instanceof Error ? err.message : "Could not contact the sync listener.");
       }
+    };
+    // Skip a tick while the previous heartbeat is still in flight, so a
+    // late response never overwrites newer state.
+    const heartbeat = () => {
+      if (heartbeatInflightRef.current) return;
+      heartbeatInflightRef.current = true;
+      void runHeartbeat().finally(() => {
+        heartbeatInflightRef.current = false;
+      });
     };
     // The backend closes the listener after a grace period, so refresh it well before then.
     void heartbeat();
@@ -255,9 +281,25 @@ function SyncPage() {
     }, 20_000);
     return () => {
       heartbeatActive = false;
+      heartbeatInflightRef.current = false;
       window.clearInterval(interval);
     };
   }, [status?.role]);
+
+  const lastSyncKey = status?.last_sync?.finished_at_ms ?? null;
+  useEffect(() => {
+    // Ignore observations before the first status load, so the initial
+    // fetch of an existing round never triggers a refresh on mount.
+    if (status === null) return;
+    if (lastSyncSeenRef.current === undefined) {
+      lastSyncSeenRef.current = lastSyncKey;
+      return;
+    }
+    if (lastSyncSeenRef.current !== lastSyncKey) {
+      lastSyncSeenRef.current = lastSyncKey;
+      refreshApp();
+    }
+  }, [status, lastSyncKey, refreshApp]);
 
   useEffect(() => {
     if (status?.role !== "hub" || !status.listener || pairCodeRequestedRef.current) return;
@@ -440,6 +482,7 @@ function HubView({
 
 function PhoneView({ status, refresh }: { status: SyncStatus; refresh: () => Promise<void> }) {
   const hub = status.peers.find((peer) => peer.role === "hub");
+  const { refresh: refreshApp } = useApp();
   const [address, setAddress] = useState(hub?.address ?? "");
   const [code, setCode] = useState("");
   const [pairedFingerprint, setPairedFingerprint] = useState<string | null>(null);
@@ -516,6 +559,7 @@ function PhoneView({ status, refresh }: { status: SyncStatus; refresh: () => Pro
         setRound(confirmed);
       }
       await refresh();
+      refreshApp();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sync failed.");
     } finally {
