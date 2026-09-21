@@ -5,6 +5,17 @@
 echo "Starting finguard_rs development environment..."
 echo ""
 
+# Inside the dev container the host browser reaches the app through the
+# container's published ports, so both servers must bind all interfaces.
+# FINGUARD_HOST and FINGUARD_DEV_HOST are the backend's and frontend's own
+# opt-ins; on the host neither is set here and both keep their loopback
+# defaults. An explicit value the caller exported always wins.
+if [ -f /run/.containerenv ]; then
+    echo "Dev container detected: binding backend and frontend to 0.0.0.0."
+    export FINGUARD_HOST="${FINGUARD_HOST:-0.0.0.0}"
+    export FINGUARD_DEV_HOST="${FINGUARD_DEV_HOST:-0.0.0.0}"
+fi
+
 # Start the Rust backend in the background
 echo "Starting Rust backend (cargo run)..."
 cd backend && cargo run --bin finguard_rs_backend &
