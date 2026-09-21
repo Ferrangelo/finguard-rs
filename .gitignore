@@ -68,6 +68,8 @@ frontend/*.sln
 frontend/*.sw?
 
 backend/target/*
+# Container-only Cargo target dir (CARGO_TARGET_DIR in .devcontainer/compose.yaml).
+backend/target-container/
 
 # Local compose overrides
 /.env
