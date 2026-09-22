@@ -68,6 +68,19 @@ async fn main() {
     }
 
     println!("Finguard server running on http://{}", addr);
+    finguard_rs_backend::diag::event(
+        0,
+        "srv",
+        format!("listening on http://{addr} (silence fx lines with FINGUARD_FX_QUIET=1)"),
+    );
+    match finguard_rs_backend::paths::get_fx_rates_path() {
+        Ok(path) => {
+            finguard_rs_backend::diag::event(0, "srv", format!("fx cache at {}", path.display()))
+        }
+        Err(err) => {
+            finguard_rs_backend::diag::event(0, "srv", format!("fx cache path error: {err}"));
+        }
+    }
     axum::serve(listener, finguard_rs_backend::api::router())
         .await
         .unwrap()

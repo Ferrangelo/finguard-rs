@@ -158,6 +158,16 @@ struct FrankfurterResponse {
     rates: BTreeMap<String, f64>,
 }
 
+/// Frankfurter's response shape for `/{start}..{end}` range requests: one
+/// EUR-based table per published day, keyed by date. Weekends and holidays
+/// have no entry; only working days appear. The sibling `amount`, `base`,
+/// `start_date` and `end_date` fields carry no rates, so they are not mapped
+/// here (serde ignores them).
+#[derive(Debug, Deserialize)]
+struct FrankfurterRangeResponse {
+    rates: BTreeMap<String, BTreeMap<String, f64>>,
+}
+
 /// Load the rate cache from disk. Returns an empty EUR-based cache if the
 /// file does not exist yet.
 fn load_cache() -> Result<RateCache> {
@@ -209,15 +219,38 @@ fn parse_date(date_str: &str) -> Result<NaiveDate> {
 
 /// Fetch and parse a Frankfurter response, mapping any failure to
 /// [`Error::Network`] so callers can distinguish it from a lookup miss.
-async fn fetch_rates(url: &str) -> Result<(NaiveDate, BTreeMap<String, f64>)> {
+///
+/// `kind` (`"single"` or `"latest"`) labels the diag line emitted on
+/// failure. Success stays silent; the batch summary covers it. The URL
+/// itself is never logged because it embeds dates.
+async fn fetch_rates(url: &str, kind: &str, op: u64) -> Result<(NaiveDate, BTreeMap<String, f64>)> {
+    let start = std::time::Instant::now();
+    let fail = |e: &reqwest::Error| {
+        crate::diag::event(
+            op,
+            "fx",
+            format!(
+                "fetch {kind} FAIL {} in {}ms",
+                classify_fetch_error(e),
+                start.elapsed().as_millis()
+            ),
+        );
+    };
     let response = http_client()?
         .get(url)
         .send()
         .await
-        .map_err(|e| Error::Network(format!("request to {url} failed: {e}")))?
+        .map_err(|e| {
+            fail(&e);
+            Error::Network(format!("request to {url} failed: {e}"))
+        })?
         .error_for_status()
-        .map_err(|e| Error::Network(format!("Frankfurter returned an error for {url}: {e}")))?;
+        .map_err(|e| {
+            fail(&e);
+            Error::Network(format!("Frankfurter returned an error for {url}: {e}"))
+        })?;
     let body: FrankfurterResponse = response.json().await.map_err(|e| {
+        fail(&e);
         Error::Network(format!(
             "Frankfurter response from {url} was not the expected shape: {e}"
         ))
@@ -226,17 +259,122 @@ async fn fetch_rates(url: &str) -> Result<(NaiveDate, BTreeMap<String, f64>)> {
     Ok((date, body.rates))
 }
 
+/// Classify a Frankfurter request failure for the diag log: timeouts,
+/// refused connections, and HTTP statuses (notably 429 rate limits) point
+/// at very different fixes, and none of this leaks dates or amounts.
+fn classify_fetch_error(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        "timeout".to_string()
+    } else if e.is_connect() {
+        "connect".to_string()
+    } else if e.is_decode() {
+        "decode".to_string()
+    } else if let Some(status) = e.status() {
+        format!("http_{}", status.as_u16())
+    } else if e.is_builder() {
+        "client".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
 /// Fetch the EUR-based rates Frankfurter published on or before `date`. The
 /// returned date is frequently earlier than requested, since the ECB does not
 /// publish on weekends or holidays.
-async fn fetch_historical(date: NaiveDate) -> Result<(NaiveDate, BTreeMap<String, f64>)> {
+async fn fetch_historical(date: NaiveDate, op: u64) -> Result<(NaiveDate, BTreeMap<String, f64>)> {
     let url = format!("{FRANKFURTER_BASE_URL}/{}?base=EUR", format_date(date));
-    fetch_rates(&url).await
+    fetch_rates(&url, "single", op).await
+}
+
+/// Parse a Frankfurter `{start}..{end}` range body into one EUR-based table
+/// per published day.
+///
+/// Pure so tests cover it without the network; [`fetch_range`] is the only
+/// caller that fetches the body it parses.
+fn parse_range_response(body: &str) -> Result<BTreeMap<NaiveDate, BTreeMap<String, f64>>> {
+    let parsed: FrankfurterRangeResponse = serde_json::from_str(body).map_err(|e| {
+        Error::Network(format!(
+            "Frankfurter range response was not the expected shape: {e}"
+        ))
+    })?;
+    let mut days = BTreeMap::new();
+    for (date_str, rates) in parsed.rates {
+        days.insert(parse_date(&date_str)?, rates);
+    }
+    Ok(days)
+}
+
+/// Fetch every EUR-based rate table Frankfurter published in `min..=max`
+/// with a single range request, keyed by the day each table was published
+/// for. A weekend or holiday inside the span simply has no entry.
+///
+/// Logs one line either way: the requested span length in days (a count, not
+/// dates) and the merged table count on success, the classified cause on
+/// failure. The URL itself is never logged because it embeds dates.
+async fn fetch_range(
+    min: NaiveDate,
+    max: NaiveDate,
+    op: u64,
+) -> Result<BTreeMap<NaiveDate, BTreeMap<String, f64>>> {
+    let start = std::time::Instant::now();
+    let span_days = max.signed_duration_since(min).num_days();
+    let url = format!(
+        "{FRANKFURTER_BASE_URL}/{}..{}?base=EUR",
+        format_date(min),
+        format_date(max)
+    );
+    let fail = |cause: &str| {
+        crate::diag::event(
+            op,
+            "fx",
+            format!(
+                "fetch range FAIL {cause} span {span_days}d in {}ms",
+                start.elapsed().as_millis()
+            ),
+        );
+    };
+    let body = http_client()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| {
+            fail(&classify_fetch_error(&e));
+            Error::Network(format!("request to {url} failed: {e}"))
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            fail(&classify_fetch_error(&e));
+            Error::Network(format!("Frankfurter returned an error for {url}: {e}"))
+        })?
+        .text()
+        .await
+        .map_err(|e| {
+            fail(&classify_fetch_error(&e));
+            Error::Network(format!(
+                "Frankfurter response from {url} was not readable: {e}"
+            ))
+        })?;
+    let days = parse_range_response(&body).inspect_err(|_| fail("decode"))?;
+    crate::diag::event(
+        op,
+        "fx",
+        format!(
+            "fetch range ok span {span_days}d tables {} in {}ms",
+            days.len(),
+            start.elapsed().as_millis()
+        ),
+    );
+    Ok(days)
 }
 
 /// Fetch the newest EUR-based rates Frankfurter has published.
 async fn fetch_latest() -> Result<(NaiveDate, BTreeMap<String, f64>)> {
-    fetch_rates(&format!("{FRANKFURTER_BASE_URL}/latest?base=EUR")).await
+    fetch_rates(
+        &format!("{FRANKFURTER_BASE_URL}/latest?base=EUR"),
+        "latest",
+        0,
+    )
+    .await
 }
 
 /// Return the largest cached date strictly before `date_str`, if any.
@@ -349,7 +487,7 @@ async fn resolve_eur_rates_on(date: NaiveDate) -> Result<(BTreeMap<String, f64>,
     }
 
     if !is_offline() {
-        match fetch_historical(date).await {
+        match fetch_historical(date, 0).await {
             Ok((returned_date, rates)) => {
                 let today = Local::now().date_naive();
                 let alias_for = should_alias_as(date, returned_date, today).then_some(date);
@@ -613,6 +751,81 @@ impl MonthlyRates {
     }
 }
 
+/// The month-end dates that back one year of [`monthly_rates`].
+///
+/// Pure and currency-independent: [`monthly_rates_core`] resolves exactly
+/// these dates through [`month_end_rate`], and [`monthly_rates_lenient`]
+/// pre-warms the cache for them with one range fetch before its per-currency
+/// loop, so the two lists cannot drift apart.
+///
+/// Never contains a date served only by [`live_rate`]: under
+/// [`config::CurrentMonthRateMode::Live`] the in-progress month and every
+/// later month resolve through the network-first live lookup, which must keep
+/// hitting the network unconditionally.
+struct YearRateDates {
+    /// `(month, last day)` for every completed month of the year.
+    completed: Vec<(u32, NaiveDate)>,
+    /// Last day of the month before `today`, backing the in-progress month
+    /// and every later month when the year reaches the current period under
+    /// [`config::CurrentMonthRateMode::PreviousMonthEnd`]. `None` for fully
+    /// past years, and always `None` under `Live`.
+    previous_month_end: Option<NaiveDate>,
+}
+
+/// Compute the [`YearRateDates`] for `year` given `today` and `mode`.
+///
+/// A month of `year` is completed exactly when `(year, month)` precedes
+/// `(today.year(), today.month())`, the same rule [`monthly_rates_core`]
+/// applies in its fetch loop. When `year` reaches the current period and
+/// `mode` is `PreviousMonthEnd`, the in-progress month's rate comes from the
+/// previous month's close (December of the prior year for January).
+fn year_rate_dates(
+    today: NaiveDate,
+    year: i32,
+    mode: config::CurrentMonthRateMode,
+) -> Result<YearRateDates> {
+    let mut completed = Vec::new();
+    for month in 1..=12u32 {
+        if (year, month) < (today.year(), today.month()) {
+            completed.push((month, last_day_of_month(year, month)?));
+        }
+    }
+    let reaches_current = (year, 12u32) >= (today.year(), today.month());
+    let previous_month_end =
+        if reaches_current && mode == config::CurrentMonthRateMode::PreviousMonthEnd {
+            let (prev_year, prev_month) = if today.month() == 1 {
+                (today.year() - 1, 12)
+            } else {
+                (today.year(), today.month() - 1)
+            };
+            Some(last_day_of_month(prev_year, prev_month)?)
+        } else {
+            None
+        };
+    Ok(YearRateDates {
+        completed,
+        previous_month_end,
+    })
+}
+
+impl YearRateDates {
+    /// Every date [`monthly_rates_core`] resolves through [`month_end_rate`]
+    /// for this year: each completed month's last day, plus the previous
+    /// month-end backing the current period when present. Sorted and
+    /// deduplicated, since that previous month-end can coincide with a
+    /// completed month of the same year.
+    fn prewarm_dates(&self) -> Vec<NaiveDate> {
+        let mut dates: Vec<NaiveDate> = self.completed.iter().map(|(_, date)| *date).collect();
+        if let Some(prev) = self.previous_month_end
+            && !dates.contains(&prev)
+        {
+            dates.push(prev);
+        }
+        dates.sort();
+        dates
+    }
+}
+
 /// Resolve one rate per currency in `currencies` for every month of `year`,
 /// given an explicit `today` so the completed/in-progress/future rule (see
 /// [`monthly_rates`]) is testable without depending on the real date.
@@ -643,6 +856,10 @@ async fn monthly_rates_core(
     let today_year = today.year();
     let today_month = today.month();
 
+    // The exact month-end dates this call resolves, shared with the
+    // [`monthly_rates_lenient`] prewarm so the two cannot drift apart.
+    let rate_dates = year_rate_dates(today, year, settings.current_month_rate_mode)?;
+
     // The in-progress month and every later month share one rate per
     // currency (a future month tracks the in-progress month so the series has
     // no discontinuity), so resolve it once here instead of once per month.
@@ -653,12 +870,13 @@ async fn monthly_rates_core(
         for currency in &needed {
             let resolved = match settings.current_month_rate_mode {
                 config::CurrentMonthRateMode::PreviousMonthEnd => {
-                    let (prev_year, prev_month) = if today_month == 1 {
-                        (today_year - 1, 12)
-                    } else {
-                        (today_year, today_month - 1)
-                    };
-                    month_end_rate(prev_year, prev_month, currency).await?
+                    let prev = rate_dates.previous_month_end.expect(
+                        "year_rate_dates sets previous_month_end whenever the year \
+                         reaches the current period under PreviousMonthEnd",
+                    );
+                    // `month_end_rate` is a thin wrapper resolving the
+                    // month-end date first; `prev` already is that date.
+                    rate_on(prev, currency).await?
                 }
                 config::CurrentMonthRateMode::Live => live_rate(currency).await?,
             };
@@ -669,13 +887,18 @@ async fn monthly_rates_core(
     for month in 1..=12u32 {
         // Every month before the in-progress one is a completed month, and
         // keeps its own frozen month-end rate rather than the current one.
-        let is_completed = (year, month) < (today_year, today_month);
+        // `rate_dates.completed` holds exactly those months with their last
+        // days, so a month absent from it takes the current-period rate.
+        let completed = rate_dates
+            .completed
+            .iter()
+            .find(|(m, _)| *m == month)
+            .map(|(_, date)| *date);
         let mut month_rates = MonthRates::new();
         for currency in &needed {
-            let rate = if is_completed {
-                month_end_rate(year, month, currency).await?.rate
-            } else {
-                current_period[currency]
+            let rate = match completed {
+                Some(last_day) => rate_on(last_day, currency).await?.rate,
+                None => current_period[currency],
             };
             month_rates.insert(currency.clone(), rate);
         }
@@ -725,10 +948,10 @@ pub async fn monthly_rates_lenient(
     year: i32,
     currencies: &[String],
 ) -> Result<(MonthlyRates, Vec<String>)> {
-    let reference_currency = config::get_currency_settings()?
-        .reference_currency
-        .trim()
-        .to_uppercase();
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
+    let settings = config::get_currency_settings()?;
+    let reference_currency = settings.reference_currency.trim().to_uppercase();
 
     let mut needed: Vec<String> = currencies
         .iter()
@@ -738,24 +961,604 @@ pub async fn monthly_rates_lenient(
     needed.sort();
     needed.dedup();
 
+    crate::diag::event(
+        op,
+        "fx",
+        format!(
+            "monthly_rates start ref={reference_currency} year={year} currencies={}",
+            needed.len()
+        ),
+    );
     let mut combined = MonthlyRates {
-        reference_currency,
+        reference_currency: reference_currency.clone(),
         rates: BTreeMap::new(),
     };
     let mut unavailable_currencies = Vec::new();
 
+    if needed.is_empty() {
+        crate::diag::event(
+            op,
+            "fx",
+            format!(
+                "monthly_rates done in {}ms months=0 unavailable=0 []",
+                start.elapsed().as_millis()
+            ),
+        );
+        return Ok((combined, unavailable_currencies));
+    }
+
+    let today = Local::now().date_naive();
+    // The exact month-end dates this call resolves, shared with
+    // `monthly_rates_core` so the two cannot drift apart. Practically
+    // infallible (only absurd years fail); on error every currency degrades,
+    // exactly as the per-currency loop would on the same error.
+    let rate_dates = match year_rate_dates(today, year, settings.current_month_rate_mode) {
+        Ok(dates) => dates,
+        Err(_) => {
+            crate::diag::event(
+                op,
+                "fx",
+                format!(
+                    "monthly_rates done in {}ms months=0 unavailable={} [{}]",
+                    start.elapsed().as_millis(),
+                    needed.len(),
+                    needed.join(",")
+                ),
+            );
+            return Ok((combined, needed));
+        }
+    };
+
+    // One snapshot for the whole call instead of one file read per month
+    // per currency. An unreadable cache degrades every currency, exactly as
+    // the per-currency loop does when each lookup fails to load it.
+    let mut batch = match load_cache() {
+        Ok(cache) => SnapBatch::new(cache, op),
+        Err(_) => {
+            crate::diag::event(
+                op,
+                "fx",
+                format!(
+                    "monthly_rates done in {}ms months=0 unavailable={} [{}]",
+                    start.elapsed().as_millis(),
+                    needed.len(),
+                    needed.join(",")
+                ),
+            );
+            return Ok((combined, needed));
+        }
+    };
+
+    // Pre-warm the batch snapshot for every month-end date this call will
+    // resolve, with one range fetch for the whole span instead of one
+    // request per month per currency below. Failures are ignored; the
+    // per-month loop stays as the fallback. Never touches a `Live`
+    // current-period date: `prewarm_dates` excludes it, so `live_rate`
+    // keeps hitting the network.
+    ensure_range_cached(&mut batch, &rate_dates.prewarm_dates()).await;
+
+    // The in-progress month and every later month share one rate per
+    // currency, mirroring `monthly_rates_core`: under `PreviousMonthEnd`
+    // that is the previous month-end date resolved once here, under `Live`
+    // it is the network-first live lookup, which stays untouched.
+    let reaches_current = (year, 12u32) >= (today.year(), today.month());
     for currency in &needed {
-        match monthly_rates(year, std::slice::from_ref(currency)).await {
-            Ok(resolved) => {
-                for (month, month_rates) in resolved.rates {
-                    combined.rates.entry(month).or_default().extend(month_rates);
+        let mut current_period: Option<f64> = None;
+        if reaches_current {
+            match settings.current_month_rate_mode {
+                config::CurrentMonthRateMode::PreviousMonthEnd => {
+                    let prev = rate_dates.previous_month_end.expect(
+                        "year_rate_dates sets previous_month_end whenever the year \
+                         reaches the current period under PreviousMonthEnd",
+                    );
+                    match batch.resolve(prev, currency, &reference_currency).await {
+                        Ok(resolved) => current_period = Some(resolved.rate),
+                        Err(()) => {
+                            unavailable_currencies.push(currency.clone());
+                            continue;
+                        }
+                    }
+                }
+                config::CurrentMonthRateMode::Live => match live_rate(currency).await {
+                    Ok(resolved) => current_period = Some(resolved.rate),
+                    Err(_) => {
+                        unavailable_currencies.push(currency.clone());
+                        continue;
+                    }
+                },
+            }
+        }
+
+        // A month that fails drops the whole currency, not just the month:
+        // the per-currency `monthly_rates` call this replaces either
+        // resolves fully or fails fully, so partial months must never merge.
+        let mut months: BTreeMap<u32, MonthRates> = BTreeMap::new();
+        let mut failed = false;
+        for (month, last_day) in &rate_dates.completed {
+            match batch
+                .resolve(*last_day, currency, &reference_currency)
+                .await
+            {
+                Ok(resolved) => {
+                    months.insert(*month, BTreeMap::from([(currency.clone(), resolved.rate)]));
+                }
+                Err(()) => {
+                    failed = true;
+                    break;
                 }
             }
-            Err(_) => unavailable_currencies.push(currency.clone()),
+        }
+        if failed {
+            unavailable_currencies.push(currency.clone());
+            continue;
+        }
+        // Every month before the in-progress one is completed and above; the
+        // rest share the current-period rate resolved once per currency.
+        for month in 1..=12u32 {
+            months.entry(month).or_insert_with(|| {
+                let current = current_period.expect(
+                    "a non-completed month implies the year reaches the current \
+                     period, whose rate resolved above",
+                );
+                BTreeMap::from([(currency.clone(), current)])
+            });
+        }
+        for (month, month_rates) in months {
+            combined.rates.entry(month).or_default().extend(month_rates);
         }
     }
 
+    crate::diag::event(
+        op,
+        "fx",
+        format!(
+            "monthly_rates done in {}ms months={} unavailable={} [{}] fetches={} fallbacks={}",
+            start.elapsed().as_millis(),
+            combined.rates.len(),
+            unavailable_currencies.len(),
+            unavailable_currencies.join(","),
+            batch.single_fetches,
+            batch.stale_fallbacks
+        ),
+    );
     Ok((combined, unavailable_currencies))
+}
+
+/// Merge range-fetched `days` into `cache`, and alias still-unresolved
+/// `key_dates` to their nearest earlier published day.
+///
+/// `min` is the earliest date the range fetch requested, so `days` proves
+/// publication only from `min` onward. An alias is recorded only when its
+/// target is at or after `min` *and* [`should_alias_as`] trusts the
+/// substitution for `today`, so a recent weekend is never frozen the way an
+/// old holiday is. A target before `min` is unproven: the response cannot
+/// show whether a closer published day exists between it and the key date, so
+/// the pre-existing cache may be stale there. Such key dates stay unresolved
+/// for the per-key fallback, which fetches their true substitution directly.
+///
+/// Apart from its arguments this is pure, so tests cover it without the
+/// network: [`ensure_range_cached`] merges through it twice, once into the
+/// batch snapshot and once into the reloaded disk cache for persistence.
+/// A key date already stored exactly, or already aliased, is left alone; a
+/// key date with no earlier published day stays unresolved for the per-key
+/// fallback.
+///
+/// Returns the number of day tables merged and the number of aliases
+/// recorded, for the diag log.
+fn merge_range_into_cache(
+    cache: &mut RateCache,
+    days: &BTreeMap<NaiveDate, BTreeMap<String, f64>>,
+    key_dates: &[NaiveDate],
+    min: NaiveDate,
+    today: NaiveDate,
+) -> (usize, usize) {
+    for (date, rates) in days {
+        cache.rates.insert(format_date(*date), rates.clone());
+    }
+    let mut aliases = 0;
+    for key_date in key_dates {
+        let key_str = format_date(*key_date);
+        if cache.rates.contains_key(&key_str) || cache.aliases.contains_key(&key_str) {
+            continue;
+        }
+        let earlier = match nearest_earlier(cache, &key_str) {
+            Ok(found) => found,
+            Err(_) => continue,
+        };
+        let Some((published_date, _)) = earlier else {
+            continue;
+        };
+        if published_date >= min && should_alias_as(*key_date, published_date, today) {
+            cache.aliases.insert(key_str, format_date(published_date));
+            aliases += 1;
+        }
+    }
+    (days.len(), aliases)
+}
+
+/// Clamp a range fetch minimum to the earliest cached day.
+///
+/// When the cache already holds history, fetching from the earliest cached
+/// day covers every unresolved date at or after it; an older date can only
+/// resolve through its own single fetch (exact for any date), so starting
+/// the range at it would re-download span already on disk. Returns the
+/// clamped minimum: `max(min, earliest cached day)` when the cache is
+/// non-empty and the earliest key parses, else `min` unchanged. Pure, so
+/// tests cover it without the network.
+fn clamp_range_min(min: NaiveDate, cache: &RateCache) -> NaiveDate {
+    let Some(earliest_str) = cache.rates.keys().next() else {
+        return min;
+    };
+    let Ok(earliest) = parse_date(earliest_str) else {
+        return min;
+    };
+    min.max(earliest)
+}
+
+/// Persist range-fetched `days` through the same locked load-modify-save
+/// discipline as `store_historical_rates`: reload under
+/// [`cache_write_lock`] right before writing, so a concurrent writer's save
+/// is never lost.
+async fn persist_range(
+    days: &BTreeMap<NaiveDate, BTreeMap<String, f64>>,
+    key_dates: &[NaiveDate],
+    min: NaiveDate,
+    today: NaiveDate,
+) {
+    let _guard = cache_write_lock().lock().await;
+    let Ok(mut cache) = load_cache() else {
+        return;
+    };
+    merge_range_into_cache(&mut cache, days, key_dates, min, today);
+    let _ = save_cache(&cache);
+}
+
+/// Pre-warm the batch's snapshot for `key_dates` with a single Frankfurter
+/// `{min}..{max}` range fetch, so the batch does not pay one HTTPS request
+/// per distinct date on a cold cache.
+///
+/// Reads only `batch.cache` (one load per batch, done by the caller) and
+/// merges fetched days into it in memory; persistence goes through
+/// [`persist_range`]. Dates older than the cached history skip the range:
+/// they resolve through their own exact single fetch downstream. Returns
+/// the dates still missing afterwards; every failure mode returns them
+/// all, leaving the per-key fallback owning them exactly as before.
+///
+/// All failures are ignored and the lenient `unavailable_currencies`
+/// contract is unchanged. Logs one line per outcome under the batch's op
+/// id. Counts only, never dates.
+async fn ensure_range_cached(batch: &mut SnapBatch, key_dates: &[NaiveDate]) -> Vec<NaiveDate> {
+    let op = batch.op;
+    if key_dates.is_empty() {
+        crate::diag::event(op, "fx", "prewarm skip: no key dates");
+        return Vec::new();
+    }
+    if is_offline() {
+        crate::diag::event(op, "fx", "prewarm skip: offline");
+        return key_dates.to_vec();
+    }
+    let mut unresolved = Vec::new();
+    for date in key_dates {
+        match cached_rate_for(&batch.cache, *date) {
+            Ok(None) => unresolved.push(*date),
+            Ok(Some(_)) => {}
+            Err(_) => return key_dates.to_vec(),
+        }
+    }
+    if unresolved.is_empty() {
+        crate::diag::event(
+            op,
+            "fx",
+            format!("prewarm skip: {} dates already cached", key_dates.len()),
+        );
+        return Vec::new();
+    }
+    let (Some(min), Some(max)) = (
+        unresolved.iter().min().copied(),
+        unresolved.iter().max().copied(),
+    ) else {
+        return key_dates.to_vec();
+    };
+    let range_min = clamp_range_min(min, &batch.cache);
+    let mut older = Vec::new();
+    let mut in_range = Vec::new();
+    for date in unresolved {
+        if date < range_min {
+            older.push(date);
+        } else {
+            in_range.push(date);
+        }
+    }
+    if in_range.is_empty() {
+        crate::diag::event(
+            op,
+            "fx",
+            format!("prewarm skip: {} dates predate cached history", older.len()),
+        );
+        return older;
+    }
+    crate::diag::event(
+        op,
+        "fx",
+        format!(
+            "prewarm range: {} unresolved dates over {} days ({} older skipped)",
+            in_range.len(),
+            max.signed_duration_since(range_min).num_days(),
+            older.len()
+        ),
+    );
+    let days = match fetch_range(range_min, max, op).await {
+        Ok(days) => days,
+        Err(_) => return older.into_iter().chain(in_range).collect(),
+    };
+    if days.is_empty() {
+        return older.into_iter().chain(in_range).collect();
+    }
+    let today = Local::now().date_naive();
+    let (tables, aliases) =
+        merge_range_into_cache(&mut batch.cache, &days, &in_range, range_min, today);
+    persist_range(&days, &in_range, range_min, today).await;
+    crate::diag::event(
+        op,
+        "fx",
+        format!("prewarm merged {tables} day tables, {aliases} aliases"),
+    );
+    // Whatever the range did not cover stays missing for the concurrent
+    // single-fetch phase, which rechecks the snapshot per date.
+    let mut still_missing = older;
+    for date in in_range {
+        if !matches!(cached_rate_for(&batch.cache, date), Ok(Some(_))) {
+            still_missing.push(date);
+        }
+    }
+    still_missing
+}
+
+/// How one leftover date resolved in the concurrent phase.
+enum MissingOutcome {
+    /// The shared snapshot already covered it (the range did the work).
+    Hit {
+        table: BTreeMap<String, f64>,
+        actual: NaiveDate,
+    },
+    /// A single fetch landed it (already stored through the locked path).
+    Fetched {
+        table: BTreeMap<String, f64>,
+        returned: NaiveDate,
+    },
+    /// Offline, past-deadline, or fetch-failed: nearest-earlier fallback.
+    Fallback {
+        table: BTreeMap<String, f64>,
+        actual: NaiveDate,
+    },
+    /// Nothing covers it: keys on this date are unavailable.
+    Failed,
+}
+
+/// Nearest-earlier fallback for one date against a shared snapshot, without
+/// any network access. Counts only, never dates.
+fn fallback_from(snap: &RateCache, date: NaiveDate) -> (NaiveDate, MissingOutcome) {
+    match nearest_earlier(snap, &format_date(date)) {
+        Ok(Some((actual, table))) => (date, MissingOutcome::Fallback { table, actual }),
+        _ => (date, MissingOutcome::Failed),
+    }
+}
+
+/// Resolve leftover dates concurrently, bounded to small chunks so a huge
+/// cold span cannot open hundreds of connections at once.
+///
+/// Each date resolves exactly as the sequential fallback would: snapshot
+/// recheck (the range may have covered it while queued), one exact single
+/// fetch stored through the locked path, else the shared snapshot's
+/// nearest-earlier fallback, else unavailable. Dates past the batch
+/// deadline skip the fetch and go straight to the fallback. A panicked or
+/// lost task degrades its date rather than dropping it silently.
+async fn fetch_missing_dates(
+    snap: std::sync::Arc<RateCache>,
+    dates: Vec<NaiveDate>,
+    deadline: std::time::Instant,
+    op: u64,
+) -> Vec<(NaiveDate, MissingOutcome)> {
+    const CHUNK: usize = 16;
+    let mut outcomes = Vec::with_capacity(dates.len());
+    for chunk in dates.chunks(CHUNK) {
+        if std::time::Instant::now() >= deadline {
+            for date in chunk {
+                outcomes.push(fallback_from(&snap, *date));
+            }
+            continue;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for date in chunk {
+            let snap = snap.clone();
+            let date = *date;
+            set.spawn(async move {
+                if let Ok(Some((table, actual))) = cached_rate_for(&snap, date) {
+                    return (date, MissingOutcome::Hit { table, actual });
+                }
+                if !is_offline()
+                    && std::time::Instant::now() < deadline
+                    && let Ok((returned, table)) = fetch_historical(date, op).await
+                {
+                    let today = Local::now().date_naive();
+                    let alias_for = should_alias_as(date, returned, today).then_some(date);
+                    match store_historical_rates(returned, &table, alias_for).await {
+                        Ok(()) => {
+                            return (date, MissingOutcome::Fetched { table, returned });
+                        }
+                        Err(_) => return (date, MissingOutcome::Failed),
+                    }
+                }
+                fallback_from(&snap, date)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(_) => {
+                    crate::diag::event(op, "fx", "concurrent fetch task lost, date degrades");
+                }
+            }
+        }
+    }
+    // Reconcile: any date without an outcome (a lost task above) degrades
+    // rather than vanishing from the batch.
+    let seen: std::collections::HashSet<NaiveDate> =
+        outcomes.iter().map(|(date, _)| *date).collect();
+    for date in dates {
+        if !seen.contains(&date) {
+            outcomes.push((date, MissingOutcome::Failed));
+        }
+    }
+    outcomes
+}
+
+/// Total network wait one lenient batch spends before resolving the rest
+/// from the cache alone.
+///
+/// A single Frankfurter request already gives up after [`REQUEST_TIMEOUT`],
+/// but a batch fires many of them serially: on a hanging route that is
+/// minutes of stall inside one API request, during which the UI shows its
+/// empty state. Past this budget no more network attempts start; every
+/// remaining key resolves from the snapshot (`nearest_earlier`) or lands in
+/// `unavailable_currencies`, exactly the degraded shape the lenient
+/// contract already returns. Warm-cache batches never touch the network,
+/// so they never notice the budget.
+const BATCH_NETWORK_BUDGET: Duration = Duration::from_secs(15);
+
+/// One lenient batch's in-memory view of the rate cache.
+///
+/// `rate_on` re-reads `currency.json` and re-parses the whole `fx_rates.json`
+/// per key, so a batch over thousands of keys pays thousands of full file
+/// reads. This snapshot loads once per batch instead; fetches that land
+/// mid-batch merge into it in memory, so later keys see them without
+/// re-reading the file. Writes still go through the existing locked
+/// load-modify-save path per fetched date, unchanged.
+struct SnapBatch {
+    cache: RateCache,
+    op: u64,
+    deadline: std::time::Instant,
+    /// Single-date fetches attempted (range fetches excluded).
+    single_fetches: u32,
+    /// Keys answered from `nearest_earlier` after an offline miss, a fetch
+    /// failure, or an exhausted budget.
+    stale_fallbacks: u32,
+    /// Whether the budget-exhausted line was already logged for this batch.
+    budget_logged: bool,
+}
+
+impl SnapBatch {
+    fn new(cache: RateCache, op: u64) -> Self {
+        Self {
+            cache,
+            op,
+            deadline: std::time::Instant::now() + BATCH_NETWORK_BUDGET,
+            single_fetches: 0,
+            stale_fallbacks: 0,
+            budget_logged: false,
+        }
+    }
+
+    /// Resolve one `(date, currency)` key into the reference currency,
+    /// mirroring [`rate_on`]'s outcome key by key while reading the files
+    /// only through this batch's snapshot.
+    ///
+    /// `Err(())` means "this key is unavailable", for every cause: the
+    /// caller reports the currency and keeps the rest of the batch, exactly
+    /// as the per-key loop it replaces does.
+    async fn resolve(
+        &mut self,
+        date: NaiveDate,
+        currency: &str,
+        reference_currency: &str,
+    ) -> std::result::Result<ResolvedRate, ()> {
+        let currency = currency.trim().to_uppercase();
+        let reference_currency = reference_currency.trim().to_uppercase();
+        if currency == reference_currency {
+            return Ok(ResolvedRate {
+                rate: 1.0,
+                rate_date: None,
+            });
+        }
+        let date_str = format_date(date);
+        // Snapshot hit: use it, exactly as `resolve_eur_rates_on` does. A
+        // day table that lacks the currency still ends here as unavailable;
+        // no network attempt follows, matching `rate_on`.
+        match cached_rate_for(&self.cache, date) {
+            Ok(Some((table, actual))) => {
+                return cross_to_reference(&table, &currency, &reference_currency, actual)
+                    .ok_or(());
+            }
+            Ok(None) => {}
+            Err(_) => return Err(()),
+        }
+        // Miss. Offline, past-deadline, and fetch-failed keys all share the
+        // nearest-earlier fallback below.
+        if !is_offline() && std::time::Instant::now() < self.deadline {
+            self.single_fetches += 1;
+            if let Ok((returned, table)) = fetch_historical(date, self.op).await {
+                let today = Local::now().date_naive();
+                let alias_for = should_alias_as(date, returned, today).then_some(date);
+                // Same locked load-modify-save as `store_historical_rates`,
+                // then mirror it into this batch's snapshot so later keys
+                // see the fetch without re-reading the file. A failed
+                // store degrades the key rather than the batch, matching
+                // the per-key path where the store error propagates as
+                // that key's own failure.
+                match store_historical_rates(returned, &table, alias_for).await {
+                    Ok(()) => {
+                        let returned_str = format_date(returned);
+                        self.cache.rates.insert(returned_str.clone(), table.clone());
+                        if let Some(requested) = alias_for {
+                            self.cache
+                                .aliases
+                                .insert(format_date(requested), returned_str);
+                        }
+                        return cross_to_reference(
+                            &table,
+                            &currency,
+                            &reference_currency,
+                            returned,
+                        )
+                        .ok_or(());
+                    }
+                    Err(_) => return Err(()),
+                }
+            }
+        } else if !is_offline() && !self.budget_logged {
+            self.budget_logged = true;
+            crate::diag::event(
+                self.op,
+                "fx",
+                format!(
+                    "network budget exhausted after {} single fetches, remaining keys resolve from cache",
+                    self.single_fetches
+                ),
+            );
+        }
+        self.stale_fallbacks += 1;
+        match nearest_earlier(&self.cache, &date_str) {
+            Ok(Some((found_date, table))) => {
+                cross_to_reference(&table, &currency, &reference_currency, found_date).ok_or(())
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+/// Convert one EUR-based day table into a [`ResolvedRate`] from `currency`
+/// to the reference currency, or `None` when the table names neither.
+fn cross_to_reference(
+    table: &BTreeMap<String, f64>,
+    currency: &str,
+    reference_currency: &str,
+    actual_date: NaiveDate,
+) -> Option<ResolvedRate> {
+    let rate = cross_rate(currency, reference_currency, table).ok()?;
+    Some(ResolvedRate {
+        rate,
+        rate_date: Some(actual_date),
+    })
 }
 
 /// Resolve every `(date, currency)` key in `keys` into the reference
@@ -785,32 +1588,176 @@ pub async fn monthly_rates_lenient(
 pub async fn rates_for_keys_lenient(
     keys: &[(NaiveDate, String)],
 ) -> Result<(HashMap<(NaiveDate, String), ResolvedRate>, Vec<String>)> {
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
     let reference_currency = config::get_currency_settings()?
         .reference_currency
         .trim()
         .to_uppercase();
 
+    crate::diag::event(
+        op,
+        "fx",
+        format!(
+            "rates_for_keys start ref={reference_currency} keys={}",
+            keys.len()
+        ),
+    );
+
+    // Load the cache once for the whole batch instead of once per key.
+    // An unreadable cache fails every key lookup, exactly as the per-key
+    // path does: every non-reference currency is reported once, and nothing
+    // resolves.
+    let mut batch = match load_cache() {
+        Ok(cache) => SnapBatch::new(cache, op),
+        Err(_) => {
+            let mut unavailable: Vec<String> = keys
+                .iter()
+                .map(|(_, currency)| currency.trim().to_uppercase())
+                .filter(|currency| *currency != reference_currency)
+                .collect();
+            unavailable.sort();
+            unavailable.dedup();
+            crate::diag::event(
+                op,
+                "fx",
+                format!(
+                    "rates_for_keys done in {}ms resolved=0 unavailable={} [{}]",
+                    start.elapsed().as_millis(),
+                    unavailable.len(),
+                    unavailable.join(",")
+                ),
+            );
+            return Ok((HashMap::new(), unavailable));
+        }
+    };
+
+    // Pre-warm the batch snapshot with one range fetch for the whole date
+    // span, so a cold cache does not cost one HTTPS request per distinct
+    // expense date below. Returns the dates still missing afterwards;
+    // failures return them all, leaving the fallback owning them exactly
+    // as the per-key loop it replaces does.
+    let mut key_dates: Vec<NaiveDate> = keys
+        .iter()
+        .filter(|(_, currency)| currency.trim().to_uppercase() != reference_currency)
+        .map(|(date, _)| *date)
+        .collect();
+    key_dates.sort();
+    key_dates.dedup();
+    // Era counts: key dates older than any cached history can never resolve
+    // (no published table predates them), and exact-epoch hits flag rows
+    // whose date was never real. Counts only, never dates.
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch exists");
+    let earliest_cached = batch
+        .cache
+        .rates
+        .keys()
+        .next()
+        .and_then(|s| parse_date(s).ok());
+    let predate_history = earliest_cached
+        .map(|earliest| key_dates.iter().filter(|d| **d < earliest).count())
+        .unwrap_or(0);
+    let epoch_hits = key_dates.iter().filter(|d| **d == epoch).count();
+    crate::diag::event(
+        op,
+        "fx",
+        format!("key eras: predate_history={predate_history} epoch_hits={epoch_hits}"),
+    );
+    ensure_range_cached(&mut batch, &key_dates).await;
+
     let mut rates = HashMap::with_capacity(keys.len());
     let mut unavailable_currencies: Vec<String> = Vec::new();
+    let mut report_unavailable = |currency: String| {
+        if !unavailable_currencies.contains(&currency) {
+            unavailable_currencies.push(currency);
+        }
+    };
 
+    // Phase A: snapshot hits, including everything the range just merged.
+    // Misses group by date for the concurrent phase below.
+    let mut by_date: std::collections::HashMap<NaiveDate, Vec<String>> =
+        std::collections::HashMap::new();
     for (date, currency) in keys {
         let currency = currency.trim().to_uppercase();
         if currency == reference_currency {
             continue;
         }
-        match rate_on(*date, &currency).await {
-            Ok(resolved) => {
-                rates.insert((*date, currency), resolved);
+        match cached_rate_for(&batch.cache, *date) {
+            Ok(Some((table, actual))) => {
+                match cross_to_reference(&table, &currency, &reference_currency, actual) {
+                    Some(resolved) => {
+                        rates.insert((*date, currency), resolved);
+                    }
+                    None => report_unavailable(currency),
+                }
             }
-            Err(_) => {
-                if !unavailable_currencies.contains(&currency) {
-                    unavailable_currencies.push(currency);
+            Ok(None) => {
+                by_date.entry(*date).or_default().push(currency);
+            }
+            Err(_) => report_unavailable(currency),
+        }
+    }
+
+    // Phase C: leftover dates concurrently, bounded and deadline-checked.
+    // A day table missing the currency still ends as unavailable with no
+    // further network attempt, matching `rate_on`.
+    let mut concurrent_fetches = 0u32;
+    if !by_date.is_empty() {
+        let mut dates: Vec<NaiveDate> = by_date.keys().copied().collect();
+        dates.sort();
+        let snap = std::sync::Arc::new(batch.cache.clone());
+        for (date, outcome) in fetch_missing_dates(snap, dates, batch.deadline, op).await {
+            let Some(currencies) = by_date.remove(&date) else {
+                continue;
+            };
+            let is_fetched = matches!(outcome, MissingOutcome::Fetched { .. });
+            let resolved_table = match outcome {
+                MissingOutcome::Hit { table, actual }
+                | MissingOutcome::Fetched {
+                    table,
+                    returned: actual,
+                }
+                | MissingOutcome::Fallback { table, actual } => {
+                    if is_fetched {
+                        concurrent_fetches += 1;
+                    }
+                    Some((table, actual))
+                }
+                MissingOutcome::Failed => None,
+            };
+            match resolved_table {
+                Some((table, actual)) => {
+                    for currency in currencies {
+                        match cross_to_reference(&table, &currency, &reference_currency, actual) {
+                            Some(resolved) => {
+                                rates.insert((date, currency), resolved);
+                            }
+                            None => report_unavailable(currency),
+                        }
+                    }
+                }
+                None => {
+                    for currency in currencies {
+                        report_unavailable(currency);
+                    }
                 }
             }
         }
     }
 
     unavailable_currencies.sort();
+    crate::diag::event(
+        op,
+        "fx",
+        format!(
+            "rates_for_keys done in {}ms resolved={} unavailable={} [{}] concurrent={}",
+            start.elapsed().as_millis(),
+            rates.len(),
+            unavailable_currencies.len(),
+            unavailable_currencies.join(","),
+            concurrent_fetches
+        ),
+    );
     Ok((rates, unavailable_currencies))
 }
 
@@ -1165,6 +2112,392 @@ mod tests {
         assert_eq!(rates.rate(1, "EUR").unwrap(), 1.0);
     }
 
+    // ======================================================================
+    // `year_rate_dates`: the prewarm list the lenient net-worth path shares
+    // with `monthly_rates_core`
+    // ======================================================================
+
+    /// A fully completed past year resolves one frozen rate per month: twelve
+    /// month-end dates, and no previous-month-end for a current period that
+    /// does not exist.
+    #[test]
+    fn year_rate_dates_fully_completed_past_year_returns_twelve_month_ends() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let dates = year_rate_dates(today, 2024, config::CurrentMonthRateMode::PreviousMonthEnd)
+            .expect("a past year always resolves");
+
+        assert_eq!(dates.completed.len(), 12);
+        assert_eq!(
+            dates.completed[0],
+            (1, NaiveDate::from_ymd_opt(2024, 1, 31).unwrap())
+        );
+        assert_eq!(
+            dates.completed[11],
+            (12, NaiveDate::from_ymd_opt(2024, 12, 31).unwrap())
+        );
+        assert_eq!(dates.previous_month_end, None);
+        assert_eq!(dates.prewarm_dates().len(), 12);
+    }
+
+    /// The year holding `today` excludes the in-progress month and every
+    /// later month, and backs them with the previous month-end instead. That
+    /// date can coincide with a completed month of the same year (August
+    /// here), so the prewarm list deduplicates it.
+    #[test]
+    fn year_rate_dates_current_year_excludes_in_progress_month_and_adds_previous_month_end() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let dates = year_rate_dates(today, 2026, config::CurrentMonthRateMode::PreviousMonthEnd)
+            .expect("the current year always resolves");
+
+        assert_eq!(dates.completed.len(), 8);
+        assert_eq!(
+            dates.completed[7],
+            (8, NaiveDate::from_ymd_opt(2026, 8, 31).unwrap())
+        );
+        assert_eq!(
+            dates.previous_month_end,
+            Some(NaiveDate::from_ymd_opt(2026, 8, 31).unwrap())
+        );
+        let prewarm = dates.prewarm_dates();
+        assert_eq!(prewarm.len(), 8);
+        // The in-progress month's own last day is never a prewarm date.
+        assert!(!prewarm.contains(&NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()));
+    }
+
+    /// Under `Live` the in-progress month and every later month resolve
+    /// through the network-first live lookup, so none of their dates may
+    /// enter the prewarm list: only completed months appear.
+    #[test]
+    fn year_rate_dates_live_mode_never_includes_a_current_period_date() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let dates = year_rate_dates(today, 2026, config::CurrentMonthRateMode::Live)
+            .expect("the current year always resolves");
+
+        assert_eq!(dates.completed.len(), 8);
+        assert_eq!(dates.previous_month_end, None);
+        let prewarm = dates.prewarm_dates();
+        assert_eq!(prewarm.len(), 8);
+        assert!(!prewarm.contains(&NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()));
+        assert!(!prewarm.contains(&NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()));
+    }
+
+    /// A future year has no completed month; under `PreviousMonthEnd` its
+    /// whole series tracks the previous month-end alone.
+    #[test]
+    fn year_rate_dates_future_year_holds_only_the_previous_month_end() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let dates = year_rate_dates(today, 2027, config::CurrentMonthRateMode::PreviousMonthEnd)
+            .expect("a future year always resolves");
+
+        assert!(dates.completed.is_empty());
+        assert_eq!(
+            dates.previous_month_end,
+            Some(NaiveDate::from_ymd_opt(2026, 8, 31).unwrap())
+        );
+        assert_eq!(
+            dates.prewarm_dates(),
+            vec![NaiveDate::from_ymd_opt(2026, 8, 31).unwrap()]
+        );
+    }
+
+    /// In January the previous month-end reaches back into December of the
+    /// prior year, while January itself is not a completed month.
+    #[test]
+    fn year_rate_dates_january_previous_month_end_reaches_back_a_year() {
+        let today = NaiveDate::from_ymd_opt(2027, 1, 10).unwrap();
+        let dates = year_rate_dates(today, 2027, config::CurrentMonthRateMode::PreviousMonthEnd)
+            .expect("January always resolves");
+
+        assert!(dates.completed.is_empty());
+        assert_eq!(
+            dates.previous_month_end,
+            Some(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap())
+        );
+    }
+
+    /// Several currencies for one year must resolve from a seeded cache with
+    /// no live network, with the exact month-end table and the
+    /// nearest-earlier fallback agreeing: January reads its own table, June
+    /// falls back to it. Same shape as Track A's
+    /// `category_totals_convert_eur_rows_for_non_eur_reference`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_lenient_resolves_several_currencies_from_a_seeded_cache() {
+        let _temp = with_temp_env_offline();
+        // Year 2000 keeps every month on the completed-month path regardless
+        // of today's real date. Cached EUR-based: 1 EUR = 1.20 USD and
+        // 1 EUR = 0.60 GBP, so into the USD reference EUR converts at 1.20
+        // and GBP at 1.20 / 0.60 = 2.0.
+        seed_cache(&[("2000-01-31", &[("USD", 1.20), ("GBP", 0.60)])]);
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "USD".to_string(),
+            current_month_rate_mode: config::CurrentMonthRateMode::PreviousMonthEnd,
+        })
+        .expect("switch reference currency to USD");
+
+        let (rates, unavailable) =
+            monthly_rates_lenient(2000, &["EUR".to_string(), "GBP".to_string()])
+                .await
+                .expect("seeded currencies resolve without the network");
+
+        assert!(unavailable.is_empty());
+        assert_eq!(rates.rate(1, "EUR").unwrap(), 1.20);
+        assert_eq!(rates.rate(6, "EUR").unwrap(), 1.20);
+        assert_eq!(rates.rate(1, "GBP").unwrap(), 2.0);
+        assert_eq!(rates.rate(12, "GBP").unwrap(), 2.0);
+    }
+
+    // ======================================================================
+    // `SnapBatch`: one snapshot per batch, one range fetch, bounded network
+    // ======================================================================
+
+    /// The batch resolver agrees with `rate_on` key by key from the same
+    /// seeded cache: an exact hit, a weekend falling back to Friday, a date
+    /// with nothing cached (unavailable), and a day table missing the
+    /// currency (unavailable without a network attempt).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snap_batch_resolve_matches_rate_on_from_a_seeded_cache() {
+        let _temp = with_temp_env_offline();
+        // Friday close only; reference is the default EUR.
+        seed_cache(&[("2026-09-04", &[("USD", 1.1622)])]);
+        let cache = load_cache().expect("seeded cache loads");
+        let mut batch = SnapBatch::new(cache, 0);
+
+        let friday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
+        let far = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+
+        // Exact hit agrees with `rate_on`, including the published date.
+        let resolved = batch
+            .resolve(friday, "USD", "EUR")
+            .await
+            .expect("exact hit resolves");
+        let direct = rate_on(friday, "USD").await.expect("rate_on resolves");
+        assert_eq!(resolved.rate, direct.rate);
+        assert_eq!(resolved.rate_date, direct.rate_date);
+
+        // Weekend falls back to Friday through the snapshot.
+        let resolved = batch
+            .resolve(sunday, "USD", "EUR")
+            .await
+            .expect("weekend falls back");
+        assert_eq!(resolved.rate, 1.0 / 1.1622);
+        assert_eq!(
+            resolved.rate_date,
+            Some(NaiveDate::from_ymd_opt(2026, 9, 4).unwrap())
+        );
+
+        // Nothing cached on or before the date: unavailable, no network
+        // offline.
+        assert!(batch.resolve(far, "USD", "EUR").await.is_err());
+
+        // The day is cached but names no GBP rate: unavailable, exactly as
+        // `rate_on`, which also does not chase the network for a currency
+        // missing from a cached day.
+        assert!(batch.resolve(friday, "GBP", "EUR").await.is_err());
+        assert!(rate_on(friday, "GBP").await.is_err());
+
+        // Reference currency is the identity without any lookup.
+        let identity = batch
+            .resolve(far, "EUR", "EUR")
+            .await
+            .expect("reference never fails");
+        assert_eq!(identity.rate, 1.0);
+        assert_eq!(identity.rate_date, None);
+    }
+
+    /// A batch whose network budget is already spent attempts no request:
+    /// with an empty cache the miss degrades straight to unavailable and
+    /// the fetch counter stays at zero. Proves the bound without depending
+    /// on live network timing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snap_batch_zero_budget_attempts_no_network() {
+        let _temp = with_temp_env_offline();
+        let saved = std::env::var_os("FINGUARD_FX_OFFLINE");
+        unsafe {
+            std::env::remove_var("FINGUARD_FX_OFFLINE");
+        }
+        // No cache file exists at all: any network attempt would be the only
+        // way to resolve.
+        let mut batch = SnapBatch::new(load_cache().expect("empty cache loads"), 0);
+        batch.deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        let outcome = batch
+            .resolve(NaiveDate::from_ymd_opt(2026, 9, 4).unwrap(), "USD", "EUR")
+            .await;
+        let fetches = batch.single_fetches;
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("FINGUARD_FX_OFFLINE", value);
+            }
+        }
+        assert!(outcome.is_err());
+        assert_eq!(fetches, 0);
+    }
+
+    /// An unreadable cache file degrades the whole batch, exactly as the
+    /// per-key path does when every lookup fails to load it: nothing
+    /// resolves and every non-reference currency is reported once, sorted.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rates_for_keys_lenient_unreadable_cache_reports_everything_unavailable() {
+        let _temp = with_temp_env_offline();
+        std::fs::write(
+            paths::get_fx_rates_path().expect("cache path"),
+            "not json at all",
+        )
+        .expect("corrupt the cache");
+
+        let friday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let (rates, unavailable) = rates_for_keys_lenient(&[
+            (friday, "USD".to_string()),
+            (friday, "EUR".to_string()),
+            (friday, "GBP".to_string()),
+        ])
+        .await
+        .expect("an unreadable cache still degrades");
+
+        assert!(rates.is_empty());
+        assert_eq!(unavailable, vec!["GBP".to_string(), "USD".to_string()]);
+    }
+
+    /// Several dates sharing one cached Friday all resolve through the
+    /// batch fallback and agree on the published date, with no network
+    /// offline.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rates_for_keys_lenient_falls_back_to_the_cached_friday_for_a_weekend() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-04", &[("USD", 1.1622)])]);
+
+        let keys = ["2026-09-04", "2026-09-05", "2026-09-06", "2026-09-07"]
+            .iter()
+            .map(|s| {
+                (
+                    NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap(),
+                    "USD".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (rates, unavailable) = rates_for_keys_lenient(&keys)
+            .await
+            .expect("weekend keys resolve from the cache");
+
+        assert!(unavailable.is_empty());
+        assert_eq!(rates.len(), 4);
+        for (_, resolved) in &rates {
+            assert_eq!(resolved.rate, 1.0 / 1.1622);
+            assert_eq!(
+                resolved.rate_date,
+                Some(NaiveDate::from_ymd_opt(2026, 9, 4).unwrap())
+            );
+        }
+    }
+
+    // ======================================================================
+    // `clamp_range_min` and the concurrent leftover phase
+    // ======================================================================
+
+    /// The clamp keeps the range minimum when the cache is empty or holds
+    /// nothing newer, and lifts it to the earliest cached day otherwise, so
+    /// a range never re-downloads span already on disk. Pure dates in,
+    /// pure date out.
+    #[test]
+    fn clamp_range_min_lifts_to_the_earliest_cached_day() {
+        let cache = RateCache {
+            base: "EUR".to_string(),
+            rates: BTreeMap::from([
+                ("2020-01-31".to_string(), BTreeMap::new()),
+                ("2026-09-04".to_string(), BTreeMap::new()),
+            ]),
+            ..Default::default()
+        };
+        let ancient = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let recent = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
+
+        assert_eq!(
+            clamp_range_min(ancient, &cache),
+            NaiveDate::from_ymd_opt(2020, 1, 31).unwrap()
+        );
+        // Already at or past the cached history: unchanged.
+        assert_eq!(clamp_range_min(recent, &cache), recent);
+
+        // Empty cache: nothing to clamp to.
+        assert_eq!(clamp_range_min(ancient, &RateCache::default()), ancient);
+    }
+
+    /// Several dates through the concurrent phase: an exact hit, a weekend
+    /// falling back, a date with nothing on or before it (unavailable), and
+    /// a cached day missing the currency (unavailable without any network).
+    /// Offline, so every outcome comes from the snapshot alone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rates_for_keys_lenient_resolves_mixed_dates_through_one_batch() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-04", &[("USD", 1.1622)])]);
+
+        let friday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
+        let ancient = NaiveDate::from_ymd_opt(2000, 1, 5).unwrap();
+        let (rates, unavailable) = rates_for_keys_lenient(&[
+            (friday, "USD".to_string()),
+            (sunday, "USD".to_string()),
+            (ancient, "USD".to_string()),
+            (friday, "GBP".to_string()),
+        ])
+        .await
+        .expect("mixed batch degrades per key");
+
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[&(friday, "USD".to_string())].rate, 1.0 / 1.1622);
+        assert_eq!(rates[&(sunday, "USD".to_string())].rate, 1.0 / 1.1622);
+        assert_eq!(unavailable, vec!["GBP".to_string(), "USD".to_string()]);
+    }
+
+    /// Under `Live` the lenient path resolves completed months from their
+    /// month-ends and the current month onward from the newest cached table
+    /// (the offline live fallback), with nothing unavailable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monthly_rates_lenient_live_mode_uses_live_rate_for_current_months() {
+        let _temp = with_temp_env_offline();
+        let today = Local::now().date_naive();
+        let year = today.year();
+        let current_month = today.month();
+        // Every month-end at 1.00, December at 1.50, so the newest cached
+        // table (December 31st) is distinguishable from every month-end rate.
+        let mut owned: Vec<(String, Vec<(&str, f64)>)> = Vec::new();
+        for month in 1..=12u32 {
+            let last = last_day_of_month(year, month).expect("valid month");
+            let rate = if month == 12 { 1.50 } else { 1.00 };
+            owned.push((format_date(last), vec![("USD", rate)]));
+        }
+        let refs: Vec<(&str, &[(&str, f64)])> = owned
+            .iter()
+            .map(|(date, pairs)| (date.as_str(), pairs.as_slice()))
+            .collect();
+        seed_cache(&refs);
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "EUR".to_string(),
+            current_month_rate_mode: config::CurrentMonthRateMode::Live,
+        })
+        .expect("save live mode");
+
+        let (rates, unavailable) = monthly_rates_lenient(year, &["USD".to_string()])
+            .await
+            .expect("live lenient resolves from the cache");
+
+        assert!(unavailable.is_empty());
+        // The current month onward tracks the newest cached table.
+        assert_eq!(rates.rate(current_month, "USD").unwrap(), 1.0 / 1.50);
+        // Completed months keep their own frozen month-end rates.
+        if current_month > 1 {
+            assert_eq!(rates.rate(1, "USD").unwrap(), 1.0 / 1.00);
+        }
+    }
+
     /// A resolvable key and an unresolvable one in the same batch must not
     /// affect each other: the resolvable one lands in the map, and only the
     /// unresolvable one is reported and left out.
@@ -1230,6 +2563,182 @@ mod tests {
 
         assert!(unavailable.is_empty());
         assert!(rates.is_empty());
+    }
+
+    // ======================================================================
+    // Range pre-warm: one `{min}..{max}` fetch instead of one request per date
+    // ======================================================================
+
+    /// A real Frankfurter range body carries one table per published day and
+    /// no entry for weekends: 2026-08-01/02 (weekend) are absent while the
+    /// surrounding working days are present.
+    const SAMPLE_RANGE_BODY: &str = r#"{
+        "amount": 1.0,
+        "base": "EUR",
+        "start_date": "2026-07-31",
+        "end_date": "2026-08-05",
+        "rates": {
+            "2026-07-31": {"USD": 1.1485, "GBP": 0.85573},
+            "2026-08-03": {"USD": 1.1535, "GBP": 0.85633},
+            "2026-08-04": {"USD": 1.1515, "GBP": 0.85639},
+            "2026-08-05": {"USD": 1.1554, "GBP": 0.8572}
+        }
+    }"#;
+
+    /// A range body whose span starts at the earliest unresolved key date, as
+    /// a real `{min}..{max}` fetch does: published tables for Monday
+    /// 2026-08-03 through Friday 2026-08-07, with the weekend Saturday
+    /// 2026-08-08 absent.
+    const SAMPLE_RANGE_BODY_IN_KEY_SPAN: &str = r#"{
+        "amount": 1.0,
+        "base": "EUR",
+        "start_date": "2026-08-03",
+        "end_date": "2026-08-08",
+        "rates": {
+            "2026-08-03": {"USD": 1.1535, "GBP": 0.85633},
+            "2026-08-04": {"USD": 1.1515, "GBP": 0.85639},
+            "2026-08-05": {"USD": 1.1554, "GBP": 0.8572},
+            "2026-08-06": {"USD": 1.1525, "GBP": 0.8568},
+            "2026-08-07": {"USD": 1.1562, "GBP": 0.8576}
+        }
+    }"#;
+
+    #[test]
+    fn parse_range_response_parses_one_table_per_published_day() {
+        let days = parse_range_response(SAMPLE_RANGE_BODY).expect("valid range body");
+
+        assert_eq!(days.len(), 4);
+        assert_eq!(
+            days[&NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()]["USD"],
+            1.1515
+        );
+        assert_eq!(
+            days[&NaiveDate::from_ymd_opt(2026, 7, 31).unwrap()]["GBP"],
+            0.85573
+        );
+        // The weekend inside the span has no entry of its own.
+        assert!(!days.contains_key(&NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()));
+        assert!(!days.contains_key(&NaiveDate::from_ymd_opt(2026, 8, 2).unwrap()));
+    }
+
+    #[test]
+    fn parse_range_response_rejects_a_body_that_is_not_a_range_table() {
+        // A single-date body has `rates` as one flat table, not per-day
+        // tables, so it must fail rather than parse into nonsense.
+        let single = r#"{"amount": 1.0, "base": "EUR", "date": "2026-08-04",
+            "rates": {"USD": 1.1515}}"#;
+        assert!(parse_range_response(single).is_err());
+        assert!(parse_range_response("not json at all").is_err());
+    }
+
+    /// Merging fetched days stores every day and aliases an old-enough
+    /// weekend key date to its nearest earlier published day, while leaving
+    /// exact-hit key dates without an alias. The weekend is not the earliest
+    /// key, so its substitution lies inside the fetched span, matching a real
+    /// `{min}..{max}` fetch.
+    #[test]
+    fn merge_range_into_cache_aliases_an_old_weekend_key_date() {
+        let mut cache = RateCache::default();
+        let days = parse_range_response(SAMPLE_RANGE_BODY_IN_KEY_SPAN).expect("valid range body");
+        // 2026-08-08 is a Saturday with no published table; 2026-09-10 is
+        // over a month later, so the substitution is old enough to freeze.
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let min = NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        let keys = [
+            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 5).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 8).unwrap(),
+        ];
+
+        merge_range_into_cache(&mut cache, &days, &keys, min, today);
+
+        assert_eq!(cache.rates.len(), 5);
+        assert_eq!(
+            cache.aliases.get("2026-08-08"),
+            Some(&"2026-08-07".to_string())
+        );
+        // Exact hits need no alias.
+        assert!(!cache.aliases.contains_key("2026-08-03"));
+        assert!(!cache.aliases.contains_key("2026-08-05"));
+    }
+
+    /// A key date whose nearest earlier cached day predates the fetched range
+    /// must not be aliased to it: the range proves nothing before `min`, so
+    /// that cached day may simply be stale. The key stays unresolved for the
+    /// per-key fallback, while a day the fetch published stays a real cached
+    /// day rather than an alias.
+    #[test]
+    fn merge_range_into_cache_does_not_alias_a_key_date_to_a_pre_min_target() {
+        let mut cache = RateCache {
+            base: "EUR".to_string(),
+            rates: BTreeMap::from([(
+                "2026-06-30".to_string(),
+                BTreeMap::from([("USD".to_string(), 1.14)]),
+            )]),
+            ..Default::default()
+        };
+        let days = BTreeMap::from([(
+            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
+            BTreeMap::from([("USD".to_string(), 1.1535)]),
+        )]);
+        // 2026-08-01 is a Saturday; 2026-09-10 is over a month later, so an
+        // alias would be trusted were its target inside the fetched span.
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let min = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let keys = [
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
+        ];
+
+        merge_range_into_cache(&mut cache, &days, &keys, min, today);
+
+        // The only earlier cached day, 2026-06-30, is before `min`, so nothing
+        // may be frozen; the per-key fallback owns these keys.
+        assert!(cache.aliases.is_empty());
+        assert!(!cache.aliases.contains_key("2026-08-01"));
+        assert!(!cache.aliases.contains_key("2026-08-02"));
+        // The fetched Monday stays a real cached day, not an alias.
+        assert!(cache.rates.contains_key("2026-08-03"));
+        assert!(!cache.aliases.contains_key("2026-08-03"));
+    }
+
+    /// A weekend key date inside the alias trust window still gets the fetched
+    /// days cached, but no alias is frozen for it. The earlier Friday key puts
+    /// the substitution inside the fetched span, so only the age window can be
+    /// what withholds the alias.
+    #[test]
+    fn merge_range_into_cache_leaves_a_recent_weekend_without_alias() {
+        let mut cache = RateCache::default();
+        let days = parse_range_response(SAMPLE_RANGE_BODY).expect("valid range body");
+        // Only four days after the Saturday: inside `ALIAS_MIN_AGE_DAYS`.
+        let today = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+        let min = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let keys = [
+            NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+        ];
+
+        merge_range_into_cache(&mut cache, &days, &keys, min, today);
+
+        assert_eq!(cache.rates.len(), 4);
+        assert!(cache.aliases.is_empty());
+    }
+
+    /// A key date older than every published day stays unresolved: there is
+    /// nothing earlier to alias it to, and the per-key fallback owns that
+    /// case.
+    #[test]
+    fn merge_range_into_cache_leaves_a_key_date_with_no_earlier_day_unaliased() {
+        let mut cache = RateCache::default();
+        let days = parse_range_response(SAMPLE_RANGE_BODY).expect("valid range body");
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let min = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let keys = [NaiveDate::from_ymd_opt(2026, 7, 30).unwrap()];
+
+        merge_range_into_cache(&mut cache, &days, &keys, min, today);
+
+        assert_eq!(cache.rates.len(), 4);
+        assert!(cache.aliases.is_empty());
     }
 
     #[test]

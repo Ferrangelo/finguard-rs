@@ -71,6 +71,7 @@ pub mod api;
 pub mod config;
 mod dbs_backup;
 pub mod df_operations;
+pub mod diag;
 pub mod error;
 pub mod expr;
 pub mod fx;

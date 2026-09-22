@@ -45,6 +45,28 @@ impl IntoResponse for AppError {
             Error::SyncLogLocked { .. } => StatusCode::SERVICE_UNAVAILABLE,
         };
 
+        // One line per failed request: status plus variant only, never the
+        // message (it can embed paths or values). Enough to spot a 500/503
+        // storm in the dev log while someone clicks through the app.
+        let variant = match &self.0 {
+            Error::InvalidArgument(_) => "InvalidArgument",
+            Error::NotFound(_) => "NotFound",
+            Error::AlreadyExists(_) => "AlreadyExists",
+            Error::Io(_) => "Io",
+            Error::Json(_) => "Json",
+            Error::Polars(_) => "Polars",
+            Error::NoHomeDir => "NoHomeDir",
+            Error::RowIdsMissing(_) => "RowIdsMissing",
+            Error::RowIdMigration { .. } => "RowIdMigration",
+            Error::SyncResetBackup { .. } => "SyncResetBackup",
+            Error::SyncProtocol(_) => "SyncProtocol",
+            Error::SyncRefused(_) => "SyncRefused",
+            Error::Network(_) => "Network",
+            Error::MergeRejected(_) => "MergeRejected",
+            Error::SyncLogLocked { .. } => "SyncLogLocked",
+        };
+        crate::diag::event(0, "app-error", format!("{status} {variant}"));
+
         let body = ErrorBody {
             error: self.0.to_string(),
         };

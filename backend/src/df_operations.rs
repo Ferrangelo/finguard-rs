@@ -385,13 +385,17 @@ pub(crate) fn str_col_to_vec(df: &DataFrame, name: &str) -> Result<Vec<String>> 
 }
 
 /// Read a `Date` column into an owned `Vec<NaiveDate>`.
-fn date_col_to_vec(df: &DataFrame, name: &str) -> Result<Vec<NaiveDate>> {
+/// Read a date column as calendar dates, preserving nulls.
+///
+/// Null stays null: a missing date is "no date", never 1970-01-01. Callers
+/// decide what a dateless row means; this layer must not invent a date.
+fn date_col_to_vec(df: &DataFrame, name: &str) -> Result<Vec<Option<NaiveDate>>> {
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     let days = df.column(name)?.cast(&DataType::Int32)?;
     Ok(days
         .i32()?
         .iter()
-        .map(|o| epoch + chrono::Duration::days(o.unwrap_or(0) as i64))
+        .map(|o| o.map(|days| epoch + chrono::Duration::days(days as i64)))
         .collect())
 }
 
@@ -1085,6 +1089,11 @@ pub struct ExpenseFact {
 
 /// Build [`ExpenseFact`]s from any dataframe carrying the detailed-expenses
 /// columns (shared by [`DetailedExpenses::expense_facts`]).
+///
+/// Rows with no date are skipped: a dateless row has no rate key and no
+/// display day, so it belongs to neither totals nor lists. This matches the
+/// Expenses list, which already skips rows whose day is missing, and keeps
+/// a dateless row from implicating its currency as unavailable.
 fn facts_from_df(df: &DataFrame) -> Result<Vec<ExpenseFact>> {
     let dates = date_col_to_vec(df, "expense_date")?;
     let currencies = str_col_to_vec(df, "currency")?;
@@ -1097,12 +1106,14 @@ fn facts_from_df(df: &DataFrame) -> Result<Vec<ExpenseFact>> {
     let primaries = str_col_to_vec(df, "primary_category")?;
     let secondaries = str_col_to_vec(df, "secondary_category")?;
     Ok((0..dates.len())
-        .map(|i| ExpenseFact {
-            expense_date: dates[i],
-            currency: currencies[i].clone(),
-            expense_amount: amounts[i],
-            primary_category: primaries[i].clone(),
-            secondary_category: secondaries[i].clone(),
+        .filter_map(|i| {
+            Some(ExpenseFact {
+                expense_date: dates[i]?,
+                currency: currencies[i].clone(),
+                expense_amount: amounts[i],
+                primary_category: primaries[i].clone(),
+                secondary_category: secondaries[i].clone(),
+            })
         })
         .collect())
 }
@@ -3764,6 +3775,52 @@ mod tests {
 
         let err = resolve_fact(&fact, "EUR", &std::collections::HashMap::new()).unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    /// A null date stays null through `date_col_to_vec`: it is "no date",
+    /// never 1970-01-01.
+    #[test]
+    fn date_col_to_vec_preserves_nulls_instead_of_inventing_epoch() {
+        let days = Series::new("expense_date".into(), &[Some(20700i32), None])
+            .cast(&DataType::Date)
+            .expect("i32 with null casts to Date");
+        let df = DataFrame::new(2, vec![days.into()]).expect("frame");
+
+        let dates = date_col_to_vec(&df, "expense_date").expect("read dates");
+
+        assert_eq!(dates.len(), 2);
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        assert_eq!(dates[0], Some(epoch + chrono::Duration::days(20700)));
+        assert_eq!(dates[1], None);
+    }
+
+    /// `facts_from_df` skips dateless rows: with no date a row has no rate
+    /// key and no display day, so it belongs to neither totals nor lists.
+    /// This matches the Expenses list, which already skips rows whose day
+    /// is missing, and keeps a dateless row from implicating its currency
+    /// as unavailable.
+    #[test]
+    fn facts_from_df_skips_rows_without_a_date() {
+        let df = DataFrame::new(
+            2,
+            vec![
+                Series::new("expense_date".into(), &[Some(20700i32), None])
+                    .cast(&DataType::Date)
+                    .expect("cast dates")
+                    .into(),
+                Series::new("currency".into(), &["EUR", "USD"]).into(),
+                Series::new("expense_amount".into(), &[10.0, 20.0]).into(),
+                Series::new("primary_category".into(), &["A", "B"]).into(),
+                Series::new("secondary_category".into(), &["a", "b"]).into(),
+            ],
+        )
+        .expect("frame");
+
+        let facts = facts_from_df(&df).expect("read facts");
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].currency, "EUR");
+        assert_eq!(facts[0].expense_amount, 10.0);
     }
 
     /// `distinct_rate_keys` must dedupe repeated `(date, currency)` pairs and

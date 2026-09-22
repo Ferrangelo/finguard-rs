@@ -1016,17 +1016,26 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   const [allocation, setAllocation] = useState<NetworthAllocation | null>(null);
   const [evolutionError, setEvolutionError] = useState<string | null>(null);
   const [allocationError, setAllocationError] = useState<string | null>(null);
+  // Distinct from `evolution` staying null: a pending request renders as
+  // "loading", so a slow currency switch never reads as "no data".
+  const [evolutionPending, setEvolutionPending] = useState(true);
 
   useEffect(() => {
     let active = true;
     setEvolution(null);
     setEvolutionError(null);
+    setEvolutionPending(true);
     api
       .ensureYear(year)
       .then(() => api.getNetworthEvolution(year))
-      .then((e) => active && setEvolution(e))
+      .then((e) => {
+        if (active) setEvolution(e);
+      })
       .catch((err) => {
         if (active) setEvolutionError(errorMessage(err, "Failed to load net worth evolution"));
+      })
+      .finally(() => {
+        if (active) setEvolutionPending(false);
       });
     return () => {
       active = false;
@@ -1380,7 +1389,7 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
       ) : evolution === null ? (
         <GlassCard title={`Net Worth · ${year}`}>
           <p className="px-3 py-8 text-center text-muted-foreground">
-            No net worth data for {year} yet.
+            {evolutionPending ? "Loading net worth…" : `No net worth data for ${year} yet.`}
           </p>
         </GlassCard>
       ) : ratesLoading ? (

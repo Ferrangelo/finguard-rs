@@ -594,8 +594,18 @@ async fn get_currency_settings_handler() -> Result<Json<CurrencySettingsJson>, A
 async fn update_currency_settings_handler(
     Json(payload): Json<CurrencySettingsJson>,
 ) -> Result<Json<CurrencySettingsJson>, AppError> {
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
     let previous = config::get_currency_settings().ok();
     let reference_currency = payload.reference_currency.trim().to_uppercase();
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "PUT /api/settings/currency req_ref={reference_currency} mode={:?}",
+            payload.current_month_rate_mode
+        ),
+    );
     if !SUPPORTED_REFERENCE_CURRENCIES.contains(&reference_currency.as_str()) {
         return Err(crate::Error::InvalidArgument(format!(
             "unsupported reference currency '{reference_currency}'; expected one of \
@@ -637,6 +647,19 @@ async fn update_currency_settings_handler(
             },
         );
     }
+    let prev_ref = previous
+        .as_ref()
+        .map(|p| p.reference_currency.clone())
+        .unwrap_or_else(|| "?".to_string());
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "PUT done prev_ref={prev_ref} new_ref={} in {}ms",
+            settings.reference_currency,
+            start.elapsed().as_millis()
+        ),
+    );
     Ok(Json(CurrencySettingsJson {
         reference_currency: settings.reference_currency,
         current_month_rate_mode: settings.current_month_rate_mode,
@@ -680,6 +703,19 @@ fn resolve_fact_lenient(
 async fn get_expenses_handler(
     Query(q): Query<GetExpensesQuery>,
 ) -> Result<Json<ExpenseListJson>, AppError> {
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/expenses year={} month={}",
+            q.year,
+            q.month
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "all".to_string())
+        ),
+    );
     // Each returned row's fixed fields, paired with the `ExpenseFact` needed
     // to resolve its reference-currency rate below. `fx_rate`/`rate_date`
     // are filled in once every row is collected, so distinct `(date,
@@ -748,6 +784,15 @@ async fn get_expenses_handler(
     let reference_currency = config::get_currency_settings()?.reference_currency;
     let facts: Vec<_> = rows.iter().map(|(_, fact)| fact.clone()).collect();
     let keys = crate::df_operations::distinct_rate_keys(&facts, &reference_currency);
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/expenses loaded rows={} rate_keys={} ref={reference_currency}",
+            rows.len(),
+            keys.len()
+        ),
+    );
     let (rates, unavailable_currencies) = fx::rates_for_keys_lenient(&keys).await?;
 
     let mut expenses = Vec::with_capacity(rows.len());
@@ -762,6 +807,17 @@ async fn get_expenses_handler(
         expenses.push(expense);
     }
 
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/expenses done in {}ms returned={} unavailable={} [{}]",
+            start.elapsed().as_millis(),
+            expenses.len(),
+            unavailable_currencies.len(),
+            unavailable_currencies.join(",")
+        ),
+    );
     Ok(Json(ExpenseListJson {
         expenses,
         unavailable_currencies,
@@ -1287,7 +1343,26 @@ async fn delete_category_handler(
 async fn get_category_totals_handler(
     Query(q): Query<KindQuery>,
 ) -> Result<Json<CategoryTotalsJson>, AppError> {
-    Ok(Json(category_totals_across_all_years(&q.kind).await?))
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
+    crate::diag::event(
+        op,
+        "api",
+        format!("GET /api/categories/totals kind={}", q.kind),
+    );
+    let totals = category_totals_across_all_years(&q.kind).await?;
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/categories/totals done in {}ms categories={} unavailable={} [{}]",
+            start.elapsed().as_millis(),
+            totals.totals.len(),
+            totals.unavailable_currencies.len(),
+            totals.unavailable_currencies.join(",")
+        ),
+    );
+    Ok(Json(totals))
 }
 
 /// `GET /api/cashflow/income`: return `q.year`'s manually entered income
@@ -1351,9 +1426,21 @@ async fn set_income_cell_handler(
 async fn get_monthly_spending_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<MonthlySpendingJson>, AppError> {
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
     let facts = crate::df_operations::expense_facts_for_year(q.year)?;
     let reference_currency = config::get_currency_settings()?.reference_currency;
     let keys = crate::df_operations::distinct_rate_keys(&facts, &reference_currency);
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/cashflow/spending year={} facts={} rate_keys={} ref={reference_currency}",
+            q.year,
+            facts.len(),
+            keys.len()
+        ),
+    );
     let (rates, unavailable_currencies) = fx::rates_for_keys_lenient(&keys).await?;
 
     let mut months = std::collections::HashMap::new();
@@ -1370,6 +1457,16 @@ async fn get_monthly_spending_handler(
         let m_map = months.entry(month).or_default();
         *m_map.entry(fact.primary_category.clone()).or_insert(0.0) += fact.expense_amount * rate;
     }
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/cashflow/spending done in {}ms unavailable={} [{}]",
+            start.elapsed().as_millis(),
+            unavailable_currencies.len(),
+            unavailable_currencies.join(",")
+        ),
+    );
     Ok(Json(MonthlySpendingJson {
         months,
         unavailable_currencies,
@@ -1879,9 +1976,27 @@ fn networth_currencies(year: i32) -> crate::Result<Vec<String>> {
 async fn get_networth_evolution_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<Option<NetworthEvolutionJson>>, AppError> {
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
+    crate::diag::event(
+        op,
+        "api",
+        format!("GET /api/networth/evolution year={}", q.year),
+    );
     let currencies = networth_currencies(q.year)?;
     let (rates, unavailable_currencies) = fx::monthly_rates_lenient(q.year, &currencies).await?;
     let evolution = plots::networth_evolution_line(q.year, &rates, &unavailable_currencies)?;
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/networth/evolution done in {}ms null={} unavailable={} [{}]",
+            start.elapsed().as_millis(),
+            evolution.is_none(),
+            unavailable_currencies.len(),
+            unavailable_currencies.join(",")
+        ),
+    );
     Ok(Json(evolution.map(|e| {
         NetworthEvolutionJson {
             months: e.months,
@@ -1912,9 +2027,30 @@ async fn get_networth_evolution_handler(
 async fn get_networth_allocation_handler(
     Query(q): Query<NetworthAllocationQuery>,
 ) -> Result<Json<Option<NetworthAllocationJson>>, AppError> {
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/networth/allocation year={} month={}",
+            q.year, q.month
+        ),
+    );
     let currencies = networth_currencies(q.year)?;
     let (rates, unavailable_currencies) = fx::monthly_rates_lenient(q.year, &currencies).await?;
     let pie = plots::networth_allocation_pie(q.year, q.month, &rates, &unavailable_currencies)?;
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/networth/allocation done in {}ms null={} unavailable={} [{}]",
+            start.elapsed().as_millis(),
+            pie.is_none(),
+            unavailable_currencies.len(),
+            unavailable_currencies.join(",")
+        ),
+    );
     Ok(Json(pie.map(|p| {
         NetworthAllocationJson {
             slices: p
@@ -1951,6 +2087,8 @@ async fn get_networth_allocation_handler(
 async fn get_monthly_fx_rates_handler(
     Query(q): Query<MonthlyFxRatesQuery>,
 ) -> Result<Json<MonthlyFxRatesJson>, AppError> {
+    let op = crate::diag::begin();
+    let start = std::time::Instant::now();
     let reference_currency = config::get_currency_settings()?.reference_currency;
 
     let mut currencies = networth_currencies(q.year)?;
@@ -1965,6 +2103,15 @@ async fn get_monthly_fx_rates_handler(
     currencies.sort();
     currencies.dedup();
 
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/fx/monthly-rates year={} currencies={} ref={reference_currency}",
+            q.year,
+            currencies.len()
+        ),
+    );
     let (rates, unavailable_currencies) = fx::monthly_rates_lenient(q.year, &currencies).await?;
 
     // `fx::monthly_rates_lenient` already resolved (or skipped) every
@@ -1988,6 +2135,16 @@ async fn get_monthly_fx_rates_handler(
         })
         .collect();
 
+    crate::diag::event(
+        op,
+        "api",
+        format!(
+            "GET /api/fx/monthly-rates done in {}ms unavailable={} [{}]",
+            start.elapsed().as_millis(),
+            unavailable_currencies.len(),
+            unavailable_currencies.join(",")
+        ),
+    );
     Ok(Json(MonthlyFxRatesJson {
         year: q.year,
         reference_currency,
@@ -3040,6 +3197,135 @@ mod tests {
         );
     }
 
+    /// EUR expenses must convert into a non-EUR reference currency from the
+    /// seeded cache alone: 100 EUR at EUR -> USD 1.20 totals 120 USD, and at
+    /// EUR -> GBP 0.85 totals 85 GBP. Nothing is unavailable.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn category_totals_convert_eur_rows_for_non_eur_reference() {
+        let _temp = with_temp_env_offline();
+        seed_fx_cache(&[("2026-09-04", &[("USD", 1.20), ("GBP", 0.85)])]);
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row(
+            "Groceries",
+            4,
+            100.0,
+            Some("Groceries"),
+            "EUR",
+            Some("OtherGroceries"),
+        )
+        .expect("add EUR row");
+
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "USD".to_string(),
+            current_month_rate_mode: Default::default(),
+        })
+        .expect("switch reference currency to USD");
+
+        let usd_totals = category_totals_across_all_years("primary")
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("USD totals succeed: {err}"));
+        assert!(usd_totals.unavailable_currencies.is_empty());
+        assert_eq!(usd_totals.totals.get("Groceries").copied(), Some(120.0));
+
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "GBP".to_string(),
+            current_month_rate_mode: Default::default(),
+        })
+        .expect("switch reference currency to GBP");
+
+        let gbp_totals = category_totals_across_all_years("primary")
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("GBP totals succeed: {err}"));
+        assert!(gbp_totals.unavailable_currencies.is_empty());
+        assert_eq!(gbp_totals.totals.get("Groceries").copied(), Some(85.0));
+    }
+
+    /// A non-EUR reference with an empty cache and no network must degrade,
+    /// not fail: every EUR row is left out, so totals stay empty and EUR is
+    /// reported once globally and under each affected category.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn category_totals_empty_cache_offline_reports_eur_unavailable_for_usd_reference() {
+        let _temp = with_temp_env_offline();
+        // No cache seeded at all.
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row("Rent", 4, 100.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add EUR row");
+        de.add_row(
+            "Groceries",
+            5,
+            50.0,
+            Some("Groceries"),
+            "EUR",
+            Some("OtherGroceries"),
+        )
+        .expect("add EUR row");
+
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "USD".to_string(),
+            current_month_rate_mode: Default::default(),
+        })
+        .expect("switch reference currency to USD");
+
+        let totals = category_totals_across_all_years("primary")
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("offline totals still succeed: {err}"));
+        assert!(totals.totals.is_empty());
+        assert_eq!(totals.unavailable_currencies, vec!["EUR".to_string()]);
+        assert_eq!(
+            totals.unavailable_currencies_by_category.get("Housing"),
+            Some(&vec!["EUR".to_string()])
+        );
+        assert_eq!(
+            totals.unavailable_currencies_by_category.get("Groceries"),
+            Some(&vec!["EUR".to_string()])
+        );
+    }
+
+    /// Of two expense currencies where only one resolves, the resolved one is
+    /// still summed and only the other is reported: a GBP row at EUR -> GBP
+    /// 0.70 totals 100 / 0.70 EUR while the USD row is left out as
+    /// unavailable.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn category_totals_partial_failure_sums_only_the_resolved_currency() {
+        let _temp = with_temp_env_offline();
+        seed_fx_cache(&[("2026-09-04", &[("GBP", 0.70)])]);
+
+        let mut de = DetailedExpenses::new(2026, 9).expect("load detailed expenses");
+        de.add_row(
+            "Tea",
+            4,
+            100.0,
+            Some("Groceries"),
+            "GBP",
+            Some("OtherGroceries"),
+        )
+        .expect("add GBP row");
+        de.add_row(
+            "Coffee",
+            4,
+            100.0,
+            Some("Groceries"),
+            "USD",
+            Some("OtherGroceries"),
+        )
+        .expect("add USD row");
+
+        let totals = category_totals_across_all_years("primary")
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("partial totals still succeed: {err}"));
+        assert_eq!(totals.unavailable_currencies, vec!["USD".to_string()]);
+        assert_eq!(
+            totals.unavailable_currencies_by_category.get("Groceries"),
+            Some(&vec!["USD".to_string()])
+        );
+        assert_eq!(totals.totals.get("Groceries").copied(), Some(100.0 / 0.70));
+    }
+
     /// `PUT /api/investments/:id` must update the stored currency when the
     /// payload includes one. `InvestmentHoldings` has no dedicated currency
     /// setter, so this exercises the same direct-patch path as
@@ -3645,6 +3931,157 @@ mod tests {
                 .expect("an unresolvable currency must not report as 'no data'");
         assert_eq!(allocation.unavailable_currencies, vec!["USD".to_string()]);
         assert!(allocation.slices.is_empty());
+    }
+
+    /// A non-EUR reference with a seeded cache converts every row through a
+    /// cross rate: `500` EUR invested at EUR -> USD `1.20` totals `600`, and
+    /// `500` GBP at EUR -> GBP `0.60` totals `500 * 1.20 / 0.60 = 1000`, for
+    /// `1600` invested, `3200` liquid, `-640` credits/debts, and a net worth
+    /// of `4160`. Nothing is unavailable, on either endpoint.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn networth_endpoints_convert_into_a_non_eur_reference_from_a_seeded_cache() {
+        let _temp = with_temp_env_offline();
+        let year = 2000;
+        seed_single_month_networth(year, "EUR", "Eur");
+        seed_single_month_networth(year, "GBP", "Gbp");
+        seed_fx_cache(&[("2000-01-31", &[("USD", 1.20), ("GBP", 0.60)])]);
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "USD".to_string(),
+            current_month_rate_mode: Default::default(),
+        })
+        .expect("switch reference currency to USD");
+
+        let evolution = get_networth_evolution_handler(Query(YearQuery { year }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("USD totals succeed: {err}"))
+            .0
+            .expect("non-zero net worth");
+        assert!(evolution.unavailable_currencies.is_empty());
+        let component = |name: &str| {
+            evolution
+                .components
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' component"))
+        };
+        assert_eq!(component("Stocks/ETF").values[0], 1600.0);
+        assert_eq!(component("Liquidity").values[0], 3200.0);
+        assert_eq!(component("Credits/Debts").values[0], -640.0);
+        assert_eq!(evolution.net_worth[0], 4160.0);
+
+        let allocation =
+            get_networth_allocation_handler(Query(NetworthAllocationQuery { year, month: 1 }))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("USD allocation succeeds: {err}"))
+                .0
+                .expect("non-empty allocation");
+        assert!(allocation.unavailable_currencies.is_empty());
+        let slice_value = |name: &str| {
+            allocation
+                .slices
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' slice"))
+                .value
+        };
+        assert_eq!(slice_value("Stocks/ETF"), 1600.0);
+        assert_eq!(slice_value("Liquidity"), 3200.0);
+        assert_eq!(slice_value("Debts"), 640.0);
+    }
+
+    /// A non-EUR reference with an empty cache and no network must degrade,
+    /// not fail: the EUR rows are left out, so evolution stays a non-`null`
+    /// body of zeros and allocation a non-`null` body with no slices, both
+    /// naming EUR as unavailable.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn networth_endpoints_empty_cache_offline_reports_eur_unavailable_for_usd_reference() {
+        let _temp = with_temp_env_offline();
+        let year = 2000;
+        seed_single_month_networth(year, "EUR", "");
+        // No cache seeded at all.
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "USD".to_string(),
+            current_month_rate_mode: Default::default(),
+        })
+        .expect("switch reference currency to USD");
+
+        let evolution = get_networth_evolution_handler(Query(YearQuery { year }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("offline totals still succeed: {err}"))
+            .0
+            .expect("an unresolvable currency must not report as 'no data'");
+        assert_eq!(evolution.unavailable_currencies, vec!["EUR".to_string()]);
+        assert_eq!(evolution.months.len(), 12);
+        assert!(evolution.components.iter().all(|c| c.values[0] == 0.0));
+        assert_eq!(evolution.net_worth[0], 0.0);
+
+        let allocation =
+            get_networth_allocation_handler(Query(NetworthAllocationQuery { year, month: 1 }))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("offline allocation still succeeds: {err}"))
+                .0
+                .expect("an unresolvable currency must not report as 'no data'");
+        assert_eq!(allocation.unavailable_currencies, vec!["EUR".to_string()]);
+        assert!(allocation.slices.is_empty());
+    }
+
+    /// Of two net-worth currencies where only one resolves, the resolved one
+    /// still contributes and only the other is reported: the EUR rows convert
+    /// at EUR -> USD `1.20` (`600` invested, `1200` liquid, `-240`
+    /// credits/debts, net worth `1560`) while every GBP row is left out as
+    /// unavailable.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn networth_endpoints_partial_failure_sums_only_the_resolved_currency() {
+        let _temp = with_temp_env_offline();
+        let year = 2000;
+        seed_single_month_networth(year, "EUR", "Eur");
+        seed_single_month_networth(year, "GBP", "Gbp");
+        seed_fx_cache(&[("2000-01-31", &[("USD", 1.20)])]);
+        config::set_currency_settings(&config::CurrencySettings {
+            reference_currency: "USD".to_string(),
+            current_month_rate_mode: Default::default(),
+        })
+        .expect("switch reference currency to USD");
+
+        let evolution = get_networth_evolution_handler(Query(YearQuery { year }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("partial totals still succeed: {err}"))
+            .0
+            .expect("the EUR rows still produce a non-zero net worth");
+        assert_eq!(evolution.unavailable_currencies, vec!["GBP".to_string()]);
+        let component = |name: &str| {
+            evolution
+                .components
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' component"))
+        };
+        assert_eq!(component("Stocks/ETF").values[0], 600.0);
+        assert_eq!(component("Liquidity").values[0], 1200.0);
+        assert_eq!(component("Credits/Debts").values[0], -240.0);
+        assert_eq!(evolution.net_worth[0], 1560.0);
+
+        let allocation =
+            get_networth_allocation_handler(Query(NetworthAllocationQuery { year, month: 1 }))
+                .await
+                .unwrap_or_else(|AppError(err)| panic!("partial allocation still succeeds: {err}"))
+                .0
+                .expect("non-empty allocation");
+        assert_eq!(allocation.unavailable_currencies, vec!["GBP".to_string()]);
+        let slice_value = |name: &str| {
+            allocation
+                .slices
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no '{name}' slice"))
+                .value
+        };
+        assert_eq!(slice_value("Stocks/ETF"), 600.0);
+        assert_eq!(slice_value("Liquidity"), 1200.0);
+        assert_eq!(slice_value("Debts"), 240.0);
     }
 
     fn expense_payload(id: &str, name: &str, day: u32, amount: f64) -> ExpenseJson {
