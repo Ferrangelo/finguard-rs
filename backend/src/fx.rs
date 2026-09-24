@@ -29,8 +29,9 @@
 //! disables every network call; resolvers then work purely from the cache.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, SystemTime};
 
 use chrono::{Datelike, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// against the publication schedule while still bounding how long a rate
 /// that changed can stay stale.
 const LATEST_STALENESS_THRESHOLD_SECS: i64 = 60 * 60;
+
+/// The first date Frankfurter's ECB reference series publishes a rate for.
+///
+/// An exact single-date fetch for a date before this returns 404, and a
+/// range fetch spanning back before it silently truncates its results to
+/// this date rather than erroring. A `NaiveDate` outside the range the
+/// backend's own dates can hold (for example a null or zero expense date
+/// read back as the Unix epoch day, 1970-01-01) is always before this
+/// constant, so every lookup for it would otherwise pay one failing
+/// round trip per call with no way to cache the failure.
+const FX_SERIES_START: NaiveDate = match NaiveDate::from_ymd_opt(1999, 1, 4) {
+    Some(date) => date,
+    None => unreachable!(),
+};
 
 /// The shared client for every Frankfurter request, built once and reused so
 /// repeated rate lookups do not each pay for a fresh connection pool the way
@@ -170,13 +185,85 @@ struct FrankfurterRangeResponse {
 
 /// Load the rate cache from disk. Returns an empty EUR-based cache if the
 /// file does not exist yet.
+///
+/// Delegates to [`load_snapshot`] and clones, so every caller shares one
+/// memoized parse without any change to its own error behavior.
 fn load_cache() -> Result<RateCache> {
+    Ok((*load_snapshot()?).clone())
+}
+
+/// Memoized file identity plus its parsed snapshot; see [`FX_SNAPSHOT_MEMO`].
+type SnapshotMemo = Option<(PathBuf, SystemTime, u64, Arc<RateCache>)>;
+
+/// Process-wide memo of the last parsed FX cache file, gated on file
+/// identity `(path, mtime, len)`. Any save rewrites the file, changing mtime
+/// or length, so a hit cannot serve rates from before the latest save.
+///
+/// The critical sections only compare the key and clone one `Arc`; the lock
+/// is never held across `await` and never meets [`cache_write_lock`], so it
+/// cannot deadlock against the locked write paths.
+static FX_SNAPSHOT_MEMO: RwLock<SnapshotMemo> = RwLock::new(None);
+
+/// Counts actual cache-file parses in test builds, so a test can prove
+/// repeat loads share one parse.
+#[cfg(test)]
+static PARSE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Load the rate cache snapshot, parsing only when the file identity changed
+/// since the last parse. A missing file returns the default exactly as
+/// [`load_cache`] always has, without touching the memo; an unreadable file
+/// or unparsable body errors without touching it, so the next lookup retries.
+///
+/// Metadata/read race: the file may change between `metadata` and
+/// `read_to_string`. A mismatched pair either misses the memo (one extra
+/// parse) or caches content under the pre-read key; the next lookup then
+/// mismatches and reparses, so the staleness heals on the following call. A
+/// batch already freezes whatever snapshot it loaded, so either outcome
+/// preserves batch semantics.
+fn load_snapshot() -> Result<Arc<RateCache>> {
     let path = paths::get_fx_rates_path()?;
     if !path.exists() {
-        return Ok(RateCache::default());
+        return Ok(Arc::new(RateCache::default()));
+    }
+    // Metadata failures fall back to a direct parse with no memo involvement,
+    // mirroring `load_cache`'s error behavior rather than inventing a key.
+    let (mtime, len) = match std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| meta.modified().ok().map(|mtime| (mtime, meta.len())))
+    {
+        Some(key) => key,
+        None => {
+            let contents = std::fs::read_to_string(&path)?;
+            let cache: RateCache = serde_json::from_str(&contents)?;
+            #[cfg(test)]
+            PARSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Arc::new(cache));
+        }
+    };
+    {
+        let guard = FX_SNAPSHOT_MEMO
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_path, cached_mtime, cached_len, cached)) = guard.as_ref()
+            && *cached_path == path
+            && *cached_mtime == mtime
+            && *cached_len == len
+        {
+            return Ok(cached.clone());
+        }
     }
     let contents = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&contents)?)
+    let cache: RateCache = serde_json::from_str(&contents)?;
+    #[cfg(test)]
+    PARSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let snapshot = Arc::new(cache);
+    {
+        let mut guard = FX_SNAPSHOT_MEMO
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some((path, mtime, len, snapshot.clone()));
+    }
+    Ok(snapshot)
 }
 
 /// Persist the rate cache to disk (pretty-printed, matching the config files).
@@ -1011,9 +1098,11 @@ pub async fn monthly_rates_lenient(
 
     // One snapshot for the whole call instead of one file read per month
     // per currency. An unreadable cache degrades every currency, exactly as
-    // the per-currency loop does when each lookup fails to load it.
-    let mut batch = match load_cache() {
-        Ok(cache) => SnapBatch::new(cache, op),
+    // the per-currency loop does when each lookup fails to load it. The
+    // snapshot is memoized on file identity, so a warm revisit clones it
+    // instead of re-parsing.
+    let mut batch = match load_snapshot() {
+        Ok(snapshot) => SnapBatch::new((*snapshot).clone(), op),
         Err(_) => {
             crate::diag::event(
                 op,
@@ -1176,6 +1265,18 @@ fn merge_range_into_cache(
     (days.len(), aliases)
 }
 
+/// Whether `date` falls inside the window Frankfurter can actually answer,
+/// [`FX_SERIES_START`] through `today` inclusive.
+///
+/// A date outside this window fails an exact fetch every time (404 before
+/// the start, nothing published yet after today), so callers skip the
+/// network round trip for it and fall back to the cache directly, the same
+/// path an offline lookup already takes. Takes `today` as a parameter,
+/// rather than reading the clock itself, so it is testable without it.
+fn is_fetchable_date(date: NaiveDate, today: NaiveDate) -> bool {
+    date >= FX_SERIES_START && date <= today
+}
+
 /// Clamp a range fetch minimum to the earliest cached day.
 ///
 /// When the cache already holds history, fetching from the earliest cached
@@ -1259,11 +1360,19 @@ async fn ensure_range_cached(batch: &mut SnapBatch, key_dates: &[NaiveDate]) -> 
     ) else {
         return key_dates.to_vec();
     };
-    let range_min = clamp_range_min(min, &batch.cache);
+    let window_today = Local::now().date_naive();
+    let range_min = clamp_range_min(min, &batch.cache).max(FX_SERIES_START);
+    let range_max = max.min(window_today);
+    // A date below `range_min` or above `window_today` cannot come from a
+    // range fetch (Frankfurter has nothing to return for it), so it joins
+    // `older` here rather than only being excluded from the `fetch_range`
+    // call below; that keeps it in the returned still-missing list through
+    // the same `in_range.is_empty()` skip this loop already had, instead of
+    // needing a second empty-range check after computing `range_max`.
     let mut older = Vec::new();
     let mut in_range = Vec::new();
     for date in unresolved {
-        if date < range_min {
+        if date < range_min || date > window_today {
             older.push(date);
         } else {
             in_range.push(date);
@@ -1283,11 +1392,11 @@ async fn ensure_range_cached(batch: &mut SnapBatch, key_dates: &[NaiveDate]) -> 
         format!(
             "prewarm range: {} unresolved dates over {} days ({} older skipped)",
             in_range.len(),
-            max.signed_duration_since(range_min).num_days(),
+            range_max.signed_duration_since(range_min).num_days(),
             older.len()
         ),
     );
-    let days = match fetch_range(range_min, max, op).await {
+    let days = match fetch_range(range_min, range_max, op).await {
         Ok(days) => days,
         Err(_) => return older.into_iter().chain(in_range).collect(),
     };
@@ -1376,11 +1485,12 @@ async fn fetch_missing_dates(
                 if let Ok(Some((table, actual))) = cached_rate_for(&snap, date) {
                     return (date, MissingOutcome::Hit { table, actual });
                 }
+                let today = Local::now().date_naive();
                 if !is_offline()
                     && std::time::Instant::now() < deadline
+                    && is_fetchable_date(date, today)
                     && let Ok((returned, table)) = fetch_historical(date, op).await
                 {
-                    let today = Local::now().date_naive();
                     let alias_for = should_alias_as(date, returned, today).then_some(date);
                     match store_historical_rates(returned, &table, alias_for).await {
                         Ok(()) => {
@@ -1607,9 +1717,10 @@ pub async fn rates_for_keys_lenient(
     // Load the cache once for the whole batch instead of once per key.
     // An unreadable cache fails every key lookup, exactly as the per-key
     // path does: every non-reference currency is reported once, and nothing
-    // resolves.
-    let mut batch = match load_cache() {
-        Ok(cache) => SnapBatch::new(cache, op),
+    // resolves. The snapshot is memoized on file identity, so a warm revisit
+    // clones it instead of re-parsing.
+    let mut batch = match load_snapshot() {
+        Ok(snapshot) => SnapBatch::new((*snapshot).clone(), op),
         Err(_) => {
             let mut unavailable: Vec<String> = keys
                 .iter()
@@ -2428,6 +2539,80 @@ mod tests {
         assert_eq!(clamp_range_min(ancient, &RateCache::default()), ancient);
     }
 
+    // ======================================================================
+    // `FX_SERIES_START` window: exact-fetch eligibility and the range clamp
+    // ======================================================================
+
+    /// The day before the series start is not fetchable, the start itself
+    /// is, an ordinary date well inside the window is, today is, and
+    /// tomorrow is not.
+    #[test]
+    fn is_fetchable_date_at_the_window_boundaries() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+
+        assert!(!is_fetchable_date(
+            FX_SERIES_START - chrono::Duration::days(1),
+            today
+        ));
+        assert!(is_fetchable_date(FX_SERIES_START, today));
+        assert!(is_fetchable_date(
+            NaiveDate::from_ymd_opt(2020, 6, 15).unwrap(),
+            today
+        ));
+        assert!(is_fetchable_date(today, today));
+        assert!(!is_fetchable_date(today + chrono::Duration::days(1), today));
+    }
+
+    /// `ensure_range_cached`'s two clamp expressions, `clamp_range_min(..)
+    /// .max(FX_SERIES_START)` and `max.min(today)`, applied to an unresolved
+    /// span that starts before the series and ends after today: the
+    /// resulting bounds are exactly the series start and today, never the
+    /// raw span. Pure inputs and outputs, no timing involved.
+    #[test]
+    fn ensure_range_cached_bounds_clamp_to_the_publishable_window() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let cache = RateCache::default();
+        let before_window = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let after_today = today + chrono::Duration::days(5);
+
+        let range_min = clamp_range_min(before_window, &cache).max(FX_SERIES_START);
+        let range_max = after_today.min(today);
+
+        assert_eq!(range_min, FX_SERIES_START);
+        assert_eq!(range_max, today);
+    }
+
+    /// A before-window date, an ordinary cached date, and a future date in
+    /// one offline batch: the cached date resolves exactly, the future date
+    /// falls back to the latest cached table through `nearest_earlier`, and
+    /// the before-window date's currency is named in `unavailable` exactly
+    /// once. This is the D1 property the window clamp must preserve: it
+    /// changes latency, never a resolved rate or the unavailable list.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rates_for_keys_lenient_leaves_resolution_unchanged_across_the_window_boundaries() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-04", &[("USD", 1.1622)])]);
+
+        let cached = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let before_window = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let today = Local::now().date_naive();
+        let future = today + chrono::Duration::days(30);
+
+        let (rates, unavailable) = rates_for_keys_lenient(&[
+            (cached, "USD".to_string()),
+            (future, "USD".to_string()),
+            (before_window, "JPY".to_string()),
+        ])
+        .await
+        .expect("mixed batch degrades per key");
+
+        assert_eq!(rates[&(cached, "USD".to_string())].rate, 1.0 / 1.1622);
+        assert_eq!(rates[&(future, "USD".to_string())].rate, 1.0 / 1.1622);
+        assert!(!rates.contains_key(&(before_window, "JPY".to_string())));
+        assert_eq!(unavailable, vec!["JPY".to_string()]);
+    }
+
     /// Several dates through the concurrent phase: an exact hit, a weekend
     /// falling back, a date with nothing on or before it (unavailable), and
     /// a cached day missing the currency (unavailable without any network).
@@ -3053,5 +3238,122 @@ mod tests {
             let key = format!("2026-01-{day:02}");
             assert_eq!(cache.rates[&key]["USD"], day as f64);
         }
+    }
+
+    // ======================================================================
+    // Snapshot memo: one parse per file identity, gated on (path, mtime, len)
+    // ======================================================================
+
+    /// A seeded file loads through the memo with its rates intact.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snapshot_memo_seeded_file_loads() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-04", &[("USD", 1.1622)])]);
+
+        let snapshot = load_snapshot().expect("seeded file loads");
+        assert_eq!(snapshot.rates["2026-09-04"]["USD"], 1.1622);
+    }
+
+    /// Overwriting the file with different data loads the new data: any save
+    /// changes mtime or length, so a hit cannot serve pre-save rates. The two
+    /// seeds differ in length, so the freshness proof does not depend on
+    /// filesystem mtime granularity.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snapshot_memo_overwrite_loads_the_new_data() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-04", &[("USD", 1.10)])]);
+        assert_eq!(
+            load_snapshot().expect("first load").rates["2026-09-04"]["USD"],
+            1.10
+        );
+
+        seed_cache(&[
+            ("2026-09-04", &[("USD", 9.99)]),
+            ("2026-09-05", &[("USD", 9.98)]),
+        ]);
+        let snapshot = load_snapshot().expect("overwrite reparses");
+        assert_eq!(snapshot.rates["2026-09-04"]["USD"], 9.99);
+        assert_eq!(snapshot.rates["2026-09-05"]["USD"], 9.98);
+    }
+
+    /// Deleting the file loads the default, exactly as `load_cache` always
+    /// has, rather than the memo's pre-delete entry.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snapshot_memo_delete_loads_default() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-04", &[("USD", 1.1622)])]);
+        load_snapshot().expect("seeded file loads");
+
+        std::fs::remove_file(paths::get_fx_rates_path().expect("cache path"))
+            .expect("delete the cache");
+        let snapshot = load_snapshot().expect("missing file loads default");
+        assert!(snapshot.rates.is_empty());
+    }
+
+    /// The memo is keyed by path: two directories hold independent snapshots,
+    /// and returning to the first still serves its own data.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snapshot_memo_isolated_per_directory() {
+        let dir_a = tempfile::tempdir().expect("create temp dir");
+        let dir_b = tempfile::tempdir().expect("create temp dir");
+        unsafe {
+            std::env::set_var("FINGUARD_FX_OFFLINE", "1");
+        }
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir_a.path());
+            std::env::set_var("XDG_CONFIG_HOME", dir_a.path());
+            std::env::set_var("HOME", dir_a.path());
+        }
+        seed_cache(&[("2026-09-04", &[("USD", 1.10)])]);
+        assert_eq!(
+            load_snapshot().expect("dir A loads").rates["2026-09-04"]["USD"],
+            1.10
+        );
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir_b.path());
+            std::env::set_var("XDG_CONFIG_HOME", dir_b.path());
+            std::env::set_var("HOME", dir_b.path());
+        }
+        seed_cache(&[("2026-09-04", &[("USD", 2.20)])]);
+        assert_eq!(
+            load_snapshot().expect("dir B loads").rates["2026-09-04"]["USD"],
+            2.20
+        );
+
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir_a.path());
+            std::env::set_var("XDG_CONFIG_HOME", dir_a.path());
+            std::env::set_var("HOME", dir_a.path());
+        }
+        assert_eq!(
+            load_snapshot().expect("dir A still isolated").rates["2026-09-04"]["USD"],
+            1.10
+        );
+    }
+
+    /// Repeat loads of an unchanged file parse exactly once: the second load
+    /// is a memo hit. The temp dir is fresh, so the first load is a certain
+    /// miss regardless of what earlier tests cached.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snapshot_memo_repeat_loads_parse_once() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-04", &[("USD", 1.1622)])]);
+
+        PARSE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        load_snapshot().expect("first load parses");
+        load_snapshot().expect("second load hits the memo");
+        load_cache().expect("delegated load hits the memo too");
+        assert_eq!(
+            PARSE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "three loads of one unchanged file parse once"
+        );
     }
 }
