@@ -229,6 +229,7 @@ function DetailedTab() {
         )}
       </div>
       <GlassCard
+        className="min-w-0"
         title={`${MONTHS[month - 1]} ${year} · ${rows.length} entries`}
         action={
           <div className="flex items-center gap-3 text-sm">
@@ -1523,7 +1524,7 @@ function RecurringTab() {
         {catsError && <ErrorBanner message={`Could not load categories: ${catsError}`} />}
       </div>
       {skippedHere.length > 0 && (
-        <div className="lg:col-span-2">
+        <div className="min-w-0 lg:col-span-2">
           <SkippedRecurringPanel
             items={skippedHere}
             periodLabel={`${MONTHS[month - 1]} ${year}`}
@@ -1533,6 +1534,7 @@ function RecurringTab() {
         </div>
       )}
       <GlassCard
+        className="min-w-0"
         title={`${items.length} recurring templates`}
         action={
           <button
@@ -1701,7 +1703,7 @@ function MappingsTab() {
         {itemsError && <ErrorBanner message={`Could not load mapping rules: ${itemsError}`} />}
         {catsError && <ErrorBanner message={`Could not load categories: ${catsError}`} />}
       </div>
-      <GlassCard title={`${items.length} mapping rules`}>
+      <GlassCard className="min-w-0" title={`${items.length} mapping rules`}>
         <div className="scrollbar-thin overflow-x-auto">
           <table className="w-full min-w-[520px] text-sm">
             <thead>
