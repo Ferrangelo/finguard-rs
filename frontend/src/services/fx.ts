@@ -45,4 +45,19 @@ export function referenceToDisplay(
   return amountInReference / rate;
 }
 
+/**
+ * Converts `amount`, denominated in a given currency, into the reference
+ * currency, given that currency's `rate_to_reference` from
+ * `getMonthlyFxRates`. This is the *inverse* direction of `referenceToDisplay`
+ * above, which divides a reference-currency amount to reach a display
+ * currency: do not confuse the two, since swapping them silently produces a
+ * plausible-looking but wrong figure. Returns `null` instead of `Infinity` or
+ * `NaN` when `rate` is missing, zero, or not finite, so a caller can render a
+ * fallback rather than a nonsense money figure.
+ */
+export function nativeToReference(amount: number, rate: number | undefined): number | null {
+  if (rate === undefined || !Number.isFinite(rate) || rate === 0) return null;
+  return amount * rate;
+}
+
 export const CURRENCIES: Currency[] = ["EUR", "USD", "GBP", "CHF", "JPY"];

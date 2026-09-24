@@ -221,24 +221,26 @@ pub fn resolve_category(value: &str, existing: &HashSet<String>) -> String {
     normalize_category_value(value)
 }
 
-/// Rewrite every legacy `"E"` value in `df`'s `currency` column to `"EUR"`.
+/// Rewrite every legacy `"E"` value in `df`'s `column` to `"EUR"`.
 ///
 /// Older parquet files (and older seed data) stored the euro as the
 /// single-letter code `"E"`. New rows always write `"EUR"`, but a table
 /// loaded from disk can still carry the legacy value, so every load path maps
-/// it forward here instead of leaking it to the API. A no-op when the column
-/// is absent or the table has no rows, so callers can apply it unconditionally.
-fn normalize_currency_column(df: DataFrame) -> Result<DataFrame> {
-    if !has_column(&df, "currency") || df.height() == 0 {
+/// it forward here instead of leaking it to the API. A no-op when `column` is
+/// absent or the table has no rows, so callers can apply it unconditionally.
+/// Generalized (rather than hardcoded to `"currency"`) so it also covers
+/// `df_prices`'s twelve `{month}_currency` columns.
+fn normalize_currency_column(df: DataFrame, column: &str) -> Result<DataFrame> {
+    if !has_column(&df, column) || df.height() == 0 {
         return Ok(df);
     }
     Ok(df
         .lazy()
         .with_column(
-            when(col("currency").eq(lit("E")))
+            when(col(column).eq(lit("E")))
                 .then(lit("EUR"))
-                .otherwise(col("currency"))
-                .alias("currency"),
+                .otherwise(col(column))
+                .alias(column),
         )
         .collect()?)
 }
@@ -673,7 +675,7 @@ impl DetailedExpenses {
                     df = df.drop(stale_column)?;
                 }
             }
-            normalize_currency_column(df)?
+            normalize_currency_column(df, "currency")?
         } else {
             empty_expenses_df()
         };
@@ -1419,13 +1421,27 @@ fn empty_wide_df(meta_cols: &[&str]) -> DataFrame {
 
 /// Build a single-row wide dataframe from `(meta column, value)` pairs plus
 /// zeroed month columns, then `row_id` as its [`ROW_ID_COLUMN`].
-fn wide_row(meta: &[(&str, &str)], row_id: &str) -> Result<DataFrame> {
+///
+/// `month_currency`, when `Some(value)`, also appends twelve
+/// `{month}_currency` `String` columns, each seeded with `value`. Only
+/// `df_prices`'s price row needs this, since each month's price carries its
+/// own currency; every other wide table passes `None`.
+fn wide_row(
+    meta: &[(&str, &str)],
+    month_currency: Option<&str>,
+    row_id: &str,
+) -> Result<DataFrame> {
     let mut cols: Vec<Column> = meta
         .iter()
         .map(|(name, val)| Column::new((*name).into(), &[*val]))
         .collect();
     for m in month_labels() {
         cols.push(Column::new(m.as_str().into(), &[0.0_f64]));
+    }
+    if let Some(currency) = month_currency {
+        for m in month_labels() {
+            cols.push(Column::new(format!("{m}_currency").into(), &[currency]));
+        }
     }
     cols.push(Column::new(ROW_ID_COLUMN.into(), &[row_id]));
     Ok(DataFrame::new_infer_height(cols)?)
@@ -1474,14 +1490,16 @@ fn set_f64_where(
 // ======================================================================
 
 /// Yearly investment holdings table. `df` holds quantities; `df_prices` holds
-/// per-month unit prices; [`Self::df_value`] multiplies them.
+/// per-month unit prices and, since each month's price can be entered in its
+/// own currency, a `{month}_currency` column for each of the twelve months;
+/// [`Self::df_value`] multiplies quantity by price and carries those
+/// currency columns through.
 ///
-/// `currency` lives on `df` only, not on `df_prices`. A holding has exactly
-/// one currency, `df` is the frame the API reads asset metadata from (see
-/// `get_investments_handler` in `api.rs`), and `df_value`'s join already
-/// selects only the price columns out of `df_prices`, so a copy on
-/// `df_prices` would never reach a caller and would just be a second value to
-/// keep in sync.
+/// `df`'s own `currency` column is only the asset's *default*: it seeds a
+/// new price entry (see [`Self::add_asset`]) and nothing else. It does not
+/// describe any already-stored price, and changing it (see
+/// [`Self::set_currency`]) leaves every existing price entry's own currency
+/// untouched.
 ///
 /// An asset's row in `df` and its row in `df_prices` share one
 /// [`ROW_ID_COLUMN`] value.
@@ -1491,18 +1509,21 @@ pub struct InvestmentHoldings {
     path: std::path::PathBuf,
     path_prices: std::path::PathBuf,
     /// Quantities dataframe (`asset_name, category, link, currency, 01..12,
-    /// row_id`).
+    /// row_id`). `currency` is the default for a new price entry; see the
+    /// type's own docs.
     pub df: DataFrame,
-    /// Prices dataframe (`asset_name, category, link, 01..12, row_id`; no
-    /// `currency`).
+    /// Prices dataframe (`asset_name, category, link, 01..12,
+    /// 01_currency..12_currency, row_id`). Each `{month}_currency` column
+    /// holds the currency that month's price was entered in.
     pub df_prices: DataFrame,
 }
 
 impl InvestmentHoldings {
     /// Construct for `year`, loading holdings and prices from disk (or
-    /// initialising empty), migrating a missing `link` column on both frames
-    /// and a missing or legacy `currency` column on `df`. Returns
-    /// [`Error::RowIdsMissing`] when either file has a row without a
+    /// initialising empty), migrating a missing `link` column on both
+    /// frames, a missing or legacy `currency` column on `df`, and a missing
+    /// or legacy `{month}_currency` column for each month on `df_prices`.
+    /// Returns [`Error::RowIdsMissing`] when either file has a row without a
     /// [`ROW_ID_COLUMN`] value.
     pub fn new(year: i32) -> Result<Self> {
         let path = get_year_summary_path(year, INVESTMENTS_FILENAME)?;
@@ -1523,21 +1544,69 @@ impl InvestmentHoldings {
 
         let mut df = load(&path, &["asset_name", "category", "link", "currency"])?;
         if !has_column(&df, "currency") {
-            // Holdings saved before this column existed are already priced in
-            // the reference currency, so backfill it from settings rather
-            // than a fixed value the user may since have changed.
-            let reference_currency = config::get_currency_settings()?.reference_currency;
+            // A file with no `currency` column predates multi-currency
+            // support, when every amount was implicitly EUR. Backfilling
+            // from the reference-currency *setting* instead would make the
+            // same stored number claim a different currency every time the
+            // user changed that setting, so the constant is what actually
+            // matches the data.
             df = df
                 .lazy()
-                .with_column(lit(reference_currency).alias("currency"))
+                .with_column(lit("EUR").alias("currency"))
                 .collect()?;
         }
-        let df = normalize_currency_column(df)?;
+        let df = normalize_currency_column(df, "currency")?;
+
+        let mut df_prices = load(&path_prices, &["asset_name", "category", "link"])?;
+        let missing_currency_cols: Vec<String> = month_labels()
+            .into_iter()
+            .map(|m| format!("{m}_currency"))
+            .filter(|column| !has_column(&df_prices, column))
+            .collect();
+        if !missing_currency_cols.is_empty() {
+            // A price entry saved before this column existed predates
+            // per-entry currency. Seed it from the *same row's* asset-level
+            // `currency` in `df` (joined on `row_id`), not the literal
+            // `"EUR"`: an asset the user had already set to a non-EUR
+            // currency must keep valuing at that currency instead of being
+            // silently relabeled EUR (exactly the bug `df`'s own backfill
+            // above exists to prevent). A `df_prices` row with no matching
+            // `row_id` in `df` (the two frames can disagree, e.g. after a
+            // partial sync) falls back to the literal `"EUR"`, which is also
+            // what a whole file with no `currency` column at all resolves
+            // to, matching the user's confirmed statement that those
+            // specific legacy prices are EUR.
+            let currency_by_row = df
+                .clone()
+                .lazy()
+                .select([col(ROW_ID_COLUMN), col("currency")]);
+            let lazy_prices = df_prices.clone().lazy().join(
+                currency_by_row,
+                [col(ROW_ID_COLUMN)],
+                [col(ROW_ID_COLUMN)],
+                JoinArgs::new(JoinType::Left),
+            );
+            // One `with_columns` call for every missing column, rather than
+            // folding them into `lazy_prices` one `.with_column()` at a
+            // time: see `df_value`'s comment on the same pattern for why.
+            let seed_exprs: Vec<Expr> = missing_currency_cols
+                .iter()
+                .map(|column| col("currency").fill_null(lit("EUR")).alias(column.as_str()))
+                .collect();
+            df_prices = lazy_prices
+                .with_columns(seed_exprs)
+                .drop(cols(["currency"]))
+                .collect()?;
+        }
+        for m in month_labels() {
+            let column = format!("{m}_currency");
+            df_prices = normalize_currency_column(df_prices, &column)?;
+        }
 
         Ok(Self {
             year,
             df,
-            df_prices: load(&path_prices, &["asset_name", "category", "link"])?,
+            df_prices,
             path,
             path_prices,
         })
@@ -1583,9 +1652,10 @@ impl InvestmentHoldings {
     /// The rows appended to `df` and `df_prices` get the same fresh
     /// [`ROW_ID_COLUMN`] value.
     ///
-    /// `currency` is stored on `df` only; the row appended to `df_prices`
-    /// keeps that frame's existing `asset_name, category, link, 01..12,
-    /// row_id` schema.
+    /// `currency` is stored on `df` as the asset's default; the row appended
+    /// to `df_prices` seeds all twelve `{month}_currency` columns with the
+    /// same value, since a fresh asset's price entries start out in that
+    /// currency until edited per month (see [`Self::set_quantity_or_price`]).
     pub fn add_asset(
         &mut self,
         asset_name: &str,
@@ -1611,6 +1681,7 @@ impl InvestmentHoldings {
                 ("link", link),
                 ("currency", currency),
             ],
+            None,
             &row_id,
         )?;
         let price_row = wide_row(
@@ -1619,6 +1690,7 @@ impl InvestmentHoldings {
                 ("category", category),
                 ("link", link),
             ],
+            Some(currency),
             &row_id,
         )?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
@@ -1737,11 +1809,13 @@ impl InvestmentHoldings {
         Ok(())
     }
 
-    /// Update the currency for an asset, then save the holdings frame.
+    /// Update the asset's *default* currency for new price entries, then
+    /// save the holdings frame.
     ///
-    /// `currency` lives on `df` only, so this writes and records only
-    /// `investments.parquet`; see the type's own docs for why `df_prices`
-    /// carries no currency.
+    /// This writes and records only `investments.parquet`'s `currency`
+    /// column; it never touches `df_prices`'s `{month}_currency` columns, so
+    /// it leaves every already-stored price entry's own currency untouched.
+    /// See the type's own docs.
     pub fn set_currency(&mut self, asset_name: &str, currency: &str) -> Result<()> {
         if !self.asset_names()?.iter().any(|n| n == asset_name) {
             return Err(Error::NotFound(format!("Asset '{asset_name}' not found.")));
@@ -1765,14 +1839,25 @@ impl InvestmentHoldings {
         Ok(())
     }
 
-    /// Set the quantity (`"quantity"`) or unit price (`"price"`) for an asset in
-    /// a given month, then save the affected frame.
+    /// Set the quantity (`"quantity"`) or unit price (`"price"`) for an asset
+    /// in a given month, then save the affected frame.
+    ///
+    /// `currency`, when `Some`, also sets that month's `{month}_currency`
+    /// column in `df_prices` and is applied only for the `"price"` branch; a
+    /// `"quantity"` write ignores it entirely, since a quantity carries no
+    /// currency. `None` leaves the stored currency unchanged, so a caller
+    /// that only wants to change the number does not have to know it. A
+    /// `Some` currency is trimmed and upper-cased before it is stored or
+    /// checked, matching `update_currency_settings_handler`'s normalization,
+    /// and is rejected with [`Error::InvalidArgument`] if that leaves it
+    /// empty, instead of silently storing one.
     pub fn set_quantity_or_price(
         &mut self,
         asset_name: &str,
         month: u32,
         value: f64,
         quant_or_price: &str,
+        currency: Option<&str>,
     ) -> Result<()> {
         if !(1..=12).contains(&month) {
             return Err(Error::InvalidArgument(format!(
@@ -1795,6 +1880,22 @@ impl InvestmentHoldings {
                 Ok(())
             }
             "price" => {
+                // Normalize the same way `update_currency_settings_handler`
+                // does, so `" usd"` and `"USD"` store identically: the
+                // frontend looks currencies up by exact code, and only the
+                // backend's own `rate()` trims/uppercases before comparing.
+                let currency = match currency {
+                    Some(currency) => {
+                        let normalized = currency.trim().to_uppercase();
+                        if normalized.is_empty() {
+                            return Err(Error::InvalidArgument(
+                                "currency must not be empty".to_string(),
+                            ));
+                        }
+                        Some(normalized)
+                    }
+                    None => None,
+                };
                 let ids = row_ids_where(&self.df_prices, "asset_name", asset_name)?;
                 self.df_prices = set_f64_where(
                     self.df_prices.clone(),
@@ -1803,9 +1904,28 @@ impl InvestmentHoldings {
                     &col_name,
                     value,
                 )?;
+                let currency_col = format!("{col_name}_currency");
+                if let Some(currency) = &currency {
+                    self.df_prices = set_str_where(
+                        self.df_prices.clone(),
+                        "asset_name",
+                        asset_name,
+                        &currency_col,
+                        currency,
+                    )?;
+                }
                 self.save_df_prices()?;
                 for id in &ids {
                     record(self.prices_table(), id, number_cell(&col_name, value));
+                }
+                if let Some(currency) = &currency {
+                    for id in &ids {
+                        record(
+                            self.prices_table(),
+                            id,
+                            Ok(text_cell(&currency_col, currency)),
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1817,20 +1937,36 @@ impl InvestmentHoldings {
 
     /// Set the quantity for an asset in a given month.
     pub fn set_quantity(&mut self, asset_name: &str, month: u32, quantity: f64) -> Result<()> {
-        self.set_quantity_or_price(asset_name, month, quantity, "quantity")
+        self.set_quantity_or_price(asset_name, month, quantity, "quantity", None)
     }
 
-    /// Set the price for an asset in a given month.
+    /// Set the price for an asset in a given month, leaving its currency
+    /// unchanged. See [`Self::set_quantity_or_price`] to set both together.
     pub fn set_price(&mut self, asset_name: &str, month: u32, price: f64) -> Result<()> {
-        self.set_quantity_or_price(asset_name, month, price, "price")
+        self.set_quantity_or_price(asset_name, month, price, "price", None)
     }
 
     /// Return a dataframe of quantity × price for each asset and month.
     ///
     /// Same shape as `df` (`asset_name, category, link, currency, 01..12,
-    /// row_id`) but each monthly cell contains `quantity * price`. The join
-    /// only pulls the price columns out of `df_prices`, so `df`'s other
-    /// columns, including `currency` and `row_id`, pass through unchanged.
+    /// row_id`), plus `df_prices`'s twelve `{month}_currency` columns passed
+    /// through unchanged: each monthly value was computed from that month's
+    /// own price, so a caller summing these values across currencies (see
+    /// `plots::sum_col_converted`) must convert each month by its own
+    /// `{month}_currency`, not by `df`'s asset-level `currency`. The join
+    /// only pulls the price and price-currency columns out of `df_prices`,
+    /// so `df`'s other columns, including its own `currency` and `row_id`,
+    /// pass through unchanged.
+    ///
+    /// An `asset_name` in `df` with no matching row in `df_prices` (the two
+    /// frames can disagree, for example after a partial sync) leaves every
+    /// `{month}_price` and `{month}_currency` null from the left join. The
+    /// price null already reads as `0.0` (see `f64_col`), so the value is
+    /// harmlessly zero; the currency null is filled here from `df`'s own
+    /// `currency` instead of being left null, because an empty-string
+    /// currency has no resolvable FX rate and would fail the whole request
+    /// in `plots::sum_col_converted` rather than just valuing this row at
+    /// zero.
     pub fn df_value(&self) -> Result<DataFrame> {
         let mcols = month_labels();
         let price_select: Vec<Expr> = std::iter::once(col("asset_name"))
@@ -1839,20 +1975,33 @@ impl InvestmentHoldings {
                     .iter()
                     .map(|c| col(c.as_str()).alias(format!("{c}_price"))),
             )
+            .chain(mcols.iter().map(|c| col(format!("{c}_currency").as_str())))
             .collect();
         let prices = self.df_prices.clone().lazy().select(price_select);
 
-        let mut value = self.df.clone().lazy().join(
+        let joined = self.df.clone().lazy().join(
             prices,
             [col("asset_name")],
             [col("asset_name")],
             JoinArgs::new(JoinType::Left),
         );
-        for c in &mcols {
-            value = value
-                .with_column((col(c.as_str()) * col(format!("{c}_price"))).alias(c.as_str()))
-                .drop(cols([format!("{c}_price")]));
-        }
+        // Built as two flat `Vec<Expr>` and applied with one `with_columns`
+        // call each, rather than folding 12 months of `.with_column()` calls
+        // into `value` one at a time: chaining that many lazy nodes let the
+        // query plan grow deep enough to overflow the stack when this ran
+        // under `cargo test`'s default (smaller) thread stack size.
+        let mut exprs: Vec<Expr> = mcols
+            .iter()
+            .map(|c| (col(c.as_str()) * col(format!("{c}_price"))).alias(c.as_str()))
+            .collect();
+        exprs.extend(mcols.iter().map(|c| {
+            let currency_col = format!("{c}_currency");
+            col(currency_col.as_str())
+                .fill_null(col("currency"))
+                .alias(currency_col.as_str())
+        }));
+        let price_cols: Vec<String> = mcols.iter().map(|c| format!("{c}_price")).collect();
+        let value = joined.with_columns(exprs).drop(cols(price_cols));
         Ok(value.collect()?)
     }
 
@@ -1921,7 +2070,7 @@ impl Liquidity {
                     .with_column(lit("EUR").alias("currency"))
                     .collect()?;
             }
-            normalize_currency_column(df)?
+            normalize_currency_column(df, "currency")?
         } else {
             empty_wide_df(&["asset_name", "category", "currency"])
         };
@@ -1965,6 +2114,7 @@ impl Liquidity {
                 ("category", category),
                 ("currency", currency),
             ],
+            None,
             &row_id,
         )?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
@@ -2121,7 +2271,7 @@ impl CreditsDebts {
                     .with_column(lit("EUR").alias("currency"))
                     .collect()?;
             }
-            let mut df = normalize_currency_column(df)?;
+            let mut df = normalize_currency_column(df, "currency")?;
             if has_column(&df, "type") {
                 df = df.drop("type")?;
             }
@@ -2158,7 +2308,7 @@ impl CreditsDebts {
             )));
         }
         let row_id = new_row_id();
-        let new_row = wide_row(&[("name", name), ("currency", currency)], &row_id)?;
+        let new_row = wide_row(&[("name", name), ("currency", currency)], None, &row_id)?;
         self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
         self.save()?;
         record(self.change_table(), &row_id, upsert_row(&self.df, &row_id));
@@ -2373,7 +2523,7 @@ impl RecurringExpenses {
         let df = if path.exists() {
             let df = read_parquet(&path)?;
             require_row_ids(&df, &path)?;
-            normalize_currency_column(df)?
+            normalize_currency_column(df, "currency")?
         } else {
             empty_recurring_df()
         };
@@ -2857,7 +3007,7 @@ mod tests {
             .expect("add asset");
 
         holdings
-            .set_quantity_or_price("Test Asset", 1, 10.0, "quantity")
+            .set_quantity_or_price("Test Asset", 1, 10.0, "quantity", None)
             .expect("'quantity' must be accepted");
         let qty = holdings
             .df
@@ -2869,7 +3019,7 @@ mod tests {
         assert_eq!(qty, Some(10.0));
 
         holdings
-            .set_quantity_or_price("Test Asset", 1, 25.5, "price")
+            .set_quantity_or_price("Test Asset", 1, 25.5, "price", None)
             .expect("'price' must be accepted");
         let price = holdings
             .df_prices
@@ -2881,23 +3031,26 @@ mod tests {
         assert_eq!(price, Some(25.5));
 
         let qty_err = holdings
-            .set_quantity_or_price("Test Asset", 1, 1.0, "qty")
+            .set_quantity_or_price("Test Asset", 1, 1.0, "qty", None)
             .expect_err("'qty' must be rejected, not silently accepted");
         assert!(matches!(qty_err, Error::InvalidArgument(_)));
 
         let other_err = holdings
-            .set_quantity_or_price("Test Asset", 1, 1.0, "bogus")
+            .set_quantity_or_price("Test Asset", 1, 1.0, "bogus", None)
             .expect_err("unrecognized field must be rejected");
         assert!(matches!(other_err, Error::InvalidArgument(_)));
     }
 
     /// A pre-existing investments file with no `currency` column must
-    /// backfill it from the configured reference currency, not a fixed
-    /// value: the user can change the reference currency, and existing
-    /// holdings were priced in whatever it was at the time.
+    /// backfill it to the constant `"EUR"`, never the configured reference
+    /// currency. Regression guard: an earlier version backfilled from the
+    /// setting, so the same stored number silently claimed a different
+    /// currency every time the user changed the setting. The setting here is
+    /// deliberately not `EUR`, so a backfill that still reads the setting
+    /// would fail this assertion.
     #[test]
     #[serial_test::serial]
-    fn investment_holdings_backfill_uses_configured_reference_currency() {
+    fn investment_holdings_backfill_uses_eur_for_pre_currency_files() {
         let _temp = with_temp_data_home();
         config::set_currency_settings(&config::CurrencySettings {
             reference_currency: "GBP".to_string(),
@@ -2912,6 +3065,7 @@ mod tests {
                 ("category", "Stocks/ETF"),
                 ("link", ""),
             ],
+            None,
             &new_row_id(),
         )
         .expect("build legacy row without a currency column");
@@ -2920,7 +3074,7 @@ mod tests {
         let holdings = InvestmentHoldings::new(2026).expect("load holdings");
         assert_eq!(
             str_col_to_vec(&holdings.df, "currency").expect("read currency column"),
-            vec!["GBP"]
+            vec!["EUR"]
         );
     }
 
@@ -2944,6 +3098,223 @@ mod tests {
             str_col_to_vec(&reloaded.df, "currency").expect("read currency column"),
             vec!["EUR", "USD"]
         );
+    }
+
+    /// A pre-existing `investments_prices.parquet` with no `{month}_currency`
+    /// columns, and no matching row in `investments.parquet` to seed a
+    /// currency from, must backfill every one of the twelve to the literal
+    /// `"EUR"`. Loading must not write the file: only the in-memory frame
+    /// changes. See `investment_prices_backfill_seeds_from_the_assets_own_currency`
+    /// for the case where a matching holdings row *does* exist.
+    #[test]
+    #[serial_test::serial]
+    fn investment_prices_backfill_uses_eur_for_pre_currency_columns() {
+        let _temp = with_temp_data_home();
+
+        let path_prices =
+            get_year_summary_path(2026, INVESTMENTS_PRICES_FILENAME).expect("prices path");
+        let legacy_row = wide_row(
+            &[
+                ("asset_name", "Legacy Holding"),
+                ("category", "Stocks/ETF"),
+                ("link", ""),
+            ],
+            None,
+            &new_row_id(),
+        )
+        .expect("build legacy price row without currency columns");
+        write_parquet(&legacy_row, &path_prices).expect("write legacy prices file");
+        let bytes_before = std::fs::read(&path_prices).expect("read legacy prices file");
+
+        let holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        for m in month_labels() {
+            let column = format!("{m}_currency");
+            assert_eq!(
+                str_col_to_vec(&holdings.df_prices, &column)
+                    .unwrap_or_else(|_| panic!("read {column} column")),
+                vec!["EUR".to_string()],
+                "month {m} must backfill to EUR"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&path_prices).expect("read prices file again"),
+            bytes_before,
+            "loading must not rewrite the file"
+        );
+    }
+
+    /// A holdings row with an explicit non-EUR `currency` and a matching
+    /// prices row with no `{month}_currency` columns must backfill every
+    /// month to that asset's own currency, not the literal `"EUR"`. Before
+    /// per-entry currency existed, net worth already converted every price
+    /// of an asset at the asset's own `currency`; backfilling to a constant
+    /// instead would silently relabel that history the moment this ships.
+    #[test]
+    #[serial_test::serial]
+    fn investment_prices_backfill_seeds_from_the_assets_own_currency() {
+        let _temp = with_temp_data_home();
+
+        let row_id = new_row_id();
+        let path = get_year_summary_path(2026, INVESTMENTS_FILENAME).expect("investments path");
+        let holdings_row = wide_row(
+            &[
+                ("asset_name", "Dollar Holding"),
+                ("category", "Stocks/ETF"),
+                ("link", ""),
+                ("currency", "USD"),
+            ],
+            None,
+            &row_id,
+        )
+        .expect("build holdings row");
+        write_parquet(&holdings_row, &path).expect("write holdings file");
+
+        let path_prices =
+            get_year_summary_path(2026, INVESTMENTS_PRICES_FILENAME).expect("prices path");
+        let legacy_price_row = wide_row(
+            &[
+                ("asset_name", "Dollar Holding"),
+                ("category", "Stocks/ETF"),
+                ("link", ""),
+            ],
+            None,
+            &row_id,
+        )
+        .expect("build legacy price row without currency columns");
+        write_parquet(&legacy_price_row, &path_prices).expect("write legacy prices file");
+
+        let holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        for m in month_labels() {
+            let column = format!("{m}_currency");
+            assert_eq!(
+                str_col_to_vec(&holdings.df_prices, &column)
+                    .unwrap_or_else(|_| panic!("read {column} column")),
+                vec!["USD".to_string()],
+                "month {m} must backfill to the asset's own USD currency, not EUR"
+            );
+        }
+    }
+
+    /// A holdings row with no matching row in `df_prices` (the two frames
+    /// can disagree, for example after a partial sync) must not leave
+    /// `df_value`'s `{month}_currency` null: `plots::sum_col_converted`
+    /// reads a null currency as `""`, which has no resolvable FX rate and
+    /// would fail the whole request instead of just valuing the row at
+    /// zero. The fallback is the holdings row's own `currency`.
+    #[test]
+    #[serial_test::serial]
+    fn df_value_fills_currency_for_a_holdings_row_with_no_price_row() {
+        let _temp = with_temp_data_home();
+
+        let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        holdings
+            .add_asset("Orphan Asset", "Stocks/ETF", "", "USD")
+            .expect("add asset");
+        // Drop only the prices row, so `df` still has the asset but
+        // `df_prices` does not, reproducing a partial-sync mismatch.
+        holdings.df_prices = holdings
+            .df_prices
+            .clone()
+            .lazy()
+            .filter(col("asset_name").neq(lit("Orphan Asset")))
+            .collect()
+            .expect("drop the price row");
+
+        let value = holdings.df_value().expect("compute value");
+        assert_eq!(
+            str_col_to_vec(&value, "01_currency").expect("read currency column"),
+            vec!["USD".to_string()],
+            "an unmatched row must fall back to the holdings row's own currency"
+        );
+        assert_eq!(
+            value
+                .column("01")
+                .expect("value frame has month column")
+                .f64()
+                .expect("month column is f64")
+                .get(0),
+            None,
+            "the missing price row leaves the value null; plots::f64_col reads that as zero"
+        );
+    }
+
+    /// Writing a price together with a currency must store both the number
+    /// and the currency, and record both as separate change-log ops on the
+    /// prices table under the asset's row ID: a peer that applies only one
+    /// of the two cells (see `merge_apply::set_cells`) still ends up with a
+    /// well-formed number/currency pair once both arrive.
+    #[test]
+    #[serial_test::serial]
+    fn set_price_with_currency_writes_both_and_records_both_ops() {
+        let _temp = with_temp_data_home();
+
+        let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        holdings
+            .add_asset("Test Asset", "Stocks/ETF", "", "EUR")
+            .expect("add asset");
+
+        holdings
+            .set_quantity_or_price("Test Asset", 3, 42.0, "price", Some("USD"))
+            .expect("set price with currency");
+
+        assert_eq!(
+            holdings
+                .df_prices
+                .column("03")
+                .expect("prices frame has month column")
+                .f64()
+                .expect("month column is f64")
+                .get(0),
+            Some(42.0)
+        );
+        assert_eq!(
+            str_col_to_vec(&holdings.df_prices, "03_currency").expect("read currency column"),
+            vec!["USD".to_string()]
+        );
+
+        let prices_table = ChangeTable::InvestmentsPrices { year: 2026 };
+        let cell_ops: Vec<ChangeOp> = log_entries()
+            .iter()
+            .filter(|e| e.table == prices_table)
+            .map(|e| e.op.clone())
+            .collect();
+        // `add_asset` records one upsert on this table; the price write
+        // follows it with exactly two cell ops, the number then the
+        // currency.
+        assert_eq!(cell_ops.len(), 3, "one upsert, then two cell writes");
+        assert_eq!(
+            cell_ops[1],
+            ChangeOp::Cell {
+                column: "03".to_string(),
+                value: Value::from(42.0),
+            }
+        );
+        assert_eq!(
+            cell_ops[2],
+            ChangeOp::Cell {
+                column: "03_currency".to_string(),
+                value: Value::from("USD"),
+            }
+        );
+    }
+
+    /// An empty currency on a price write must be rejected, not silently
+    /// stored: an empty string is not a valid currency anywhere else in this
+    /// module either.
+    #[test]
+    #[serial_test::serial]
+    fn set_price_rejects_empty_currency() {
+        let _temp = with_temp_data_home();
+
+        let mut holdings = InvestmentHoldings::new(2026).expect("load holdings");
+        holdings
+            .add_asset("Test Asset", "Stocks/ETF", "", "EUR")
+            .expect("add asset");
+
+        let err = holdings
+            .set_quantity_or_price("Test Asset", 1, 10.0, "price", Some(""))
+            .expect_err("an empty currency must be rejected");
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 
     /// `set_income` (via `recompute`) must still sum the income categories
@@ -3116,7 +3487,8 @@ mod tests {
             DataFrame::new_infer_height(vec![Column::new("currency".into(), &["E", "USD", "E"])])
                 .expect("build test frame");
 
-        let normalized = normalize_currency_column(df).expect("normalize currency column");
+        let normalized =
+            normalize_currency_column(df, "currency").expect("normalize currency column");
 
         assert_eq!(
             str_col_to_vec(&normalized, "currency").expect("read currency column"),
@@ -3132,7 +3504,8 @@ mod tests {
         let df = DataFrame::new_infer_height(vec![Column::new("asset_name".into(), &["Test"])])
             .expect("build test frame");
 
-        let normalized = normalize_currency_column(df.clone()).expect("normalize currency column");
+        let normalized =
+            normalize_currency_column(df.clone(), "currency").expect("normalize currency column");
 
         assert_eq!(normalized.get_column_names(), df.get_column_names());
     }

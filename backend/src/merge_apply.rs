@@ -619,12 +619,17 @@ fn describe(table: &ChangeTable) -> String {
 /// The defaults mirror the data layer: `DetailedExpenses::add_row` stores an
 /// empty `secondary_category` when neither the caller nor a mapping gives
 /// one, `wide_row` zeroes every month column of a new investment, price,
-/// liquidity, or credit and debt row, and `POST /api/investments` stores an
-/// empty `link` when none is given. Recurring templates have no default: the
-/// app requires every field. Changing a default in the data layer means
-/// changing it here too.
+/// liquidity, or credit and debt row (and seeds a price row's twelve
+/// `{month}_currency` columns with the asset's own currency, which is
+/// `"EUR"` here since a peer's batch carries no asset context to seed
+/// from), and `POST /api/investments` stores an empty `link` when none is
+/// given. Recurring templates have no default: the app requires every
+/// field. Changing a default in the data layer means changing it here too.
 fn default_value(table: &ChangeTable, column: &str) -> Value {
     let is_month = month_labels().iter().any(|month| month == column);
+    let is_price_currency = month_labels()
+        .iter()
+        .any(|month| *column == format!("{month}_currency"));
     match table {
         ChangeTable::Expenses { .. } if column == "secondary_category" => Value::from(""),
         ChangeTable::Investments { .. } | ChangeTable::InvestmentsPrices { .. }
@@ -632,6 +637,7 @@ fn default_value(table: &ChangeTable, column: &str) -> Value {
         {
             Value::from("")
         }
+        ChangeTable::InvestmentsPrices { .. } if is_price_currency => Value::from("EUR"),
         ChangeTable::Investments { .. }
         | ChangeTable::InvestmentsPrices { .. }
         | ChangeTable::Liquidity { .. }

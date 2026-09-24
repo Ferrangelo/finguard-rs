@@ -172,6 +172,11 @@ pub struct CategoriesJson {
 pub struct QtyPrice {
     pub qty: f64,
     pub price: f64,
+    /// The currency `price` was entered in, per month, from `df_prices`'s
+    /// `{month}_currency` column. `"EUR"` for an entry saved before that
+    /// column existed. Unrelated to `qty`, which carries no currency.
+    #[serde(default)]
+    pub price_currency: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -180,10 +185,16 @@ pub struct InvestmentAssetJson {
     pub name: String,
     pub category: String,
     pub link: Option<String>,
-    /// Defaults to the empty string for a client that predates this field, the
-    /// same tolerance `fx_rate`/`rate_date` got in the earlier currency step.
-    /// An empty string is a caller bug, not a valid currency; `InvestmentHoldings::new`
-    /// itself never produces one, since it backfills from settings.
+    /// The default currency for a *new* price entry on this asset (see
+    /// `InvestmentHoldings::add_asset`). It does not describe any
+    /// already-stored price, which carries its own currency in
+    /// `QtyPrice::price_currency`; changing this field (`PUT
+    /// /api/investments/:id`) leaves every existing price entry's currency
+    /// untouched. Defaults to the empty string for a client that predates
+    /// this field, the same tolerance `fx_rate`/`rate_date` got in the
+    /// earlier currency step. An empty string is a caller bug, not a valid
+    /// currency; `InvestmentHoldings::new` itself never produces one, since
+    /// it backfills to `"EUR"`.
     #[serde(default)]
     pub currency: String,
     pub data: std::collections::HashMap<i32, std::collections::HashMap<u32, QtyPrice>>,
@@ -434,6 +445,12 @@ pub struct SetInvestmentCellPayload {
     pub month: u32,
     pub field: String, // "quantity" or "price"; see `InvestmentHoldings::set_quantity_or_price`
     pub value: f64,
+    /// The currency to store `value` in, applied only when `field ==
+    /// "price"`; ignored for `"quantity"`, which carries no currency.
+    /// Absent or `null` leaves the stored currency unchanged, so a client
+    /// built against the old contract cannot blank it.
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1527,7 +1544,19 @@ async fn get_investments_handler(
                 .and_then(|c| c.cast(&polars::prelude::DataType::Float64))
                 .and_then(|c| c.f64().map(|s| s.get(i).unwrap_or(0.0)))
                 .unwrap_or(0.0);
-            m_map.insert(m, QtyPrice { qty, price });
+            let price_currency = inv
+                .df_prices
+                .column(&format!("{col}_currency"))
+                .and_then(|c| c.str().map(|s| s.get(i).unwrap_or("EUR").to_string()))
+                .unwrap_or_else(|_| "EUR".to_string());
+            m_map.insert(
+                m,
+                QtyPrice {
+                    qty,
+                    price,
+                    price_currency,
+                },
+            );
         }
         data_map.insert(q.year, m_map);
 
@@ -1576,6 +1605,7 @@ async fn add_investment_handler(
             QtyPrice {
                 qty: 0.0,
                 price: 0.0,
+                price_currency: currency.clone(),
             },
         );
     }
@@ -1669,14 +1699,28 @@ pub struct DeleteAssetQuery {
 /// named `payload.id` in `payload.year`/`payload.month`, saving only the
 /// affected table (`payload.field` selects `"quantity"` or `"price"`).
 ///
+/// `payload.currency` is applied only when `payload.field == "price"`; a
+/// `"quantity"` write ignores it, even if the caller sent one.
+///
 /// Returns [`Error::NotFound`] (`404`) if the asset does not exist,
-/// [`Error::InvalidArgument`] (`400`) for an out-of-range month or an
-/// unrecognized `payload.field`.
+/// [`Error::InvalidArgument`] (`400`) for an out-of-range month, an
+/// unrecognized `payload.field`, or an empty `payload.currency`.
 async fn set_investment_cell_handler(
     Json(payload): Json<SetInvestmentCellPayload>,
 ) -> Result<(), AppError> {
     let mut inv = InvestmentHoldings::new(payload.year)?;
-    inv.set_quantity_or_price(&payload.id, payload.month, payload.value, &payload.field)?;
+    let currency = if payload.field == "price" {
+        payload.currency.as_deref()
+    } else {
+        None
+    };
+    inv.set_quantity_or_price(
+        &payload.id,
+        payload.month,
+        payload.value,
+        &payload.field,
+        currency,
+    )?;
     Ok(())
 }
 
@@ -1961,15 +2005,23 @@ async fn set_credits_debts_cell_handler(
     Ok(())
 }
 
-/// Collect every distinct currency code across `year`'s investment holdings,
-/// liquidity, and credits/debts rows, so [`fx::monthly_rates`] resolves
-/// exactly the currencies the net-worth charts need and nothing else.
+/// Collect every distinct currency code across `year`'s investment holdings
+/// (both the default `currency` on `df` and every price entry's own
+/// `{month}_currency` on `df_prices`), liquidity, and credits/debts rows, so
+/// [`fx::monthly_rates`] resolves exactly the currencies the net-worth
+/// charts need and nothing else. Skipping the per-entry price currencies
+/// here would leave a currency used only in one price cell with no
+/// resolved rate anywhere, so that cell (and the totals depending on it)
+/// would render as unavailable.
 fn networth_currencies(year: i32) -> crate::Result<Vec<String>> {
     let inv = InvestmentHoldings::new(year)?;
     let liq = Liquidity::new(year)?;
     let cd = CreditsDebts::new(year)?;
 
     let mut currencies = str_col_to_vec(&inv.df, "currency")?;
+    for m in 1..=12 {
+        currencies.extend(str_col_to_vec(&inv.df_prices, &format!("{m:02}_currency"))?);
+    }
     currencies.extend(str_col_to_vec(&liq.df, "currency")?);
     currencies.extend(str_col_to_vec(&cd.df, "currency")?);
     currencies.sort();
@@ -3405,6 +3457,91 @@ mod tests {
         assert!(matches!(err.0, crate::Error::NotFound(_)));
     }
 
+    /// `GET /api/investments` must report each month's own `price_currency`
+    /// from `df_prices`, not the asset's default `currency`: March was
+    /// entered in USD, April in EUR, so the response must carry that
+    /// difference through even though the asset's own default stayed EUR.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn get_investments_handler_reports_price_currency_per_month() {
+        let _temp = with_temp_env_offline();
+
+        let mut inv = InvestmentHoldings::new(2026).expect("load holdings");
+        inv.add_asset("Mixed Asset", "Stocks/ETF", "", "EUR")
+            .expect("add asset");
+        inv.set_quantity_or_price("Mixed Asset", 3, 100.0, "price", Some("USD"))
+            .expect("set March price in USD");
+        inv.set_quantity_or_price("Mixed Asset", 4, 90.0, "price", Some("EUR"))
+            .expect("set April price in EUR");
+
+        let response = get_investments_handler(Query(YearQuery { year: 2026 }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("get investments succeeds: {err}"));
+        let asset = response
+            .0
+            .iter()
+            .find(|a| a.id == "Mixed Asset")
+            .expect("the asset is in the response");
+        let month = |m: u32| &asset.data[&2026][&m];
+        assert_eq!(month(3).price, 100.0);
+        assert_eq!(month(3).price_currency, "USD");
+        assert_eq!(month(4).price, 90.0);
+        assert_eq!(month(4).price_currency, "EUR");
+        // A month never priced still reports a currency, defaulting to EUR.
+        assert_eq!(month(5).price_currency, "EUR");
+    }
+
+    /// `POST /api/investments/cell` with `field: "price"` and no `currency`
+    /// must leave the stored currency unchanged, so a client built against
+    /// the old contract cannot blank it. `field: "quantity"` must never
+    /// write a currency, even if the payload includes one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn set_investment_cell_handler_currency_rules() {
+        let _temp = with_temp_env_offline();
+
+        let mut inv = InvestmentHoldings::new(2026).expect("load holdings");
+        inv.add_asset("Test Asset", "Stocks/ETF", "", "EUR")
+            .expect("add asset");
+        inv.set_quantity_or_price("Test Asset", 1, 10.0, "price", Some("USD"))
+            .expect("seed a USD price");
+
+        // A price write with no currency leaves "USD" in place.
+        set_investment_cell_handler(Json(SetInvestmentCellPayload {
+            id: "Test Asset".to_string(),
+            year: 2026,
+            month: 1,
+            field: "price".to_string(),
+            value: 12.0,
+            currency: None,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("price update succeeds: {err}"));
+        let after_price = InvestmentHoldings::new(2026).expect("reload holdings");
+        assert_eq!(
+            str_col_to_vec(&after_price.df_prices, "01_currency").expect("read currency"),
+            vec!["USD".to_string()]
+        );
+
+        // A quantity write that also sends a currency must not apply it.
+        set_investment_cell_handler(Json(SetInvestmentCellPayload {
+            id: "Test Asset".to_string(),
+            year: 2026,
+            month: 1,
+            field: "quantity".to_string(),
+            value: 5.0,
+            currency: Some("GBP".to_string()),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("quantity update succeeds: {err}"));
+        let after_quantity = InvestmentHoldings::new(2026).expect("reload holdings");
+        assert_eq!(
+            str_col_to_vec(&after_quantity.df_prices, "01_currency").expect("read currency"),
+            vec!["USD".to_string()],
+            "a quantity write must never touch the price currency"
+        );
+    }
+
     /// `PUT /api/liquidity/:id` must update the stored currency when the
     /// payload includes one, mirroring
     /// [`update_investment_meta_handler_updates_currency`].
@@ -4397,6 +4534,7 @@ mod tests {
                 month: 2,
                 field: field.to_string(),
                 value: 3.0,
+                currency: None,
             }))
             .await
             .unwrap_or_else(|AppError(err)| panic!("investment cell succeeds: {err}"));

@@ -184,15 +184,23 @@ export type InvestmentCategory = "Stocks/ETF" | "Commodities" | "Bonds";
 /**
  * Mirrors `InvestmentAssetJson` in backend/src/api.rs. `id` is the asset
  * name (assets are keyed by name, not a generated id). `data` is a
- * year -> month -> { qty, price } table, but a single fetch (`getInvestments`
- * takes one `year`) only ever populates the requested year's key; that one
- * year always has all 12 months present, defaulting each to
- * `{ qty: 0, price: 0 }` when unset. JSON object keys are always strings on
- * the wire; the numeric key types here describe the year and month values
- * after the runtime coerces them back to numbers. `currency` is typed as
- * `Currency` for consistency with `LiquidityRow.currency` and
- * `CreditDebtRow.currency`, but the backend column is a free string: an
- * older row could in principle hold a code outside the union.
+ * year -> month -> `QtyPrice` table (see `QtyPrice` in backend/src/api.rs),
+ * but a single fetch (`getInvestments` takes one `year`) only ever populates
+ * the requested year's key; that one year always has all 12 months present,
+ * defaulting each to `{ qty: 0, price: 0, price_currency: currency }` when
+ * unset. `price_currency` is the currency that month's own `price` was
+ * entered in; it is independent of `qty`, which never carries a currency. An
+ * unset or legacy month falls back to this same asset's own `currency`
+ * field below (`add_asset` seeds all 12 months with it at creation), which
+ * itself reads as `"EUR"` only for a file that predates multi-currency
+ * support. JSON object keys are always strings on the wire; the numeric key types
+ * here describe the year and month values after the runtime coerces them
+ * back to numbers. `currency` is typed as `Currency` for consistency with
+ * `LiquidityRow.currency` and `CreditDebtRow.currency`, but the backend
+ * column is a free string: an older row could in principle hold a code
+ * outside the union. It is only the default currency offered for a *new*
+ * price entry on this asset; it does not describe any already-stored price,
+ * which carries its own currency in `price_currency` above.
  */
 export interface InvestmentAsset {
   id: string;
@@ -200,7 +208,7 @@ export interface InvestmentAsset {
   category: InvestmentCategory;
   link?: string;
   currency: Currency;
-  data: Record<number, Record<number, { qty: number; price: number }>>;
+  data: Record<number, Record<number, { qty: number; price: number; price_currency: Currency }>>;
 }
 
 // Matches `df_operations::LIQUIDITY_CATEGORIES` in the backend.

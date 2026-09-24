@@ -123,12 +123,20 @@ fn f64_col(df: &DataFrame, name: &str) -> Result<Vec<f64>> {
         .collect())
 }
 
-/// Sum a numeric month column, converting each row from its own `currency`
-/// column into the reference currency via `rates` before adding it in.
+/// Sum a numeric month column, converting each row from its own
+/// `currency_col` column into the reference currency via `rates` before
+/// adding it in.
 ///
 /// Net-worth rows are not all in the same currency (a holding, a liquidity
 /// asset, or a credit/debt can each carry its own), so summing raw values
 /// directly would add unlike units together. Returns `0.0` for an empty `df`.
+///
+/// `currency_col` names the column to read for each row's currency:
+/// `"currency"` for liquidity and credits/debts, or `"{month:02}_currency"`
+/// for an investment `df_value` row, since a price can be entered in a
+/// different currency each month and `df_value`'s own `currency` column is
+/// only the asset's default, not the currency `col_name`'s value was priced
+/// in.
 ///
 /// A row whose currency is listed in `unavailable_currencies` is dropped from
 /// the sum instead of being looked up in `rates`: that list names currencies
@@ -138,6 +146,7 @@ fn f64_col(df: &DataFrame, name: &str) -> Result<Vec<f64>> {
 fn sum_col_converted(
     df: &DataFrame,
     col_name: &str,
+    currency_col: &str,
     month: u32,
     rates: &MonthlyRates,
     unavailable_currencies: &[String],
@@ -145,7 +154,7 @@ fn sum_col_converted(
     if df.height() == 0 {
         return Ok(0.0);
     }
-    let currencies = str_col(df, "currency")?;
+    let currencies = str_col(df, currency_col)?;
     let values = f64_col(df, col_name)?;
     let mut total = 0.0;
     for (currency, value) in currencies.iter().zip(values.iter()) {
@@ -205,7 +214,15 @@ pub fn networth_allocation_pie(
             .filter(col("category").eq(lit(*cat)))
             .collect()?;
         let val = if cat_df.height() > 0 {
-            sum_col_converted(&cat_df, &col_name, month, rates, unavailable_currencies)?
+            let currency_col = format!("{col_name}_currency");
+            sum_col_converted(
+                &cat_df,
+                &col_name,
+                &currency_col,
+                month,
+                rates,
+                unavailable_currencies,
+            )?
         } else {
             0.0
         };
@@ -218,7 +235,14 @@ pub fn networth_allocation_pie(
     }
 
     let liq_val = if liq.df.height() > 0 {
-        sum_col_converted(&liq.df, &col_name, month, rates, unavailable_currencies)?
+        sum_col_converted(
+            &liq.df,
+            &col_name,
+            "currency",
+            month,
+            rates,
+            unavailable_currencies,
+        )?
     } else {
         0.0
     };
@@ -230,7 +254,14 @@ pub fn networth_allocation_pie(
     }
 
     let cd_val = if cd.df.height() > 0 {
-        sum_col_converted(&cd.df, &col_name, month, rates, unavailable_currencies)?
+        sum_col_converted(
+            &cd.df,
+            &col_name,
+            "currency",
+            month,
+            rates,
+            unavailable_currencies,
+        )?
     } else {
         0.0
     };
@@ -302,9 +333,11 @@ pub fn networth_evolution_line(
             .enumerate()
             .map(|(i, c)| -> Result<f64> {
                 Ok(if has_rows {
+                    let currency_col = format!("{c}_currency");
                     round2_half_even(sum_col_converted(
                         &cat_df,
                         c,
+                        &currency_col,
                         (i + 1) as u32,
                         rates,
                         unavailable_currencies,
@@ -329,6 +362,7 @@ pub fn networth_evolution_line(
                 round2_half_even(sum_col_converted(
                     &liq.df,
                     c,
+                    "currency",
                     (i + 1) as u32,
                     rates,
                     unavailable_currencies,
@@ -352,6 +386,7 @@ pub fn networth_evolution_line(
                 round2_half_even(sum_col_converted(
                     &cd.df,
                     c,
+                    "currency",
                     (i + 1) as u32,
                     rates,
                     unavailable_currencies,
@@ -557,6 +592,111 @@ mod tests {
             .find(|s| s.name == "Liquidity")
             .expect("liquidity slice");
         assert_eq!(liquidity_slice.value, 1090.0);
+    }
+
+    /// Two months of one investment asset, each entered in a different
+    /// currency, must each convert at their own month's rate: `df_value`
+    /// carries `df_prices`'s `{month}_currency` columns through, and
+    /// `sum_col_converted` must read the matching month's currency, not the
+    /// asset's default `currency`. March: `10 * 100 USD` at `0.90` is `900`;
+    /// April: `10 * 100 EUR` needs no conversion and stays `1000`. A
+    /// per-asset conversion (the pre-fix behavior) would instead apply the
+    /// asset's default EUR to both months and read `1000` for March too.
+    #[test]
+    #[serial_test::serial]
+    fn investment_price_currency_is_converted_per_entry_not_per_asset() {
+        let _temp = with_temp_data_home();
+        let year = 2026;
+
+        let mut inv = InvestmentHoldings::new(year).expect("load investments");
+        inv.add_asset("Mixed Asset", "Stocks/ETF", "", "EUR")
+            .expect("add investment asset");
+        inv.set_quantity("Mixed Asset", 3, 10.0)
+            .expect("set March quantity");
+        inv.set_quantity_or_price("Mixed Asset", 3, 100.0, "price", Some("USD"))
+            .expect("set March price in USD");
+        inv.set_quantity("Mixed Asset", 4, 10.0)
+            .expect("set April quantity");
+        inv.set_quantity_or_price("Mixed Asset", 4, 100.0, "price", Some("EUR"))
+            .expect("set April price in EUR");
+
+        let rates_by_month: BTreeMap<u32, BTreeMap<String, f64>> = (1..=12u32)
+            .map(|month| {
+                let mut month_rates = BTreeMap::new();
+                month_rates.insert("USD".to_string(), 0.90);
+                (month, month_rates)
+            })
+            .collect();
+        let rates = MonthlyRates::for_test("EUR", rates_by_month);
+
+        let evolution = networth_evolution_line(year, &rates, &[])
+            .expect("compute evolution")
+            .expect("non-zero net worth");
+        let stocks = evolution
+            .components
+            .iter()
+            .find(|c| c.name == "Stocks/ETF")
+            .expect("stocks component");
+        assert_eq!(stocks.values[2], 900.0, "March: 10 * 100 USD at 0.90");
+        assert_eq!(
+            stocks.values[3], 1000.0,
+            "April: 10 * 100 EUR, no conversion"
+        );
+    }
+
+    /// A holdings row with no matching row in `df_prices` (the two files can
+    /// disagree, for example after a partial sync) must still let both
+    /// net-worth endpoints succeed, valuing that asset at zero, instead of
+    /// failing the whole year: before the fix, the row's null
+    /// `{month}_currency` read as `""`, and `MonthlyRates::rate` errored on
+    /// an unresolvable empty currency rather than being skipped.
+    #[test]
+    #[serial_test::serial]
+    fn orphaned_holdings_row_values_at_zero_instead_of_failing_the_request() {
+        let _temp = with_temp_data_home();
+        let year = 2026;
+
+        let mut inv = InvestmentHoldings::new(year).expect("load investments");
+        // The asset's own currency is the reference currency, so the fixed
+        // fallback resolves with an identity rate and needs no entry in
+        // `rates`: this isolates the bug (an empty-string currency has no
+        // resolvable rate at all) from an ordinary "currency not in the rate
+        // table" case, which is not what this test is about.
+        inv.add_asset("Orphan Asset", "Stocks/ETF", "", "EUR")
+            .expect("add asset");
+        inv.set_quantity("Orphan Asset", 1, 10.0)
+            .expect("set quantity");
+        // Drop only the prices row, reproducing a partial-sync mismatch: the
+        // holdings row survives, but its price row does not.
+        inv.df_prices = inv
+            .df_prices
+            .clone()
+            .lazy()
+            .filter(col("asset_name").neq(lit("Orphan Asset")))
+            .collect()
+            .expect("drop the price row");
+        inv.save_df_prices()
+            .expect("save the mismatched prices file");
+
+        let rates = MonthlyRates::for_test("EUR", BTreeMap::new());
+
+        let evolution = networth_evolution_line(year, &rates, &[]).expect("compute evolution");
+        if let Some(evolution) = &evolution {
+            let stocks = evolution
+                .components
+                .iter()
+                .find(|c| c.name == "Stocks/ETF")
+                .expect("stocks component");
+            assert_eq!(stocks.values[0], 0.0);
+        }
+
+        let pie = networth_allocation_pie(year, 1, &rates, &[]).expect("compute allocation");
+        if let Some(pie) = &pie {
+            assert!(
+                pie.slices.iter().all(|s| s.name != "Stocks/ETF"),
+                "a zero-valued slice is dropped, not reported as a nonzero amount"
+            );
+        }
     }
 
     /// A currency present in the data but absent from the rate table, and not

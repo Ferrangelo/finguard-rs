@@ -19,7 +19,7 @@ import { ExternalLink, Plus } from "lucide-react";
 import { useApp } from "@/context/AppContext";
 import * as api from "@/services/api";
 import { MONTHS, MONTHS_SHORT } from "@/services/api";
-import { CURRENCIES, formatRef, referenceToDisplay } from "@/services/fx";
+import { CURRENCIES, formatRef, nativeToReference, referenceToDisplay } from "@/services/fx";
 import { GlassCard } from "@/components/finguard/GlassCard";
 import { SubTabs } from "@/components/finguard/SubTabs";
 import { MathInput } from "@/components/finguard/MathInput";
@@ -125,6 +125,24 @@ function fmtOrDash(value: number | null, currency: Currency): ReactNode {
   return formatRef(value, currency);
 }
 
+/**
+ * The month-end factor that converts `currency` into `refCurrency` for
+ * calendar month `m` of `rates`, for `InvestmentsTab`'s per-entry price
+ * conversion. `rate_to_reference` never carries the reference currency
+ * itself (see `MonthlyFxRates` in services/types.ts), so this forces the
+ * factor to 1 in that case instead of reading as "no rate found" and
+ * dropping every price already in the reference currency to a dash.
+ */
+function monthRateToReference(
+  rates: MonthlyFxRates | null,
+  m: number,
+  currency: string,
+  refCurrency: Currency,
+): number | undefined {
+  if (currency === refCurrency) return 1;
+  return rates?.months.find((r) => r.month === m)?.rate_to_reference[currency];
+}
+
 export const Route = createFileRoute("/networth")({
   head: () => ({ meta: [{ title: "Net Worth · Finguard" }] }),
   component: NetWorthPage,
@@ -165,6 +183,14 @@ function NetWorthPage() {
 const INV_CATS: InvestmentCategory[] = ["Stocks/ETF", "Commodities", "Bonds"];
 const LIQ_CATS = ["Bank/Broker account", "Cash", "Other"] as const;
 
+// Investments table empty-state colSpan: Asset, Category, Link, 12 months
+// and the actions column (16), plus the Currency column in the Prices view
+// only. The Value view hides it because its cells are in the reference
+// currency, not the asset's own. One constant pair so the colSpan cannot
+// drift from the header's actual column count.
+const INVESTMENTS_COLSPAN_WITHOUT_CURRENCY = 16;
+const INVESTMENTS_COLSPAN_WITH_CURRENCY = INVESTMENTS_COLSPAN_WITHOUT_CURRENCY + 1;
+
 // ────────────────────────────────────────────────────────────── Investments
 function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
   const colorAt = useChartColors();
@@ -193,20 +219,68 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
     };
   }, [year, refreshTick]);
 
+  // Month-end fx rates for every currency appearing in this year's price
+  // entries (the backend's `networth_currencies` already folds those in, so
+  // this fetch takes no `currencies` argument). `null` always means
+  // "loading", never "stale", because it is reset at the start of every
+  // re-run below, including a plain reference-currency change: the endpoint
+  // resolves against the server-side setting, so `refCurrency` must be a
+  // dependency even though it changes no request parameter.
+  const [rates, setRates] = useState<MonthlyFxRates | null>(null);
+  const [ratesError, setRatesError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    setRates(null);
+    setRatesError(null);
+    api
+      .getMonthlyFxRates(year)
+      .then((r) => active && setRates(r))
+      .catch((err) => {
+        if (active) setRatesError(errorMessage(err, "Failed to load exchange rates"));
+      });
+    return () => {
+      active = false;
+    };
+  }, [year, refreshTick, refCurrency]);
+
+  // Price-entry currencies this year's loaded assets actually use that the
+  // fetch above could not resolve into `refCurrency`. Distinct from
+  // `rates.unavailable_currencies` itself, which can list a currency no
+  // asset here uses at all (e.g. only present in liquidity rows).
+  const missingRateCurrencies = rates
+    ? Array.from(
+        new Set(
+          assets.flatMap((a) =>
+            Object.values(a.data[year] ?? {}).map((c) => c.price_currency || a.currency),
+          ),
+        ),
+      ).filter((c) => rates.unavailable_currencies.includes(c))
+    : [];
+
   // Optimistic update: see the file-level comment on cell edits above.
-  const setCell = async (id: string, m: number, field: "qty" | "price", v: number) => {
+  // `currency` is only meaningful when `field` is `"price"`; a quantity edit
+  // never passes one.
+  const setCell = async (
+    id: string,
+    m: number,
+    field: "qty" | "price",
+    v: number,
+    currency?: Currency,
+  ) => {
     setAssets((prev) =>
       prev.map((a) => {
         if (a.id !== id) return a;
         const d = { ...a.data };
         if (!d[year]) d[year] = {};
-        const cur = d[year][m] ?? { qty: 0, price: 0 };
-        d[year] = { ...d[year], [m]: { ...cur, [field]: v } };
+        const cur = d[year][m] ?? { qty: 0, price: 0, price_currency: a.currency };
+        const next = { ...cur, [field]: v };
+        if (field === "price" && currency) next.price_currency = currency;
+        d[year] = { ...d[year], [m]: next };
         return { ...a, data: d };
       }),
     );
     try {
-      await api.setInvestmentCell(id, year, m, field, v);
+      await api.setInvestmentCell(id, year, m, field, v, field === "price" ? currency : undefined);
       notify("success", "Saved");
     } catch (err) {
       notify("error", err instanceof Error ? err.message : "Save failed");
@@ -221,9 +295,9 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
           value={view}
           onChange={setView}
           options={[
-            { value: "holdings", label: "Holdings (qty)" },
+            { value: "holdings", label: "Holdings (quantity)" },
             { value: "prices", label: "Prices" },
-            { value: "value", label: "Value (qty × price)" },
+            { value: "value", label: "Value (quantity × price)" },
           ]}
         />
         <button
@@ -249,6 +323,27 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
 
       {loadError && <ErrorBanner message={`Could not load investments: ${loadError}`} />}
 
+      {view === "prices" && (
+        <p className="text-sm text-muted-foreground">
+          Prices are entered in each asset's own currency, set below in the Currency column. Switch
+          to the Value view to see these figures converted into {refCurrency}.
+        </p>
+      )}
+      {view === "value" && (
+        <p className="text-sm text-muted-foreground">
+          Figures below are quantity × price, converted into {refCurrency} at each month's own
+          month-end rate; none of these are the native price amount.
+        </p>
+      )}
+      {view === "value" && ratesError && (
+        <ErrorBanner message={`Could not load exchange rates: ${ratesError}`} />
+      )}
+      {view === "value" && missingRateCurrencies.length > 0 && (
+        <ErrorBanner
+          message={`No exchange rate available for ${missingRateCurrencies.join(", ")}. Affected figures show as a dash instead of a converted amount.`}
+        />
+      )}
+
       <GlassCard title={`Investments · ${year}`}>
         <div className="scrollbar-thin overflow-x-auto">
           <table className="w-full min-w-[1200px] text-sm">
@@ -256,7 +351,14 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
               <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
                 <th className="px-3 py-2 font-medium">Asset</th>
                 <th className="px-3 py-2 font-medium">Category</th>
-                <th className="px-3 py-2 font-medium">Currency</th>
+                {view === "prices" && (
+                  <th
+                    className="px-3 py-2 font-medium"
+                    title="The currency every price entered on this row is stored in. Changing it applies to prices you edit from now on; it does not relabel or convert months already saved."
+                  >
+                    Currency
+                  </th>
+                )}
                 <th className="px-3 py-2 font-medium">Link</th>
                 {MONTHS_SHORT.map((m) => (
                   <th key={m} className="px-2 py-2 text-right font-medium">
@@ -313,31 +415,33 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
                         </span>
                       )}
                     </td>
-                    <td className="px-3 py-1.5">
-                      {isEdit ? (
-                        <select
-                          defaultValue={a.currency}
-                          onChange={(e) =>
-                            api
-                              .updateInvestmentMeta(
-                                a.id,
-                                { currency: e.target.value as Currency },
-                                year,
-                              )
-                              .then(refresh)
-                          }
-                          className="rounded border border-border bg-surface/60 px-2 py-0.5 text-xs"
-                        >
-                          {CURRENCIES.map((c) => (
-                            <option key={c} value={c}>
-                              {c}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">{a.currency}</span>
-                      )}
-                    </td>
+                    {view === "prices" && (
+                      <td className="px-3 py-1.5">
+                        {isEdit ? (
+                          <select
+                            defaultValue={a.currency}
+                            onChange={(e) =>
+                              api
+                                .updateInvestmentMeta(
+                                  a.id,
+                                  { currency: e.target.value as Currency },
+                                  year,
+                                )
+                                .then(refresh)
+                            }
+                            className="rounded border border-border bg-surface/60 px-2 py-0.5 text-xs"
+                          >
+                            {CURRENCIES.map((c) => (
+                              <option key={c} value={c}>
+                                {c}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">{a.currency}</span>
+                        )}
+                      </td>
+                    )}
                     <td className="px-3 py-1.5">
                       {isEdit ? (
                         <input
@@ -364,21 +468,69 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
                     </td>
                     {MONTHS_SHORT.map((_, i) => {
                       const m = i + 1;
-                      const cell = a.data[year]?.[m] ?? { qty: 0, price: 0 };
-                      if (view === "value") {
+                      const cell = a.data[year]?.[m] ?? {
+                        qty: 0,
+                        price: 0,
+                        price_currency: a.currency,
+                      };
+
+                      if (view === "holdings") {
                         return (
-                          <td key={m} className="px-2 py-1.5 text-right tabular-nums text-xs">
-                            {(cell.qty * cell.price).toFixed(0)}
+                          <td key={m} className="px-1 py-1">
+                            <MathInput
+                              value={cell.qty}
+                              onCommit={(v) => setCell(a.id, m, "qty", v)}
+                            />
                           </td>
                         );
                       }
-                      const field = view === "holdings" ? "qty" : "price";
+
+                      if (view === "prices") {
+                        // The row's own Currency column (below) is the only
+                        // currency control now; every price commit sends
+                        // `a.currency` automatically, mirroring the Expense
+                        // tab's one-currency-per-row model instead of a
+                        // per-cell picker.
+                        return (
+                          <td key={m} className="px-1 py-1">
+                            <MathInput
+                              value={cell.price}
+                              onCommit={(v) => setCell(a.id, m, "price", v, a.currency)}
+                            />
+                          </td>
+                        );
+                      }
+
+                      // view === "value": quantity × price converted into
+                      // the reference currency at that entry's own stored
+                      // currency and month, the row's counterpart to the
+                      // Expense tab's separate "Ref (refCurrency)" column.
+                      // A price entry saved before per-entry currency
+                      // existed, or before the user last changed this row's
+                      // Currency, can still carry a currency other than
+                      // `a.currency`, so this reads the entry's own
+                      // `price_currency` rather than assuming today's row
+                      // setting applied when it was saved.
+                      const cellCurrency = cell.price_currency || a.currency;
+                      const rate = monthRateToReference(rates, m, cellCurrency, refCurrency);
+                      const converted = nativeToReference(cell.qty * cell.price, rate);
                       return (
-                        <td key={m} className="px-1 py-1">
-                          <MathInput
-                            value={cell[field]}
-                            onCommit={(v) => setCell(a.id, m, field, v)}
-                          />
+                        <td key={m} className="px-2 py-1.5 text-right tabular-nums text-xs">
+                          {converted === null ? (
+                            <span
+                              className="text-warning"
+                              title={`No exchange rate available for ${cellCurrency} in ${MONTHS_SHORT[m - 1]} ${year}`}
+                            >
+                              —
+                            </span>
+                          ) : (
+                            <>
+                              {converted.toFixed(0)}{" "}
+                              <span className="text-[10px] text-muted-foreground">
+                                {refCurrency}
+                              </span>
+                            </>
+                          )}
                         </td>
                       );
                     })}
@@ -404,7 +556,14 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
               })}
               {assets.length === 0 && !loadError && (
                 <tr>
-                  <td colSpan={17} className="px-3 py-8 text-center text-muted-foreground">
+                  <td
+                    colSpan={
+                      view === "prices"
+                        ? INVESTMENTS_COLSPAN_WITH_CURRENCY
+                        : INVESTMENTS_COLSPAN_WITHOUT_CURRENCY
+                    }
+                    className="px-3 py-8 text-center text-muted-foreground"
+                  >
                     No investments yet.
                   </td>
                 </tr>

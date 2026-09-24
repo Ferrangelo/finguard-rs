@@ -360,7 +360,7 @@ export async function getMonthlySpendingByPrimary(year: number): Promise<Monthly
   return apiFetch(`/api/cashflow/spending?year=${year}`);
 }
 
-/** GET /api/investments. Lists every investment asset with its qty/price data for `year` (see `InvestmentAsset.data`). */
+/** GET /api/investments. Lists every investment asset with its qty/price data for `year`, including each month's own price currency (see `InvestmentAsset.data`). */
 export async function getInvestments(year: number): Promise<InvestmentAsset[]> {
   return apiFetch(`/api/investments?year=${year}`);
 }
@@ -414,20 +414,27 @@ export async function deleteInvestment(id: string, year: number): Promise<void> 
   await apiFetch(`/api/investments/${encodeURIComponent(id)}?year=${year}`, { method: "DELETE" });
 }
 
-/** POST /api/investments/cell. Sets a single month's quantity or price for one asset. */
+/**
+ * POST /api/investments/cell. Sets a single month's quantity or price for
+ * one asset. `currency` is meaningful only when `field` is `"price"`; the
+ * backend ignores it for `"quantity"`, which carries no currency. Omitting
+ * it leaves the stored currency unchanged, so a plain price edit does not
+ * need to resend it.
+ */
 export async function setInvestmentCell(
   id: string,
   year: number,
   month: number,
   field: "qty" | "price",
   value: number,
+  currency?: Currency,
 ): Promise<void> {
   // The backend accepts "quantity" or "price"; "qty" is only the in-memory field name.
   const wireField = field === "qty" ? "quantity" : field;
   await apiFetch("/api/investments/cell", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, year, month, field: wireField, value }),
+    body: JSON.stringify({ id, year, month, field: wireField, value, currency }),
   });
 }
 
