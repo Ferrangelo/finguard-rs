@@ -14,7 +14,10 @@ import { cn } from "@/lib/utils";
  * that unchanged value. Cancelling an edit therefore still issues one save.
  */
 export function MathInput({
-  value, onCommit, placeholder, className,
+  value,
+  onCommit,
+  placeholder,
+  className,
 }: {
   value: number;
   onCommit: (v: number) => void;
@@ -30,8 +33,10 @@ export function MathInput({
 
   const commit = () => {
     const v = evalMath(draft);
-    if (Number.isFinite(v)) { onCommit(v); setDraft(String(v)); }
-    else setDraft(Number.isFinite(value) ? String(value) : "");
+    if (Number.isFinite(v)) {
+      onCommit(v);
+      setDraft(String(v));
+    } else setDraft(Number.isFinite(value) ? String(value) : "");
   };
 
   return (
@@ -42,10 +47,16 @@ export function MathInput({
       placeholder={placeholder}
       onFocus={() => setFocused(true)}
       onChange={(e) => setDraft(e.target.value)}
-      onBlur={() => { setFocused(false); commit(); }}
+      onBlur={() => {
+        setFocused(false);
+        commit();
+      }}
       onKeyDown={(e) => {
         if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-        if (e.key === "Escape") { setDraft(String(value)); (e.target as HTMLInputElement).blur(); }
+        if (e.key === "Escape") {
+          setDraft(String(value));
+          (e.target as HTMLInputElement).blur();
+        }
       }}
       className={cn(
         "w-full rounded-md border border-transparent bg-transparent px-2 py-1 text-right text-sm tabular-nums",

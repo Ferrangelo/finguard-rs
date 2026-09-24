@@ -9,15 +9,28 @@ import { cn } from "@/lib/utils";
  * click.
  */
 export function ConfirmButton({
-  onConfirm, label = "Delete", confirmLabel = "Confirm?", className,
-}: { onConfirm: () => void; label?: string; confirmLabel?: string; className?: string }) {
+  onConfirm,
+  label = "Delete",
+  confirmLabel = "Confirm?",
+  className,
+}: {
+  onConfirm: () => void;
+  label?: string;
+  confirmLabel?: string;
+  className?: string;
+}) {
   const [armed, setArmed] = useState(false);
   return (
     <button
       type="button"
       onClick={() => {
-        if (armed) { onConfirm(); setArmed(false); }
-        else { setArmed(true); setTimeout(() => setArmed(false), 2500); }
+        if (armed) {
+          onConfirm();
+          setArmed(false);
+        } else {
+          setArmed(true);
+          setTimeout(() => setArmed(false), 2500);
+        }
       }}
       className={cn(
         "rounded-md border px-2 py-1 text-xs font-medium transition-all",

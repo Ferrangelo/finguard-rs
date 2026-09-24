@@ -21,6 +21,7 @@ The application includes 7 predefined themes:
 ### Components
 
 #### `ThemeContext.tsx` (`src/context/ThemeContext.tsx`)
+
 - **Provider:** `ThemeProvider` - Wraps the app to manage theme state
 - **Hook:** `useTheme()` - Access theme state in any component
 - **Features:**
@@ -29,6 +30,7 @@ The application includes 7 predefined themes:
   - Type-safe theme selection
 
 #### `ThemeSwitcher.tsx` (`src/components/ThemeSwitcher.tsx`)
+
 - Dropdown menu component for theme selection
 - Shows current theme with checkmark
 - Theme icons for visual identification
@@ -37,6 +39,7 @@ The application includes 7 predefined themes:
 ### CSS Files
 
 Each theme is defined as a complete CSS file in `src/styles/`:
+
 - `arctic.css`
 - `midnight.css`
 - `dusk.css`
@@ -94,9 +97,7 @@ export function MyComponent() {
   return (
     <div>
       <p>Current theme: {theme}</p>
-      <button onClick={() => setTheme('arctic')}>
-        Switch to Arctic
-      </button>
+      <button onClick={() => setTheme("arctic")}>Switch to Arctic</button>
     </div>
   );
 }
@@ -143,6 +144,7 @@ src/
 4. Add label and icon to `THEME_LABELS` in `ThemeSwitcher.tsx`
 
 Example:
+
 ```css
 /* src/styles/myTheme.css */
 @import "tailwindcss" source(none);
@@ -169,16 +171,19 @@ Edit the corresponding CSS file in `src/styles/` and adjust color values. Change
 ## Technical Details
 
 ### CSS Variable Scope
+
 - Variables are defined in `:root` selector (global scope)
 - Tailwind's `@theme` directive creates utility classes from these variables
 - Custom utilities (`.glass`, `.text-gradient`, etc.) reference these variables
 
 ### Dark Mode Support
+
 - Each theme CSS file includes its own dark mode styling
 - Uses `@custom-variant dark (&:is(.dark *))` for dark mode state
 - HTML element has `className="dark"` applied in `__root.tsx`
 
 ### Performance Considerations
+
 - Theme stylesheets are dynamically injected/removed
 - Old stylesheet is removed before new one is added (prevents conflicts)
 - localStorage saves user preference (minimal overhead)
@@ -187,16 +192,19 @@ Edit the corresponding CSS file in `src/styles/` and adjust color values. Change
 ## Troubleshooting
 
 ### Theme Not Persisting
+
 - Check browser localStorage is enabled
 - Verify `THEME_STORAGE_KEY` matches in ThemeContext
 - Check browser console for errors
 
 ### Theme Not Applying
+
 - Ensure theme CSS file exists in `src/styles/`
 - Verify theme name matches filename exactly
 - Check network tab to ensure CSS is loading
 
 ### Theme Flickering on Page Load
+
 - This is expected if theme is different from default
 - `ThemeProvider` applies theme on mount before render
 - Consider adding a loading state if this is problematic
