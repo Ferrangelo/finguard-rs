@@ -1,0 +1,256 @@
+name: Release Android APK
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+# Keep these matched to .devcontainer/Containerfile, where the local builds get
+# the same toolchain. mobile/ was generated with this tauri-cli version.
+env:
+  TAURI_CLI_VERSION: 2.11.4
+  NDK_VERSION: 30.0.16248370
+  ANDROID_PLATFORM: android-36
+  ANDROID_BUILD_TOOLS: 35.0.0
+
+jobs:
+  # Builds the unsigned arm64 release APK. This job never sees the signing key: it runs
+  # npm, every Rust build script and proc macro, and the Gradle/AGP toolchain, any of
+  # which could be compromised by a supply-chain attack, and none of them needs to run
+  # next to a key that cannot be revoked if stolen.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      apk_name: ${{ steps.name.outputs.name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check that the tag matches the app version
+        if: github.ref_type == 'tag'
+        run: |
+          conf_version=$(jq -r .version mobile/src-tauri/tauri.conf.json)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$conf_version" != "$tag_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $conf_version in mobile/src-tauri/tauri.conf.json. Set the version there, commit, and tag that commit."
+            exit 1
+          fi
+
+      - name: Compute the release APK name
+        id: name
+        run: |
+          version=$(jq -r .version mobile/src-tauri/tauri.conf.json)
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            name="finguard-${version}-arm64"
+          else
+            name="finguard-${version}-${GITHUB_SHA::7}-arm64"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      # The release build of the backend and Polars needs several GB of disk.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache/CodeQL
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: |
+            mobile/src-tauri/gen/android/**/*.gradle*
+            mobile/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # `yes` ends with SIGPIPE when sdkmanager exits, which pipefail would
+      # report as a failure, hence `|| true` inside the group.
+      - name: Install Android SDK packages
+        run: |
+          { yes || true; } | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;${NDK_VERSION}" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" > /dev/null
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-linux-android
+          rustup default stable
+
+      - name: Cache Cargo registry and tauri-cli
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cargo/bin/cargo-tauri
+          key: cargo-android-${{ runner.os }}-tauri-${{ env.TAURI_CLI_VERSION }}-${{ hashFiles('mobile/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cargo-android-${{ runner.os }}-tauri-${{ env.TAURI_CLI_VERSION }}-
+
+      - name: Install tauri-cli
+        run: |
+          if ! cargo tauri --version 2>/dev/null | grep -qx "tauri-cli ${TAURI_CLI_VERSION}"; then
+            cargo install tauri-cli --locked --version "${TAURI_CLI_VERSION}" --force
+          fi
+
+      # No FINGUARD_ANDROID_* variables here: the app/build.gradle.kts release build
+      # type has no signing config, so this always produces an unsigned APK. Signing
+      # happens in the sign job, which is the only job that receives the key.
+      - name: Build the unsigned release APK
+        working-directory: mobile
+        run: cargo tauri android build --apk --target aarch64 --ci
+
+      - name: Stage the unsigned APK
+        run: |
+          shopt -s nullglob globstar
+          apks=(mobile/src-tauri/gen/android/app/build/outputs/apk/**/release/*.apk)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "::error::Expected one unsigned release APK, found ${#apks[@]}: ${apks[*]}"
+            exit 1
+          fi
+          mkdir -p dist-apk-unsigned
+          cp "${apks[0]}" "dist-apk-unsigned/${{ steps.name.outputs.name }}-unsigned.apk"
+
+      - name: Upload the unsigned APK artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: finguard-apk-unsigned
+          path: dist-apk-unsigned/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Signs the unsigned APK. This is the only job with the signing secrets, and the only
+  # steps it runs are GitHub actions plus zipalign and apksigner from the runner's
+  # preinstalled Android SDK: no checkout, no npm, no cargo, no Gradle.
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download the unsigned APK artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: finguard-apk-unsigned
+          path: unsigned
+
+      - name: Check that the signing secrets are set
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          missing=()
+          [ -z "$ANDROID_KEYSTORE_BASE64" ] && missing+=(ANDROID_KEYSTORE_BASE64)
+          [ -z "$ANDROID_KEYSTORE_PASSWORD" ] && missing+=(ANDROID_KEYSTORE_PASSWORD)
+          [ -z "$ANDROID_KEY_ALIAS" ] && missing+=(ANDROID_KEY_ALIAS)
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::Missing repository secret(s): ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Decode the signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          keystore="$RUNNER_TEMP/finguard-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          echo "KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
+
+      - name: Sign and verify the APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          shopt -s nullglob
+          unsigned=(unsigned/*-unsigned.apk)
+          if [ "${#unsigned[@]}" -ne 1 ]; then
+            echo "::error::Expected one unsigned APK in the artifact, found ${#unsigned[@]}: ${unsigned[*]}"
+            exit 1
+          fi
+          zipalign="$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/zipalign"
+          apksigner="$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          name="${{ needs.build.outputs.apk_name }}"
+          signed="$RUNNER_TEMP/$name.apk"
+          # AGP already zipaligns its packaged output; align only if that check fails,
+          # so a future AGP change that stops zipaligning does not silently ship an
+          # unaligned APK.
+          if "$zipalign" -c -p 4 "${unsigned[0]}"; then
+            to_sign="${unsigned[0]}"
+          else
+            to_sign="$RUNNER_TEMP/aligned.apk"
+            "$zipalign" -p 4 "${unsigned[0]}" "$to_sign"
+          fi
+          "$apksigner" sign \
+            --ks "$KEYSTORE_PATH" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --out "$signed" \
+            "$to_sign"
+          "$apksigner" verify --verbose --print-certs "$signed"
+          mkdir -p dist-apk
+          cp "$signed" "dist-apk/$name.apk"
+          (cd dist-apk && sha256sum "$name.apk" > "$name.apk.sha256")
+
+      - name: Delete the signing keystore
+        if: always()
+        run: rm -f "$KEYSTORE_PATH"
+
+      - name: Upload the signed APK artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: finguard-apk
+          path: dist-apk/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: sign
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the signed APK artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: finguard-apk
+          path: dist-apk
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist-apk/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "finguard $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
