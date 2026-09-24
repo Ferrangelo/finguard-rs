@@ -6,7 +6,20 @@
 // in `<head>` rather than toggling a class, so unrelated component code
 // never needs to branch on the active theme. The chosen theme persists in
 // localStorage under `THEME_STORAGE_KEY` and is re-applied on every mount.
+//
+// Theme files are imported with Vite's `?url` suffix, the same mechanism
+// `src/routes/__root.tsx` uses for `styles.css`, so each resolves to a
+// hashed asset path in a production build. A plain `/src/styles/...` path
+// only resolves under the Vite dev server, not in a built bundle.
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+
+import arcticCss from "../styles/arctic.css?url";
+import midnightCss from "../styles/midnight.css?url";
+import duskCss from "../styles/dusk.css?url";
+import emberCss from "../styles/ember.css?url";
+import forestCss from "../styles/forest.css?url";
+import pitchCss from "../styles/pitch.css?url";
+import originalCss from "../styles/original.css?url";
 
 type Theme = "arctic" | "midnight" | "dusk" | "ember" | "forest" | "pitch" | "original";
 
@@ -29,6 +42,16 @@ const AVAILABLE_THEMES: Theme[] = [
 ];
 const DEFAULT_THEME: Theme = "midnight";
 const THEME_STORAGE_KEY = "finguard-theme";
+
+const THEME_URLS: Record<Theme, string> = {
+  arctic: arcticCss,
+  midnight: midnightCss,
+  dusk: duskCss,
+  ember: emberCss,
+  forest: forestCss,
+  pitch: pitchCss,
+  original: originalCss,
+};
 
 /**
  * Provides the active theme and `setTheme` to descendants. Renders its
@@ -89,7 +112,7 @@ function applyTheme(theme: Theme) {
   // Create and append the new theme stylesheet
   const link = document.createElement("link");
   link.rel = "stylesheet";
-  link.href = `/src/styles/${theme}.css`;
+  link.href = THEME_URLS[theme];
   link.dataset.theme = theme;
   document.head.appendChild(link);
 }

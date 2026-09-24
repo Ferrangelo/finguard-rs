@@ -63,7 +63,20 @@ The CSS files define Tailwind CSS theme variables using the `@theme` directive.
      - Removes old theme stylesheet
      - Injects new theme stylesheet
 
-3. **Persistence:**
+3. **CSS URL resolution:**
+   - Each theme file is imported in `ThemeContext.tsx` with Vite's `?url`
+     suffix (the same mechanism `src/routes/__root.tsx` uses for
+     `styles.css`), producing a `THEME_URLS` map from theme name to a
+     resolved URL.
+   - In development this resolves to the dev server's path under
+     `src/styles/`. In a production build it resolves to the hashed asset
+     Vite emits, for example `assets/arctic-<hash>.css`.
+   - `applyTheme()` sets the injected `<link>`'s `href` from `THEME_URLS`,
+     never a hand-built `/src/styles/${theme}.css` path, so theme switching
+     works the same way in the dev server, the web production build, and
+     the Android app's bundled build.
+
+4. **Persistence:**
    - Theme preference is saved in `localStorage['finguard-theme']`
    - Preference persists across browser sessions
    - No app restart required
