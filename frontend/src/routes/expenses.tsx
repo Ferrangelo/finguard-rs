@@ -1467,7 +1467,7 @@ function RecurringTab() {
     return () => {
       active = false;
     };
-  }, [dateReady, refreshTick]);
+  }, [dateReady, refreshTick, year]);
 
   const submit = async () => {
     const amt = evalMath(form.amount);
