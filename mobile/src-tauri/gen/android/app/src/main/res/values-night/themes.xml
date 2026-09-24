@@ -2,5 +2,10 @@
     <!-- Base application theme. -->
     <style name="Theme.finguard_mobile" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <!-- Customize your theme here. -->
+        <!-- Fixed dark background behind the edge-to-edge WebView, so the strip
+             padded for the status/navigation bar insets is never blank/white.
+             Same value as values/themes.xml: kept fixed regardless of the
+             system light/dark setting, not just the in-app theme. -->
+        <item name="android:windowBackground">@color/status_bar_background</item>
     </style>
 </resources>

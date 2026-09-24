@@ -7,4 +7,8 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <!-- Fixed status/navigation-bar strip color, approximating the Midnight
+         theme's dark background. Deliberately not tied to the in-app theme
+         picker: the window background is native and cannot follow it. -->
+    <color name="status_bar_background">#FF0A0D15</color>
 </resources>
