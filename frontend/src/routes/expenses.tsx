@@ -1400,7 +1400,6 @@ function RecurringTab() {
   const [cats, setCats] = useState<Categories>({ primary: [], secondary: [] });
   const [form, setForm] = useState({
     name: "",
-    day: "1",
     amount: "",
     currency: "EUR" as Currency,
     primary: "",
@@ -1456,20 +1455,21 @@ function RecurringTab() {
       notify("error", "Name and amount required");
       return;
     }
-    await api.addRecurring({
-      year,
-      name: form.name.trim(),
-      // Clamped to 1-28 so the template's day exists in every month,
-      // including February.
-      day: Math.max(1, Math.min(28, Number(form.day) || 1)),
-      amount: amt,
-      currency: form.currency,
-      primary: form.primary,
-      secondary: form.secondary,
-    });
-    setForm({ name: "", day: "1", amount: "", currency: "EUR", primary: "", secondary: "" });
-    notify("success", "Template added");
-    refresh();
+    try {
+      await api.addRecurring({
+        year,
+        name: form.name.trim(),
+        amount: amt,
+        currency: form.currency,
+        primary: form.primary,
+        secondary: form.secondary,
+      });
+      setForm({ name: "", amount: "", currency: "EUR", primary: "", secondary: "" });
+      notify("success", "Template added");
+      refresh();
+    } catch (err) {
+      notify("error", errorMessage(err, "Could not add the template"));
+    }
   };
 
   // Materializes every recurring template into the current month's expense
@@ -1548,7 +1548,6 @@ function RecurringTab() {
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
                 <th className="px-3 py-2 font-medium">Name</th>
-                <th className="px-3 py-2 text-right font-medium">Day</th>
                 <th className="px-3 py-2 text-right font-medium">Amount</th>
                 <th className="px-3 py-2 font-medium">Curr</th>
                 <th className="px-3 py-2 font-medium">Primary</th>
@@ -1560,7 +1559,6 @@ function RecurringTab() {
               {items.map((r) => (
                 <tr key={r.id} className="hover:bg-muted/30">
                   <td className="px-3 py-2 font-medium">{r.name}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{r.day}</td>
                   <td className="px-3 py-2 text-right tabular-nums">{r.amount.toFixed(2)}</td>
                   <td className="px-3 py-2 text-xs text-muted-foreground">{r.currency}</td>
                   <td className="px-3 py-2">
@@ -1582,7 +1580,7 @@ function RecurringTab() {
               ))}
               {items.length === 0 && !itemsError && (
                 <tr>
-                  <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
+                  <td colSpan={6} className="px-3 py-8 text-center text-muted-foreground">
                     No recurring templates yet.
                   </td>
                 </tr>
@@ -1601,25 +1599,13 @@ function RecurringTab() {
               className="w-full rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-sm focus:border-primary/60 focus:outline-none"
             />
           </Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Day (1-28)">
-              <input
-                type="number"
-                min={1}
-                max={28}
-                value={form.day}
-                onChange={(e) => setForm({ ...form, day: e.target.value })}
-                className="w-full rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-sm focus:border-primary/60 focus:outline-none"
-              />
-            </Field>
-            <Field label="Amount">
-              <input
-                value={form.amount}
-                onChange={(e) => setForm({ ...form, amount: e.target.value })}
-                className="w-full rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-sm focus:border-primary/60 focus:outline-none"
-              />
-            </Field>
-          </div>
+          <Field label="Amount">
+            <input
+              value={form.amount}
+              onChange={(e) => setForm({ ...form, amount: e.target.value })}
+              className="w-full rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-sm focus:border-primary/60 focus:outline-none"
+            />
+          </Field>
           <Field label="Currency">
             <select
               value={form.currency}

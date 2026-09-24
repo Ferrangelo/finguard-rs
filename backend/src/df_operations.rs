@@ -2250,6 +2250,13 @@ impl CreditsDebts {
 // RecurringExpenses
 // ======================================================================
 
+/// The day of month every generated recurring row lands on. A user can no
+/// longer choose a different day; the `expense_day` column stays in the
+/// schema only because [`RecurringExpenses::plan_for_month`]'s pre-row-ID due
+/// check matches new rows against a template's stored day, and the sync row
+/// shape still carries the column.
+pub const GENERATED_RECURRING_DAY: u32 = 1;
+
 /// Build an empty recurring-expenses dataframe with the canonical schema.
 fn empty_recurring_df() -> DataFrame {
     DataFrame::empty_with_schema(&Schema::from_iter([
@@ -2285,8 +2292,16 @@ pub struct PendingRecurringRow {
     pub template_row_id: String,
     /// The expense name to insert.
     pub expense_name: String,
-    /// Day of month (1..=28) the generated row lands on.
+    /// The template's stored `expense_day`, kept only so
+    /// [`RecurringExpenses::plan_for_month`]'s pre-row-ID due check can match
+    /// a row from before derived IDs existed. Not the day a generated row
+    /// lands on; see [`Self::landing_day`] for that.
     pub expense_day: u32,
+    /// The day of month a generated row actually lands on: always
+    /// [`GENERATED_RECURRING_DAY`]. [`RecurringExpenses::insert_resolved`]
+    /// and [`RecurringExpenses::reinstate_for_month`] use this to build
+    /// `expense_date`.
+    pub landing_day: u32,
     /// The expense amount, in `currency`.
     pub expense_amount: f64,
     /// The currency `expense_amount` is denominated in.
@@ -2300,8 +2315,12 @@ pub struct PendingRecurringRow {
 /// What one `/api/recurring/apply` call will and will not generate for a
 /// month. Returned by [`RecurringExpenses::plan_for_month`].
 ///
-/// Neither list holds a template whose row the month already has, by derived
-/// ID or by name and day: those are not due at all and are reported nowhere.
+/// Neither list holds a template the month already satisfies: a row counts
+/// as satisfying a template when the row carries that template's own
+/// derived ID, or when it matches the template by name and day but carries
+/// no template's derived ID at all (the legacy, pre-row-ID case, which also
+/// covers a hand-typed expense that happens to collide). Such a template is
+/// not due and is reported nowhere.
 #[derive(Debug, Clone, Default)]
 pub struct RecurringApplyPlan {
     /// Templates due for the month. Hand this to
@@ -2361,26 +2380,40 @@ impl RecurringExpenses {
         Ok(Self { year, path, df })
     }
 
-    /// Add a recurring expense definition (day must be 1..=28) with a fresh
-    /// [`ROW_ID_COLUMN`] value, save, and return the new row's ID.
+    fn template_names(&self) -> Result<Vec<String>> {
+        str_col_to_vec(&self.df, "expense_name")
+    }
+
+    /// Add a recurring expense definition with a fresh [`ROW_ID_COLUMN`]
+    /// value, save, and return the new row's ID.
+    ///
+    /// The day is not a parameter: every generated row lands on
+    /// [`GENERATED_RECURRING_DAY`], and this always stores that constant.
+    /// There is no way to make a new template store a different day.
+    ///
+    /// Returns [`Error::AlreadyExists`] and writes nothing when this year
+    /// already has a template named `expense_name`. The check is exact and
+    /// case-sensitive, with no trimming, against the names currently in
+    /// `self.df`, so a deleted template's name is free to reuse immediately.
+    /// This guards the name-only fallback [`Self::plan_for_month`] falls back
+    /// to once every template lands on day 1; see that method's doc comment.
     pub fn add(
         &mut self,
         expense_name: &str,
-        expense_day: i64,
         expense_amount: f64,
         currency: &str,
         primary_category: &str,
         secondary_category: &str,
     ) -> Result<String> {
-        if !(1..=28).contains(&expense_day) {
-            return Err(Error::InvalidArgument(format!(
-                "expense_day must be between 1 and 28, got {expense_day}"
+        if self.template_names()?.iter().any(|n| n == expense_name) {
+            return Err(Error::AlreadyExists(format!(
+                "Recurring expense '{expense_name}' already exists."
             )));
         }
         let row_id = new_row_id();
         let new_row = DataFrame::new_infer_height(vec![
             Column::new("expense_name".into(), &[expense_name]),
-            Column::new("expense_day".into(), &[expense_day]),
+            Column::new("expense_day".into(), &[GENERATED_RECURRING_DAY as i64]),
             Column::new("expense_amount".into(), &[expense_amount]),
             Column::new("currency".into(), &[currency]),
             Column::new(
@@ -2457,6 +2490,7 @@ impl RecurringExpenses {
                 template_row_id: template_ids[i].clone(),
                 expense_name: names[i].clone(),
                 expense_day: days[i] as u32,
+                landing_day: GENERATED_RECURRING_DAY,
                 expense_amount: amounts[i],
                 currency: currencies[i].clone(),
                 primary_category: primaries[i].clone(),
@@ -2509,6 +2543,41 @@ impl RecurringExpenses {
     /// read this function as a complete guarantee for rows older than the
     /// change log.
     ///
+    /// # The name-and-day fallback ignores another template's generated row
+    ///
+    /// Every template [`Self::add`] creates stores day 1, and every generated
+    /// row lands on day 1, so for two templates the day half of the
+    /// name-and-day fallback above no longer discriminates between them: it
+    /// degenerates to a name match. Left alone, that match would let one
+    /// template's surviving generated row mask another, same-named
+    /// template's deleted one, with no way to tell the two apart.
+    ///
+    /// To avoid that, the fallback ignores a matching row when the row is
+    /// itself a generated row for this month, that is, when its
+    /// [`ROW_ID_COLUMN`] is one of `candidates`' derived IDs (any template of
+    /// this year, not only the one being checked). Such a row can only be
+    /// evidence for its own template, never for another one sharing its name.
+    /// A template whose own generated row was deleted then falls through to
+    /// [`RecurringApplyPlan::skipped`] instead of being silently dropped, so
+    /// [`Self::reinstate_for_month`] and the "Not added" panel can bring it
+    /// back. [`Self::add`]'s uniqueness check still closes the collision at
+    /// local creation; this closes it on the sync path too, where
+    /// `crate::merge_apply::apply_row_action` deliberately bypasses that
+    /// check because a peer's row must be stored, not rejected.
+    ///
+    /// The fallback still applies, unchanged, to a row carrying a random
+    /// UUID: that is the pre-row-ID case it exists for, such a row is never
+    /// in `candidates`' derived IDs, and it still skips the template with no
+    /// duplicate generated. Two gaps remain, both pre-existing and accepted:
+    /// a hand-typed expense that shares a template's name and lands on the
+    /// day the user entered for it still suppresses that template silently
+    /// when that day happens to match the template's stored day, because the
+    /// hand-typed row carries a random UUID indistinguishable from a
+    /// pre-row-ID generated row; and a generated row whose template has
+    /// since been deleted is absent from `candidates`, so it can still mask
+    /// a same-named template. Removing the fallback instead would reopen the
+    /// duplicate-generation hazard the 2026-09-18 decision above avoided.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] when the change log exists but cannot be read.
@@ -2524,6 +2593,12 @@ impl RecurringExpenses {
     /// whether this device is fit to sync at all.
     pub fn plan_for_month(&self, de: &DetailedExpenses) -> Result<RecurringApplyPlan> {
         let candidates = self.rows_for_month(de.year, de.month)?;
+        // Every row id a previous apply would have given a row in this
+        // month, for any template of this year. A row carrying one of these
+        // is some template's generated row, never the pre-row-ID row the
+        // name-and-day fallback below exists for.
+        let derived_ids: std::collections::HashSet<&str> =
+            candidates.iter().map(|c| c.row_id.as_str()).collect();
         let log = sync::read_log()?;
         if !log.corrupt_lines.is_empty() {
             eprintln!(
@@ -2537,7 +2612,7 @@ impl RecurringExpenses {
         let table = de.change_table();
 
         let mut plan = RecurringApplyPlan::default();
-        for row in candidates {
+        for row in &candidates {
             let existing = de
                 .expense_df
                 .clone()
@@ -2551,15 +2626,26 @@ impl RecurringExpenses {
                     ))
                     .or(col(ROW_ID_COLUMN).eq(lit(row.row_id.as_str()))),
                 )
+                .select([col(ROW_ID_COLUMN)])
                 .collect()?;
-            if existing.height() > 0 {
+            let existing_ids = str_col_to_vec(&existing, ROW_ID_COLUMN)?;
+            // Present when this template's own generated row matched, or
+            // when a name-and-day match is not some template's generated
+            // row for this month (the pre-row-ID case). `row.row_id` is
+            // itself a member of `derived_ids`, so the `==` term is what
+            // still lets a template's own row count as present; without it
+            // every second apply would regenerate a duplicate.
+            let already_present = existing_ids
+                .iter()
+                .any(|id| *id == row.row_id || !derived_ids.contains(id.as_str()));
+            if already_present {
                 continue;
             }
 
             if crate::merge::generated_row_stays_deleted(&log.entries, &table, &row.row_id) {
-                plan.skipped.push(row);
+                plan.skipped.push(row.clone());
             } else {
-                plan.pending.push(row);
+                plan.pending.push(row.clone());
             }
         }
         Ok(plan)
@@ -2635,7 +2721,7 @@ impl RecurringExpenses {
         de.add_row_with_id(
             &row.row_id,
             &row.expense_name,
-            row.expense_day,
+            row.landing_day,
             row.expense_amount,
             Some(&row.primary_category),
             &row.currency,
@@ -2679,7 +2765,7 @@ impl RecurringExpenses {
             de.add_row_with_id(
                 &row.row_id,
                 &row.expense_name,
-                row.expense_day,
+                row.landing_day,
                 row.expense_amount,
                 Some(&row.primary_category),
                 &row.currency,
@@ -3101,10 +3187,10 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         recurring
-            .add("Legacy Rent", 1, 1_000.0, "E", "Housing", "Rent")
+            .add("Legacy Rent", 1_000.0, "E", "Housing", "Rent")
             .expect("add legacy recurring expense");
         recurring
-            .add("Modern Rent", 1, 1_000.0, "USD", "Housing", "Rent")
+            .add("Modern Rent", 1_000.0, "USD", "Housing", "Rent")
             .expect("add modern recurring expense");
 
         let reloaded = RecurringExpenses::new(2026).expect("reload recurring expenses");
@@ -3124,7 +3210,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add recurring template");
 
         let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
@@ -3149,7 +3235,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add recurring template");
 
         let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
@@ -3182,7 +3268,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add recurring template");
 
         let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
@@ -3209,7 +3295,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add recurring template");
 
         let de_a = DetailedExpenses::new(2026, 3).expect("load march expenses (device a)");
@@ -3240,7 +3326,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add recurring template");
 
         let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
@@ -3284,7 +3370,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add the first recurring template");
 
         // Simulate a corrupted or hand-restored file: a second template that
@@ -3334,7 +3420,7 @@ mod tests {
     fn march_rent_generated_then_deleted() -> (RecurringExpenses, DetailedExpenses, String) {
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add recurring template");
 
         let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
@@ -3383,7 +3469,7 @@ mod tests {
         let (mut recurring, mut de, deleted_template) = march_rent_generated_then_deleted();
 
         let due_template = recurring
-            .add("Internet", 5, 40.0, "EUR", "Housing", "Internet")
+            .add("Internet", 40.0, "EUR", "Housing", "Internet")
             .expect("add a second template");
 
         let plan = recurring.plan_for_month(&de).expect("plan march again");
@@ -3477,7 +3563,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add recurring template");
 
         let de = DetailedExpenses::new(2026, 3).expect("load march expenses");
@@ -3598,7 +3684,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add recurring template");
         let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
 
@@ -3991,7 +4077,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add the template");
         let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
         let pending = recurring
@@ -4035,7 +4121,7 @@ mod tests {
 
         let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add the template");
         recurring.remove(&template_id).expect("remove the template");
 
@@ -4044,6 +4130,442 @@ mod tests {
         assert_eq!(entries[1].table, ChangeTable::Recurring { year: 2026 });
         assert_eq!(entries[1].row_id, template_id);
         assert_eq!(entries[1].op, ChangeOp::Delete);
+    }
+
+    /// `RecurringExpenses::add` cannot be told to store a day other than
+    /// [`GENERATED_RECURRING_DAY`]: the parameter that once chose it is gone.
+    #[test]
+    #[serial_test::serial]
+    fn add_stores_the_generated_day_constant() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        recurring
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add recurring template");
+
+        let stored_days: Vec<i64> = recurring
+            .df
+            .column("expense_day")
+            .expect("expense_day column")
+            .i64()
+            .expect("expense_day is i64")
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(stored_days, vec![GENERATED_RECURRING_DAY as i64]);
+    }
+
+    /// A second template with the same name in the same year is rejected,
+    /// and the rejection writes nothing: the row count and the change log
+    /// stay exactly as they were after the first `add`.
+    #[test]
+    #[serial_test::serial]
+    fn recurring_add_rejects_duplicate_name_in_same_year() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        recurring
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add the first template");
+        let entries_before = log_entries();
+
+        let err = recurring
+            .add("Rent", 500.0, "EUR", "Housing", "Rent")
+            .expect_err("a duplicate name in the same year must be rejected");
+        assert!(matches!(err, Error::AlreadyExists(_)));
+
+        assert_eq!(recurring.df.height(), 1, "the rejected add wrote no row");
+        assert_eq!(
+            log_entries(),
+            entries_before,
+            "the rejected add recorded no change"
+        );
+    }
+
+    /// The same name is accepted in a different year: the uniqueness check
+    /// is scoped to one year's table, matching `add_asset` and `add_entry`.
+    #[test]
+    #[serial_test::serial]
+    fn recurring_add_allows_same_name_in_different_year() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring_2026 = RecurringExpenses::new(2026).expect("load 2026 recurring");
+        recurring_2026
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add the 2026 template");
+
+        let mut recurring_2027 = RecurringExpenses::new(2027).expect("load 2027 recurring");
+        recurring_2027
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
+            .expect("the same name in a different year must be accepted");
+        assert_eq!(recurring_2027.df.height(), 1);
+    }
+
+    /// The uniqueness check is case-sensitive, matching `add_asset` and
+    /// `add_entry`: pinned here rather than left implicit, so a reader who
+    /// later folds case knows it is a deliberate change, not a fix.
+    #[test]
+    #[serial_test::serial]
+    fn recurring_add_name_check_is_case_sensitive() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        recurring
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add the first template");
+        recurring
+            .add("rent", 1_000.0, "EUR", "Housing", "Rent")
+            .expect("a name differing only in case must be accepted");
+        assert_eq!(recurring.df.height(), 2);
+    }
+
+    /// Removing a template frees its name: there is no tombstone, so a name
+    /// is available again as soon as its row leaves `self.df`.
+    #[test]
+    #[serial_test::serial]
+    fn recurring_add_allows_name_reuse_after_delete() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = recurring
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
+            .expect("add the template");
+        recurring.remove(&template_id).expect("remove the template");
+
+        recurring
+            .add("Rent", 500.0, "EUR", "Housing", "Rent")
+            .expect("the freed name must be reusable");
+        assert_eq!(recurring.df.height(), 1);
+    }
+
+    /// Append a recurring template whose stored `expense_day` is
+    /// `stored_day`, bypassing [`RecurringExpenses::add`]'s constant.
+    /// Simulates a template that predates this change, whose stored day is
+    /// not 1.
+    fn add_template_with_stored_day(
+        recurring: &mut RecurringExpenses,
+        name: &str,
+        stored_day: i64,
+        amount: f64,
+        currency: &str,
+        primary: &str,
+        secondary: &str,
+    ) -> String {
+        let row_id = new_row_id();
+        let row = DataFrame::new_infer_height(vec![
+            Column::new("expense_name".into(), &[name]),
+            Column::new("expense_day".into(), &[stored_day]),
+            Column::new("expense_amount".into(), &[amount]),
+            Column::new("currency".into(), &[currency]),
+            Column::new("primary_category".into(), &[primary]),
+            Column::new("secondary_category".into(), &[secondary]),
+            Column::new(ROW_ID_COLUMN.into(), &[row_id.as_str()]),
+        ])
+        .expect("build a template row with an arbitrary stored day");
+        recurring.df =
+            concat_df_diagonal(&[recurring.df.clone(), row]).expect("append the template row");
+        recurring.save().expect("save recurring expenses");
+        row_id
+    }
+
+    /// A template whose stored day predates this change (here 15) must still
+    /// generate its row on day 1: `insert_resolved` uses the landing day, not
+    /// the stored one.
+    #[test]
+    #[serial_test::serial]
+    fn apply_generates_on_day_one_for_a_template_whose_stored_day_is_not_one() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = add_template_with_stored_day(
+            &mut recurring,
+            "Rent",
+            15,
+            1_000.0,
+            "EUR",
+            "Housing",
+            "Rent",
+        );
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows");
+        recurring
+            .insert_resolved(&mut de, &pending)
+            .expect("insert pending rows");
+
+        let dates = date_col_to_vec(&de.expense_df, "expense_date").expect("read expense_date");
+        assert_eq!(
+            dates,
+            vec![Some(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap())]
+        );
+        let row_ids = str_col_to_vec(&de.expense_df, ROW_ID_COLUMN).expect("read row_id column");
+        assert_eq!(row_ids, vec![format!("{template_id}:2026-03")]);
+    }
+
+    /// Reinstating a skipped row from a template whose stored day predates
+    /// this change must also land the row on day 1, matching what a fresh
+    /// apply would have generated.
+    #[test]
+    #[serial_test::serial]
+    fn reinstate_generates_on_day_one_for_a_template_whose_stored_day_is_not_one() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_id = add_template_with_stored_day(
+            &mut recurring,
+            "Rent",
+            15,
+            1_000.0,
+            "EUR",
+            "Housing",
+            "Rent",
+        );
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let plan = recurring.plan_for_month(&de).expect("plan march");
+        recurring
+            .insert_resolved(&mut de, &plan.pending)
+            .expect("insert pending rows");
+        de.delete_row(&format!("{template_id}:2026-03"))
+            .expect("delete the generated row");
+
+        recurring
+            .reinstate_for_month(&mut de, &template_id)
+            .expect("reinstate the deleted row");
+
+        let dates = date_col_to_vec(&de.expense_df, "expense_date").expect("read expense_date");
+        assert_eq!(
+            dates,
+            vec![Some(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap())]
+        );
+    }
+
+    /// A month already holding a pre-row-ID row that matches a template's
+    /// stored day (here 15, not 1) must still be recognized as already
+    /// satisfied: `plan_for_month`'s name-and-day check reads the *stored*
+    /// day, never the day newly generated rows land on. This is the D1
+    /// regression guard: rewriting a template's stored day to 1 would break
+    /// this match and double-count the expense.
+    #[test]
+    #[serial_test::serial]
+    fn apply_skips_a_pre_row_id_row_matching_a_non_day_one_stored_day() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        add_template_with_stored_day(
+            &mut recurring,
+            "Rent",
+            15,
+            1_000.0,
+            "EUR",
+            "Housing",
+            "Rent",
+        );
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        de.add_row("Rent", 15, 1_000.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add a pre-row-ID row matching the template's stored day");
+
+        let plan = recurring.plan_for_month(&de).expect("plan march");
+        assert!(
+            plan.pending.is_empty(),
+            "the name-and-day match against the stored day must still skip the template, \
+             even though a generated row would land on day 1"
+        );
+        assert!(plan.skipped.is_empty());
+
+        let added = recurring
+            .insert_resolved(&mut de, &plan.pending)
+            .expect("insert pending rows");
+        assert!(added.is_empty());
+        assert_eq!(
+            de.expense_df.height(),
+            1,
+            "no second row may be generated beside the pre-row-ID row"
+        );
+    }
+
+    /// Applying a stored-day-15 template twice must add nothing the second
+    /// time: the row landed on day 1, but the derived ID it carries, not its
+    /// landing day, is what the second apply matches against.
+    #[test]
+    #[serial_test::serial]
+    fn a_second_apply_of_a_non_day_one_stored_template_adds_nothing() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        add_template_with_stored_day(
+            &mut recurring,
+            "Rent",
+            15,
+            1_000.0,
+            "EUR",
+            "Housing",
+            "Rent",
+        );
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let first_pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows");
+        recurring
+            .insert_resolved(&mut de, &first_pending)
+            .expect("insert pending rows");
+        assert_eq!(de.expense_df.height(), 1);
+
+        let second_pending = recurring
+            .pending_for_month(&de)
+            .expect("compute pending rows again");
+        assert!(
+            second_pending.is_empty(),
+            "the derived-ID check must still match the row even though it landed on day 1, \
+             not on the template's stored day"
+        );
+        assert_eq!(de.expense_df.height(), 1, "no duplicate row may be added");
+    }
+
+    /// V2-F1 regression guard, D1 case. Narrowing `plan_for_month`'s
+    /// name-and-day fallback to ignore another template's generated row must
+    /// not stop it recognizing a pre-row-ID row: a random UUID is never in
+    /// `derived_ids`, so a template whose stored day predates this change
+    /// (here 20) must still be suppressed by a matching pre-row-ID row, with
+    /// no duplicate generated.
+    #[test]
+    #[serial_test::serial]
+    fn plan_for_month_still_skips_a_pre_row_id_row_after_the_narrowing() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        add_template_with_stored_day(
+            &mut recurring,
+            "Rent",
+            20,
+            1_000.0,
+            "EUR",
+            "Housing",
+            "Rent",
+        );
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        de.add_row("Rent", 20, 1_000.0, Some("Housing"), "EUR", Some("Rent"))
+            .expect("add a pre-row-ID row matching the template's stored day");
+
+        let plan = recurring.plan_for_month(&de).expect("plan march");
+        assert!(
+            plan.pending.is_empty(),
+            "the pre-row-ID row must still suppress the template"
+        );
+        assert!(
+            plan.skipped.is_empty(),
+            "a pre-row-ID match is not a deletion, so it must not be reported as skipped either"
+        );
+
+        let added = recurring
+            .insert_resolved(&mut de, &plan.pending)
+            .expect("insert pending rows");
+        assert!(added.is_empty());
+        assert_eq!(
+            de.expense_df.height(),
+            1,
+            "no generated row may be added beside the pre-row-ID row"
+        );
+    }
+
+    /// V2-F1: two templates named the same, created the way a peer's merge
+    /// upsert creates them. `RecurringExpenses::add` now rejects a duplicate
+    /// name locally, so this uses `add_template_with_stored_day` instead,
+    /// which is the same path a peer's merged row takes through
+    /// `merge_apply::apply_row_action`. Before this narrowing, deleting one
+    /// template's generated row let the survivor's same-name row mask the
+    /// deletion, so the deleted template vanished from both `pending` and
+    /// `skipped`. After it, the deleted template must be reported in
+    /// `skipped`, not dropped, and reinstating it must add exactly one row.
+    #[test]
+    #[serial_test::serial]
+    fn plan_for_month_reports_a_same_name_collision_as_skipped_not_dropped() {
+        let _temp = with_temp_data_home();
+
+        let mut recurring = RecurringExpenses::new(2026).expect("load recurring expenses");
+        let template_a = add_template_with_stored_day(
+            &mut recurring,
+            "Rent",
+            1,
+            1_000.0,
+            "EUR",
+            "Housing",
+            "Rent",
+        );
+        let template_b = add_template_with_stored_day(
+            &mut recurring,
+            "Rent",
+            1,
+            1_000.0,
+            "EUR",
+            "Housing",
+            "Rent",
+        );
+
+        let mut de = DetailedExpenses::new(2026, 3).expect("load march expenses");
+        let first_plan = recurring.plan_for_month(&de).expect("plan march");
+        assert_eq!(
+            first_plan.pending.len(),
+            2,
+            "both same-named templates must be due"
+        );
+        recurring
+            .insert_resolved(&mut de, &first_plan.pending)
+            .expect("insert both pending rows");
+        let row_ids = str_col_to_vec(&de.expense_df, ROW_ID_COLUMN).expect("read row_id column");
+        assert_eq!(
+            row_ids.len(),
+            2,
+            "each template must generate its own row under its own derived id"
+        );
+        assert!(row_ids.contains(&format!("{template_a}:2026-03")));
+        assert!(row_ids.contains(&format!("{template_b}:2026-03")));
+
+        de.delete_row(&format!("{template_a}:2026-03"))
+            .expect("delete template a's generated row");
+
+        let second_plan = recurring.plan_for_month(&de).expect("plan march again");
+        assert!(
+            second_plan
+                .pending
+                .iter()
+                .all(|r| r.template_row_id != template_a),
+            "the deleted template must not be pending again"
+        );
+        assert_eq!(
+            second_plan.skipped.len(),
+            1,
+            "the deleted template must be reported as skipped, not silently dropped \
+             by template b's surviving same-name row"
+        );
+        assert_eq!(second_plan.skipped[0].template_row_id, template_a);
+        assert!(
+            !second_plan
+                .pending
+                .iter()
+                .chain(second_plan.skipped.iter())
+                .any(|r| r.template_row_id == template_b),
+            "template b's own still-present row must keep it out of both lists"
+        );
+
+        let reinstated = recurring
+            .reinstate_for_month(&mut de, &template_a)
+            .expect("reinstate the skipped row");
+        assert!(reinstated.created);
+        assert_eq!(reinstated.row_id, format!("{template_a}:2026-03"));
+
+        let row_ids_after =
+            str_col_to_vec(&de.expense_df, ROW_ID_COLUMN).expect("read row_id column");
+        assert_eq!(
+            row_ids_after.len(),
+            2,
+            "reinstating must bring the month back to two rows, not three"
+        );
     }
 
     /// A net worth row is created and deleted as a whole row, and every edit

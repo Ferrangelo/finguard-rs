@@ -43,7 +43,6 @@ export function SkippedRecurringPanel({
           <thead>
             <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
               <th className="px-3 py-2 font-medium">Name</th>
-              <th className="px-3 py-2 text-right font-medium">Day</th>
               <th className="px-3 py-2 text-right font-medium">Amount</th>
               <th className="px-3 py-2 font-medium">Curr</th>
               <th className="px-3 py-2 font-medium">Category</th>
@@ -54,7 +53,6 @@ export function SkippedRecurringPanel({
             {items.map((item) => (
               <tr key={item.row_id} className="hover:bg-muted/30">
                 <td className="px-3 py-2 font-medium">{item.name}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{item.day}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{item.amount.toFixed(2)}</td>
                 <td className="px-3 py-2 text-xs text-muted-foreground">{item.currency}</td>
                 <td className="px-3 py-2 text-xs text-muted-foreground">

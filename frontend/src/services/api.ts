@@ -25,6 +25,7 @@ import type {
   NetworthAllocation,
   NetworthEvolution,
   RecurringTemplate,
+  RecurringTemplateWrite,
   ReinstatedRow,
   SyncDiscoveryResult,
   SyncListener,
@@ -159,10 +160,8 @@ export async function getRecurring(year: number): Promise<RecurringTemplate[]> {
   return apiFetch(`/api/recurring?year=${year}`);
 }
 
-/** POST /api/recurring. Adds a new recurring template for `t.year`. The backend assigns the new `id`. */
-export async function addRecurring(
-  t: Omit<RecurringTemplate, "id"> & { year: number },
-): Promise<RecurringTemplate> {
+/** POST /api/recurring. Adds a new recurring template for `t.year`. The backend assigns the new `id` and always generates the template's rows on day 1. */
+export async function addRecurring(t: RecurringTemplateWrite): Promise<RecurringTemplate> {
   return apiFetch("/api/recurring", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

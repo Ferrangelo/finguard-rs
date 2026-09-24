@@ -1237,7 +1237,7 @@ mod tests {
             .add_row("Tea", 2, 3.0, Some("Out"), "EUR", Some("Cafe"))
             .unwrap();
         let mut rec = RecurringExpenses::new(2026).unwrap();
-        let gym = rec.add("Gym", 5, 30.0, "EUR", "Health", "Gym").unwrap();
+        let gym = rec.add("Gym", 30.0, "EUR", "Health", "Gym").unwrap();
         let later = far_future(0).ms;
 
         apply_remote_batch(&[
@@ -1873,7 +1873,7 @@ mod tests {
             .unwrap();
         RecurringExpenses::new(2026)
             .unwrap()
-            .add("Gym", 5, 30.0, "EUR", "Health", "Gym")
+            .add("Gym", 30.0, "EUR", "Health", "Gym")
             .unwrap();
         let mut liq = Liquidity::new(2026).unwrap();
         liq.add_asset("Bank", "Cash", "EUR").unwrap();

@@ -63,11 +63,30 @@ export interface ExpenseList {
 export interface RecurringTemplate {
   id: string;
   name: string;
+  /**
+   * `getRecurring`'s response reflects the template's real stored day: 1 to
+   * 28 for a template created before this change, always 1 for one created
+   * after. `addRecurring`'s response ignores whatever day was submitted and
+   * always reports 1, the day every generated row now lands on regardless of
+   * the template's stored value.
+   */
   day: number;
   amount: number;
   currency: Currency;
   primary: string;
   secondary: string;
+}
+
+/**
+ * The shape a caller builds to create a recurring template through
+ * `addRecurring` in `services/api.ts`. Omits `id`, which the server assigns,
+ * and `day`, which the server always sets to 1 and ignores on write (see
+ * `RecurringTemplate.day`), the same way `ExpenseWrite` omits `fx_rate` and
+ * `rate_date`. Adds `year`, which scopes the new template but is not part of
+ * `RecurringTemplate` itself.
+ */
+export interface RecurringTemplateWrite extends Omit<RecurringTemplate, "id" | "day"> {
+  year: number;
 }
 
 /**
@@ -89,8 +108,9 @@ export interface ApplyRecurringResult {
  * to recognize the expense. `template_id` is the same value as
  * `RecurringTemplate.id` and is what `reinstateRecurring` in
  * `services/api.ts` takes. `row_id` is the ID the row would have had; it is
- * unique within one response, so it also serves as a list key. `day` is 1 to
- * 28, the range the backend clamps templates to. `currency` is typed as
+ * unique within one response, so it also serves as a list key. `day` is
+ * server-derived and always 1: the backend generates every row on day 1 of
+ * the month. `currency` is typed as
  * `Currency` to match `RecurringTemplate.currency`, but the backend column is
  * a free string, so an older template could in principle carry a code outside
  * the union.

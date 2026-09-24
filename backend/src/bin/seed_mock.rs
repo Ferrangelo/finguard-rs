@@ -156,11 +156,11 @@ fn main() -> Result<()> {
     // 4. Recurring expense templates.
     // -----------------------------------------------------------------------
     let mut recurring = RecurringExpenses::new(year)?;
-    recurring.add("Rent", 1, 1_500.00, "EUR", "housing", "rent")?;
-    recurring.add("Netflix", 10, 15.99, "EUR", "leisure", "streaming")?;
-    recurring.add("Gym", 5, 45.00, "EUR", "leisure", "gym")?;
-    recurring.add("Internet", 15, 30.00, "EUR", "otherexpenses", "internet")?;
-    recurring.add("Phone Plan", 20, 20.00, "EUR", "otherexpenses", "phone")?;
+    recurring.add("Rent", 1_500.00, "EUR", "housing", "rent")?;
+    recurring.add("Netflix", 15.99, "EUR", "leisure", "streaming")?;
+    recurring.add("Gym", 45.00, "EUR", "leisure", "gym")?;
+    recurring.add("Internet", 30.00, "EUR", "otherexpenses", "internet")?;
+    recurring.add("Phone Plan", 20.00, "EUR", "otherexpenses", "phone")?;
 
     // -----------------------------------------------------------------------
     // 5. Detailed expenses: January through December.

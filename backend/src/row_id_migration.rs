@@ -867,7 +867,7 @@ mod tests {
             .unwrap();
         RecurringExpenses::new(2026)
             .unwrap()
-            .add("Gym", 5, 40.0, "EUR", "Leisure", "Gym")
+            .add("Gym", 40.0, "EUR", "Leisure", "Gym")
             .unwrap();
         InvestmentHoldings::new(2026)
             .unwrap()

@@ -1364,7 +1364,7 @@ mod tests {
             .unwrap();
         RecurringExpenses::new(2026)
             .unwrap()
-            .add("Gym", 5, 30.0, "EUR", "Health", "Gym")
+            .add("Gym", 30.0, "EUR", "Health", "Gym")
             .unwrap();
         let mut liquidity = Liquidity::new(2026).unwrap();
         liquidity.add_asset("Bank", "Cash", "EUR").unwrap();

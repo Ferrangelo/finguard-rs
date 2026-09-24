@@ -141,6 +141,12 @@ pub struct RecurringTemplateJson {
     /// The template's stable `row_id` (see [`df_operations::ROW_ID_COLUMN`]).
     pub id: String,
     pub name: String,
+    /// [`get_recurring_handler`] returns the template's real stored day,
+    /// which can predate this change and so be anything from 1 to 28.
+    /// [`add_recurring_handler`] ignores [`AddRecurringPayload::day`] and
+    /// always reports the day this build generates rows on instead (see
+    /// `df_operations::GENERATED_RECURRING_DAY`), because that is what a
+    /// freshly created template will actually produce.
     pub day: i64,
     pub amount: f64,
     pub currency: String,
@@ -361,7 +367,10 @@ pub struct SkippedRecurringJson {
     pub row_id: String,
     /// The expense name the template carries.
     pub name: String,
-    /// Day of the month the row would land on.
+    /// The day of the month the row would land on if generated: always the
+    /// day this build generates rows on (see
+    /// `df_operations::GENERATED_RECURRING_DAY`), regardless of the
+    /// template's own stored day.
     pub day: u32,
     /// The amount, in `currency`.
     pub amount: f64,
@@ -387,6 +396,11 @@ pub struct ReinstatedRowJson {
 pub struct AddRecurringPayload {
     pub year: i32,
     pub name: String,
+    /// Accepted and ignored: every generated row lands on
+    /// `df_operations::GENERATED_RECURRING_DAY` regardless of this value.
+    /// Kept, with `#[serde(default)]`, so a client built against the old
+    /// contract still deserializes.
+    #[serde(default)]
     pub day: i64,
     pub amount: f64,
     pub currency: String,
@@ -936,6 +950,10 @@ async fn delete_expense_handler(
 /// `GET /api/recurring`: list `q.year`'s recurring expense templates. Each
 /// [`RecurringTemplateJson::id`] is that template's stable `row_id`, which
 /// [`delete_recurring_handler`] expects back verbatim.
+///
+/// [`RecurringTemplateJson::day`] here is the template's real stored value,
+/// not necessarily the day a generated row lands on: see that field's doc
+/// comment.
 async fn get_recurring_handler(
     Query(q): Query<YearQuery>,
 ) -> Result<Json<Vec<RecurringTemplateJson>>, AppError> {
@@ -969,15 +987,20 @@ async fn get_recurring_handler(
 /// `payload.year` and save the table. The response's `id` is the new
 /// template's `row_id`.
 ///
-/// Returns [`Error::InvalidArgument`] (`400`) if `payload.day` is outside
-/// 1..=28 (a template must fire in every month, including February).
+/// `payload.day` is accepted and ignored: every new template generates on
+/// `df_operations::GENERATED_RECURRING_DAY`, and there is no way to store a
+/// different day.
+///
+/// Returns [`Error::AlreadyExists`] (`409`) when `payload.year` already has a
+/// template named `payload.name`.
+///
+/// [`Error::AlreadyExists`]: crate::Error::AlreadyExists
 async fn add_recurring_handler(
     Json(payload): Json<AddRecurringPayload>,
 ) -> Result<Json<RecurringTemplateJson>, AppError> {
     let mut rec = RecurringExpenses::new(payload.year)?;
     let new_id = rec.add(
         &payload.name,
-        payload.day,
         payload.amount,
         &payload.currency,
         &payload.primary,
@@ -987,7 +1010,7 @@ async fn add_recurring_handler(
     Ok(Json(RecurringTemplateJson {
         id: new_id,
         name: payload.name,
-        day: payload.day,
+        day: df_operations::GENERATED_RECURRING_DAY as i64,
         amount: payload.amount,
         currency: payload.currency,
         primary: payload.primary,
@@ -1046,7 +1069,7 @@ fn skipped_recurring_json(row: &df_operations::PendingRecurringRow) -> SkippedRe
         template_id: row.template_row_id.clone(),
         row_id: row.row_id.clone(),
         name: row.expense_name.clone(),
-        day: row.expense_day,
+        day: row.landing_day,
         amount: row.expense_amount,
         currency: row.currency.clone(),
         primary: row.primary_category.clone(),
@@ -4249,6 +4272,97 @@ mod tests {
         assert_eq!(listed[0].name, "Gym");
     }
 
+    /// `day` in the request body is accepted and ignored: it used to be
+    /// rejected with a `400` outside 1..=28, and a payload with no `day` key
+    /// at all must still deserialize, so an older client stays compatible.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn add_recurring_ignores_day_and_never_rejects_it() {
+        let _temp = with_temp_env_offline();
+
+        let created = add_recurring_handler(Json(AddRecurringPayload {
+            year: 2026,
+            name: "Rent".to_string(),
+            day: 30,
+            amount: 1_000.0,
+            currency: "EUR".to_string(),
+            primary: "Housing".to_string(),
+            secondary: "Rent".to_string(),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("an out-of-range day must not be rejected: {err}"))
+        .0;
+        assert_eq!(
+            created.day, 1,
+            "the response reports the day templates actually generate on"
+        );
+
+        let stored = df_operations::RecurringExpenses::new(2026).expect("load recurring expenses");
+        assert_eq!(column_i64(&stored.df, "expense_day"), vec![1]);
+
+        let no_day: AddRecurringPayload = serde_json::from_str(
+            r#"{"year":2026,"name":"Gym","amount":40.0,"currency":"EUR","primary":"Leisure","secondary":"Gym"}"#,
+        )
+        .expect("a payload without a day key must still deserialize");
+        assert_eq!(
+            no_day.day, 0,
+            "#[serde(default)] fills the missing field with 0"
+        );
+
+        let created2 = add_recurring_handler(Json(no_day))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("a payload without day must succeed: {err}"))
+            .0;
+        assert_eq!(created2.day, 1);
+    }
+
+    /// `POST /api/recurring` with a name already used in that year is a `409
+    /// Conflict` carrying the backend's own sentence, and writes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn add_recurring_rejects_duplicate_name() {
+        use axum::response::IntoResponse;
+        let _temp = with_temp_env_offline();
+
+        let _ = add_recurring_handler(Json(AddRecurringPayload {
+            year: 2026,
+            name: "Rent".to_string(),
+            day: 1,
+            amount: 1_000.0,
+            currency: "EUR".to_string(),
+            primary: "Housing".to_string(),
+            secondary: "Rent".to_string(),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("create the first template: {err}"));
+
+        let err = add_recurring_handler(Json(AddRecurringPayload {
+            year: 2026,
+            name: "Rent".to_string(),
+            day: 1,
+            amount: 500.0,
+            currency: "EUR".to_string(),
+            primary: "Housing".to_string(),
+            secondary: "Rent".to_string(),
+        }))
+        .await
+        .expect_err("a duplicate name in the same year must be rejected");
+        assert_eq!(
+            err.0.to_string(),
+            "Recurring expense 'Rent' already exists."
+        );
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::CONFLICT
+        );
+
+        let listed = get_recurring_handler(Query(YearQuery { year: 2026 }))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("list succeeds: {err}"))
+            .0;
+        assert_eq!(listed.len(), 1, "the rejected add created no row");
+    }
+
     /// Net worth rows keep their `row_id` through every edit route: rename,
     /// category, link, currency, and cell updates. An investment's holdings
     /// row and prices row keep sharing one ID.
@@ -4361,7 +4475,7 @@ mod tests {
         de.add_row("Rent", 1, 900.0, Some("Housing"), "EUR", Some("Rent"))
             .unwrap();
         let mut rec = RecurringExpenses::new(2026).unwrap();
-        rec.add("Gym", 5, 40.0, "EUR", "Leisure", "Gym").unwrap();
+        rec.add("Gym", 40.0, "EUR", "Leisure", "Gym").unwrap();
         for (path, df) in [
             (de.expense_df_path.clone(), de.expense_df.clone()),
             (
@@ -4481,7 +4595,7 @@ mod tests {
         let mut recurring =
             df_operations::RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add a template");
 
         let applied = apply_recurring_handler(Json(ApplyRecurringPayload {
@@ -4531,7 +4645,7 @@ mod tests {
         let mut recurring =
             df_operations::RecurringExpenses::new(2026).expect("load recurring expenses");
         let template_id = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add a template");
         let row_id = format!("{template_id}:2026-09");
 
@@ -4610,7 +4724,7 @@ mod tests {
         let mut recurring =
             df_operations::RecurringExpenses::new(2026).expect("load recurring expenses");
         let deleted_template = recurring
-            .add("Rent", 1, 1_000.0, "EUR", "Housing", "Rent")
+            .add("Rent", 1_000.0, "EUR", "Housing", "Rent")
             .expect("add the first template");
 
         let apply = || {
@@ -4637,7 +4751,7 @@ mod tests {
         .unwrap_or_else(|AppError(err)| panic!("deleting the generated row succeeds: {err}"));
 
         let due_template = recurring
-            .add("Internet", 5, 40.0, "EUR", "Housing", "Internet")
+            .add("Internet", 40.0, "EUR", "Housing", "Internet")
             .expect("add a second template");
 
         let second = apply()
