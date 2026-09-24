@@ -1,0 +1,11 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="512" height="512" rx="116" fill="#1B2A4A"/>
+
+  <rect x="64" y="294" width="88" height="170" rx="14" fill="#5C6B8A"/>
+  <rect x="176" y="214" width="88" height="250" rx="14" fill="#2F8F7B"/>
+  <rect x="288" y="124" width="88" height="340" rx="14" fill="#E3B23C"/>
+
+  <circle cx="372" cy="150" r="124" fill="#F7F4EE"/>
+  <circle cx="372" cy="150" r="124" fill="none" stroke="#E3B23C" stroke-width="10"/>
+  <text x="372" y="192" font-family="Georgia, 'Times New Roman', serif" font-size="130" font-weight="700" fill="#1B2A4A" text-anchor="middle">€</text>
+</svg>

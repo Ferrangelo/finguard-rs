@@ -15,6 +15,7 @@ import { MONTHS } from "@/services/api";
 import { StatusPill } from "./StatusPill";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { cn } from "@/lib/utils";
+import logoUrl from "@/assets/finguard-logo.svg";
 
 const TABS = [
   { to: "/expenses", label: "Expenses", icon: Wallet },
@@ -39,12 +40,7 @@ export function Header() {
     <header className="sticky top-0 z-40 border-b border-border/60 bg-background/60 backdrop-blur-xl">
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-4 px-6 py-3">
         <div className="flex items-center gap-3">
-          <div
-            className="relative grid h-9 w-9 place-items-center rounded-xl bg-gradient-brand"
-            style={{ boxShadow: "var(--shadow-glow)" }}
-          >
-            <Wallet className="h-5 w-5 text-background" strokeWidth={2.5} />
-          </div>
+          <img src={logoUrl} alt="" className="h-9 w-9 shrink-0" />
           <div className="flex flex-col leading-none">
             <span className="text-lg font-bold tracking-tight text-gradient">Finguard</span>
             <span className="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
