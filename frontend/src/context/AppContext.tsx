@@ -32,6 +32,8 @@ interface AppContextValue {
   years: number[];
   setYear: (y: number) => void;
   setMonth: (m: number) => void;
+  /** False until the mount effect replaces `year`/`month`/`years` with the real date (see `PLACEHOLDER_YEAR`). A route's own data-fetch effects must wait for this before calling the backend with `year`/`month`, or they fetch the placeholder date once on every launch. */
+  dateReady: boolean;
   status: StatusMessage;
   notify: (kind: StatusMessage["kind"], text: string) => void;
   refreshTick: number;
@@ -44,16 +46,27 @@ interface AppContextValue {
 
 const AppCtx = createContext<AppContextValue | null>(null);
 
+// Fixed placeholder for `year`/`month`/`years` until the effect below runs.
+// The Android build prerenders this component once at build time, then the
+// device hydrates it later against its own clock; seeding the initial state
+// from `new Date()` in both places made them disagree on any date after the
+// build and triggered a hydration mismatch (React error #418) on the
+// `<select>` elements in Header.tsx that render `years`. `ThemeProvider`
+// (context/ThemeContext.tsx) uses the same fixed-default-then-effect
+// pattern for its client-only localStorage read.
+const PLACEHOLDER_YEAR = 1970;
+const PLACEHOLDER_MONTH = 1;
+
 /**
  * Provides the shared app state described in the file-level comment above.
  * Refetches the list of available years whenever `refreshTick` changes, in
  * addition to whatever each route's own effects refetch.
  */
 export function AppProvider({ children }: { children: ReactNode }) {
-  const now = new Date();
-  const [year, setYear] = useState(now.getFullYear());
-  const [month, setMonth] = useState(now.getMonth() + 1);
-  const [years, setYears] = useState<number[]>([now.getFullYear(), now.getFullYear() - 1]);
+  const [year, setYear] = useState(PLACEHOLDER_YEAR);
+  const [month, setMonth] = useState(PLACEHOLDER_MONTH);
+  const [years, setYears] = useState<number[]>([PLACEHOLDER_YEAR]);
+  const [dateReady, setDateReady] = useState(false);
   const [status, setStatus] = useState<StatusMessage>({
     kind: "idle",
     text: "Ready",
@@ -64,6 +77,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     FALLBACK_CURRENCY_SETTINGS,
   );
   const [currencySettingsLoaded, setCurrencySettingsLoaded] = useState(false);
+
+  // Replaces the placeholder above with the device's real current date.
+  // Runs only on the client, after hydration, so it never affects the
+  // markup React compares against the prerendered HTML. Sets `dateReady`
+  // last so a route's fetch effect that checks it also sees the corrected
+  // year/month in the same render, rather than firing once more against
+  // the placeholder before the flag catches up.
+  useEffect(() => {
+    const now = new Date();
+    setYear(now.getFullYear());
+    setMonth(now.getMonth() + 1);
+    setYears([now.getFullYear(), now.getFullYear() - 1]);
+    setDateReady(true);
+  }, []);
 
   useEffect(() => {
     api
@@ -99,6 +126,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       years,
       setYear,
       setMonth,
+      dateReady,
       status,
       notify,
       refreshTick,
@@ -110,6 +138,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       year,
       month,
       years,
+      dateReady,
       status,
       refreshTick,
       notify,

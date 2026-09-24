@@ -194,7 +194,7 @@ const INVESTMENTS_COLSPAN_WITH_CURRENCY = INVESTMENTS_COLSPAN_WITHOUT_CURRENCY +
 // ────────────────────────────────────────────────────────────── Investments
 function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
   const colorAt = useChartColors();
-  const { year, notify, refresh, refreshTick } = useApp();
+  const { year, dateReady, notify, refresh, refreshTick } = useApp();
   const [assets, setAssets] = useState<InvestmentAsset[]>([]);
   const [view, setView] = useState<"holdings" | "prices" | "value">("value");
   const [adding, setAdding] = useState(false);
@@ -204,7 +204,10 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
   // opposite of a load error.
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  // Waits for `dateReady` so this never fetches AppContext's placeholder
+  // year (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setLoadError(null);
     api
@@ -217,7 +220,7 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
     return () => {
       active = false;
     };
-  }, [year, refreshTick]);
+  }, [dateReady, year, refreshTick]);
 
   // Month-end fx rates for every currency appearing in this year's price
   // entries (the backend's `networth_currencies` already folds those in, so
@@ -228,7 +231,10 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
   // dependency even though it changes no request parameter.
   const [rates, setRates] = useState<MonthlyFxRates | null>(null);
   const [ratesError, setRatesError] = useState<string | null>(null);
+  // Waits for `dateReady` so this never fetches AppContext's placeholder
+  // year (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setRates(null);
     setRatesError(null);
@@ -241,7 +247,7 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
     return () => {
       active = false;
     };
-  }, [year, refreshTick, refCurrency]);
+  }, [dateReady, year, refreshTick, refCurrency]);
 
   // Price-entry currencies this year's loaded assets actually use that the
   // fetch above could not resolve into `refCurrency`. Distinct from
@@ -652,7 +658,7 @@ function AddInvestmentForm({
 
 // ────────────────────────────────────────────────────────────── Liquidity & Credits/Debts
 function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
-  const { year, notify, refresh, refreshTick } = useApp();
+  const { year, dateReady, notify, refresh, refreshTick } = useApp();
   const [liq, setLiq] = useState<LiquidityRow[]>([]);
   const [cd, setCd] = useState<CreditDebtRow[]>([]);
   // Rates for every currency already used by this year's liquidity and
@@ -668,7 +674,10 @@ function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
   // but this currency has no rate").
   const [ratesError, setRatesError] = useState<string | null>(null);
 
+  // Waits for `dateReady` so this never fetches AppContext's placeholder
+  // year (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setLiqError(null);
     setCdError(null);
@@ -705,7 +714,7 @@ function LiquidityTab({ refCurrency }: { refCurrency: Currency }) {
     return () => {
       active = false;
     };
-  }, [year, refreshTick]);
+  }, [dateReady, year, refreshTick]);
 
   // Converts a row's own balance into the reference currency at month `m`'s
   // own rate, reporting which of three states applies rather than always
@@ -1151,7 +1160,7 @@ function AddCreditDebtForm({
 // ────────────────────────────────────────────────────────────── Total Net Worth
 function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) {
   const colorAt = useChartColors();
-  const { year, month, refreshTick, notify, refresh } = useApp();
+  const { year, month, dateReady, refreshTick, notify, refresh } = useApp();
   const { theme } = useTheme();
   const totalStroke = theme === "arctic" ? "oklch(0.30 0.10 260)" : "oklch(0.95 0.02 260)";
   const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
@@ -1179,7 +1188,10 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   // "loading", so a slow currency switch never reads as "no data".
   const [evolutionPending, setEvolutionPending] = useState(true);
 
+  // Waits for `dateReady` so this never fetches AppContext's placeholder
+  // year (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setEvolution(null);
     setEvolutionError(null);
@@ -1199,9 +1211,12 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
     return () => {
       active = false;
     };
-  }, [year, refreshTick]);
+  }, [dateReady, year, refreshTick]);
 
+  // Waits for `dateReady` so this never fetches AppContext's placeholder
+  // year/month (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setAllocation(null);
     setAllocationError(null);
@@ -1215,7 +1230,7 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
     return () => {
       active = false;
     };
-  }, [year, month, refreshTick]);
+  }, [dateReady, year, month, refreshTick]);
 
   // December of the prior year's net worth (reference currency), the
   // baseline for January's month-over-month delta. `getNetworthEvolution`
@@ -1231,7 +1246,10 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   // unresolved below rather than measured against a wrong 0.
   const [prevDecNetWorth, setPrevDecNetWorth] = useState<number | null>(null);
   const [prevDecError, setPrevDecError] = useState<string | null>(null);
+  // Waits for `dateReady` so this never fetches against AppContext's
+  // placeholder year (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setPrevDecNetWorth(null);
     setPrevDecError(null);
@@ -1247,7 +1265,7 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
     return () => {
       active = false;
     };
-  }, [year, refreshTick]);
+  }, [dateReady, year, refreshTick]);
 
   // Display currency: defaults to the reference currency until the user
   // explicitly picks another one.
@@ -1266,7 +1284,10 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
   const [prevDisplayRates, setPrevDisplayRates] = useState<MonthlyFxRates | null>(null);
   const [displayRatesError, setDisplayRatesError] = useState<string | null>(null);
   const [prevDisplayRatesError, setPrevDisplayRatesError] = useState<string | null>(null);
+  // Waits for `dateReady` so this never fetches against AppContext's
+  // placeholder year (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setDisplayRates(null);
     setPrevDisplayRates(null);
@@ -1295,7 +1316,7 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
     return () => {
       active = false;
     };
-  }, [year, displayCurrency, refCurrency, refreshTick]);
+  }, [dateReady, year, displayCurrency, refCurrency, refreshTick]);
 
   // A fetch failure is treated the same as the backend reporting the
   // currency itself unavailable: either way there is no reliable rate to

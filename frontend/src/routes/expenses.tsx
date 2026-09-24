@@ -122,7 +122,7 @@ function ExpensesPage() {
 
 // ────────────────────────────────────────────────────────────── Detailed
 function DetailedTab() {
-  const { year, month, notify, refresh, refreshTick, currencySettings } = useApp();
+  const { year, month, dateReady, notify, refresh, refreshTick, currencySettings } = useApp();
   const refCurrency = currencySettings.reference_currency;
   const [rows, setRows] = useState<Expense[]>([]);
   const [cats, setCats] = useState<Categories>({ primary: [], secondary: [] });
@@ -172,8 +172,11 @@ function DetailedTab() {
   // Refetch the row list on every change to year, month, the active
   // filter, or refreshTick. Empty filter fields are sent as `undefined` so
   // the backend does not apply that filter at all, rather than filtering
-  // on an empty string.
+  // on an empty string. Waits for `dateReady` so this never fetches the
+  // placeholder year/month AppContext seeds before it reads the real date
+  // (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setRowsError(null);
     api
@@ -194,7 +197,7 @@ function DetailedTab() {
     return () => {
       active = false;
     };
-  }, [year, month, filter, refreshTick]);
+  }, [dateReady, year, month, filter, refreshTick]);
 
   // Sort is applied client-side to the already-filtered rows; the backend
   // does not accept a sort order.
@@ -893,11 +896,20 @@ function SummaryTooltip({
 
 function SummaryTab() {
   const colorAt = useChartColors();
-  const { year, month, refreshTick, currencySettings } = useApp();
+  const { year, month, dateReady, refreshTick, currencySettings } = useApp();
   const refCurrency = currencySettings.reference_currency;
   const [kind, setKind] = useState<"primary" | "secondary">("primary");
   const [yearExpenses, setYearExpenses] = useState<Expense[]>([]);
   const [selMonths, setSelMonths] = useState<number[]>([Math.max(1, month - 1), month]);
+  // `selMonths` above defaults from `month`, which is still AppContext's
+  // placeholder on the very first render (see AppContext.tsx). Replace that
+  // default once the real date lands, so the chart does not stay pinned to
+  // the placeholder month. `dateReady` flips on mount, before a human can
+  // act, so this cannot overwrite a selection the user made themselves.
+  useEffect(() => {
+    if (dateReady) setSelMonths([Math.max(1, month - 1), month]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dateReady]);
   const [selCats, setSelCats] = useState<string[]>([]);
   const { theme } = useTheme();
   const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
@@ -913,8 +925,10 @@ function SummaryTab() {
 
   // Loads every expense for the whole year once (not per-month); every
   // derived table and chart below slices this same list client-side
-  // instead of making a separate request per view.
+  // instead of making a separate request per view. Waits for `dateReady`
+  // so this never fetches AppContext's placeholder year (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     setYearExpensesError(null);
     api
@@ -930,7 +944,7 @@ function SummaryTab() {
     return () => {
       active = false;
     };
-  }, [year, refreshTick]);
+  }, [dateReady, year, refreshTick]);
 
   const catOf = (e: Expense) => (kind === "primary" ? e.primary : e.secondary) || "Uncategorized";
 
@@ -1396,7 +1410,7 @@ function SummaryTab() {
 
 // ────────────────────────────────────────────────────────────── Recurring
 function RecurringTab() {
-  const { year, month, notify, refresh, refreshTick } = useApp();
+  const { year, month, dateReady, notify, refresh, refreshTick } = useApp();
   const [items, setItems] = useState<RecurringTemplate[]>([]);
   const [cats, setCats] = useState<Categories>({ primary: [], secondary: [] });
   const [form, setForm] = useState({
@@ -1431,24 +1445,29 @@ function RecurringTab() {
 
   useEffect(() => {
     let active = true;
-    setItemsError(null);
     setCatsError(null);
-    api
-      .getRecurring(year)
-      .then((items) => active && setItems(items))
-      .catch((err) => {
-        if (active) setItemsError(errorMessage(err, "Failed to load recurring templates"));
-      });
     api
       .getCategories()
       .then((cats) => active && setCats(cats))
       .catch((err) => {
         if (active) setCatsError(errorMessage(err, "Failed to load categories"));
       });
+    // Waits for `dateReady` so this never fetches templates for AppContext's
+    // placeholder year (see AppContext.tsx). `getCategories` above does not
+    // depend on the date, so it still runs on the first pass.
+    if (dateReady) {
+      setItemsError(null);
+      api
+        .getRecurring(year)
+        .then((items) => active && setItems(items))
+        .catch((err) => {
+          if (active) setItemsError(errorMessage(err, "Failed to load recurring templates"));
+        });
+    }
     return () => {
       active = false;
     };
-  }, [refreshTick]);
+  }, [dateReady, refreshTick]);
 
   const submit = async () => {
     const amt = evalMath(form.amount);

@@ -51,7 +51,7 @@ function ErrorBanner({ message }: { message: string }) {
 
 function CashflowPage() {
   const colorAt = useChartColors();
-  const { year, notify, refresh, refreshTick, currencySettings } = useApp();
+  const { year, dateReady, notify, refresh, refreshTick, currencySettings } = useApp();
   const refCurrency = currencySettings.reference_currency;
   const [income, setIncome] = useState<Record<number, Record<string, number>>>({});
   const [spending, setSpending] = useState<Record<number, Record<string, number>>>({});
@@ -62,7 +62,10 @@ function CashflowPage() {
   const { theme } = useTheme();
   const tickColor = theme === "arctic" ? "oklch(0.48 0.022 240)" : "oklch(0.68 0.02 260)";
 
+  // Waits for `dateReady` so this never fetches AppContext's placeholder
+  // year (see AppContext.tsx).
   useEffect(() => {
+    if (!dateReady) return;
     let active = true;
     api.getIncome(year).then((income) => active && setIncome(income));
     api.getMonthlySpendingByPrimary(year).then((res) => {
@@ -73,7 +76,7 @@ function CashflowPage() {
     return () => {
       active = false;
     };
-  }, [year, refreshTick]);
+  }, [dateReady, year, refreshTick]);
 
   const months = useMemo(() => Array.from({ length: 12 }, (_, i) => i + 1), []);
 
