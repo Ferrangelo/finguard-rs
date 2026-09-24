@@ -36,8 +36,8 @@ import type {
 } from "./types";
 
 // Prefixes every request. Empty by default, which keeps the relative
-// `/api/...` paths this app has always used, so Lovable's dev server and its
-// `/api` proxy still work unchanged. Set `VITE_API_BASE_URL` only for a build
+// `/api/...` paths this app has always used, so the Vite dev server's
+// `/api` proxy still works unchanged. Set `VITE_API_BASE_URL` only for a build
 // that is not served from the backend's own origin, such as the static
 // Tauri Android build. Stripping a trailing slash here avoids a double
 // slash where a call path starts with `/api`.

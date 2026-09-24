@@ -6,11 +6,10 @@ import {
   HeadContent,
   Scripts,
 } from "@tanstack/react-router";
-import { useEffect, type ReactNode } from "react";
+import { type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
 import logoUrl from "../assets/finguard-logo.svg";
-import { reportLovableError } from "../lib/lovable-error-reporting";
 import { AppProvider } from "@/context/AppContext";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { Header } from "@/components/finguard/Header";
@@ -46,16 +45,11 @@ function NotFoundComponent() {
   );
 }
 
-// Root-level error boundary for any route render error. In addition to
-// rendering the fallback UI, it forwards the error to Lovable's injected
-// error-reporting hook if present (see lib/lovable-error-reporting.ts),
-// so a render error surfaces in the Lovable editor when running there.
+// Root-level error boundary for any route render error. Logs the error and
+// renders the fallback UI.
 function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   console.error(error);
   const router = useRouter();
-  useEffect(() => {
-    reportLovableError(error, { boundary: "tanstack_root_error_component" });
-  }, [error]);
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -106,7 +100,6 @@ export const Route = createRootRoute({
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
-      { name: "twitter:site", content: "@Lovable" },
     ],
     links: [
       { rel: "icon", type: "image/svg+xml", href: logoUrl },
