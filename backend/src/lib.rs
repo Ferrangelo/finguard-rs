@@ -24,6 +24,11 @@
 //! - [`row_id_migration`]: the startup migration that gives every row of the
 //!   synced tables a stable row ID, after backing up the data folder. Every
 //!   program that serves this data calls it before its first request.
+//! - [`expense_date_repair`]: an operator-run tool, not a startup pass, that
+//!   finds and, only when told to, fixes detailed-expense rows whose
+//!   `expense_date` does not belong to their own monthly file. Backs up the
+//!   data folder before its first write, the same way [`row_id_migration`]
+//!   does.
 //! - [`sync`]: the append-only change log under
 //!   `$XDG_DATA_HOME/finguard/sync/`, its hybrid logical clock, and this
 //!   device's id. Every method in [`df_operations`] that saves a change
@@ -73,6 +78,7 @@ mod dbs_backup;
 pub mod df_operations;
 pub mod diag;
 pub mod error;
+pub mod expense_date_repair;
 pub mod expr;
 pub mod fx;
 mod http_error;
