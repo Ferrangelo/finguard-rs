@@ -331,8 +331,8 @@ function InvestmentsTab({ refCurrency }: { refCurrency: Currency }) {
       )}
       {view === "value" && (
         <p className="text-sm text-muted-foreground">
-          Figures below are quantity × price, converted into {refCurrency} at each month's own
-          month-end rate; none of these are the native price amount.
+          Figures below are quantity × price, shown in your reference currency ({refCurrency}). You
+          can change the reference currency from the Total Net Worth tab.
         </p>
       )}
       {view === "value" && ratesError && (
