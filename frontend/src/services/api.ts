@@ -269,8 +269,8 @@ export function lookupMapping(name: string, rules: MappingRule[]): MappingRule |
 }
 
 /** GET /api/categories. Returns the full set of known primary and secondary expense categories. */
-export async function getCategories(): Promise<Categories> {
-  return apiFetch("/api/categories");
+export async function getCategories(signal?: AbortSignal): Promise<Categories> {
+  return apiFetch("/api/categories", { signal });
 }
 
 /** POST /api/categories/:kind. Registers a new known category name and returns the updated category set. */
@@ -316,8 +316,11 @@ export async function deleteCategory(
  * that per-category map, so gate a delete action on that entry, not on
  * `unavailable_currencies`.
  */
-export async function getCategoryTotals(kind: "primary" | "secondary"): Promise<CategoryTotals> {
-  return apiFetch(`/api/categories/totals?kind=${kind}`);
+export async function getCategoryTotals(
+  kind: "primary" | "secondary",
+  signal?: AbortSignal,
+): Promise<CategoryTotals> {
+  return apiFetch(`/api/categories/totals?kind=${kind}`, { signal });
 }
 
 /**

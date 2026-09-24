@@ -40,6 +40,11 @@ function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback;
 }
 
+/** True for the rejection an aborted `fetch` produces, so a deliberate cancellation never turns into a red banner. */
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
 // One kind's fetch state. `loading` and `error` never render as `0.00`:
 // the total cell shows a muted placeholder instead, so a slow or failed
 // request cannot be mistaken for a genuine zero.
@@ -59,6 +64,11 @@ function CategoriesPage() {
 
   useEffect(() => {
     let active = true;
+    // One controller per run: `refreshTick` and `refCurrency` each trigger a
+    // run of this effect on a currency switch (refresh() bumps refreshTick,
+    // then AppContext's own settings refetch changes refCurrency), so the
+    // first run's requests must be cancelled rather than left in flight.
+    const controller = new AbortController();
     // Reset to `loading`, not to `EMPTY_TOTALS`: clearing the totals here
     // would flash stale zeros while the refetch is in flight.
     setCatsError(null);
@@ -67,41 +77,44 @@ function CategoriesPage() {
     setPriStatus("loading");
     setSecStatus("loading");
     api
-      .getCategories()
+      .getCategories(controller.signal)
       .then((cats) => {
         if (active) setCats(cats);
       })
       .catch((err) => {
-        if (active) setCatsError(errorMessage(err, "Failed to load categories"));
+        if (active && !isAbortError(err)) {
+          setCatsError(errorMessage(err, "Failed to load categories"));
+        }
       });
     api
-      .getCategoryTotals("primary")
+      .getCategoryTotals("primary", controller.signal)
       .then((pri) => {
         if (!active) return;
         setPri(pri);
         setPriStatus("loaded");
       })
       .catch((err) => {
-        if (active) {
+        if (active && !isAbortError(err)) {
           setPriError(errorMessage(err, "Failed to load primary totals"));
           setPriStatus("error");
         }
       });
     api
-      .getCategoryTotals("secondary")
+      .getCategoryTotals("secondary", controller.signal)
       .then((sec) => {
         if (!active) return;
         setSec(sec);
         setSecStatus("loaded");
       })
       .catch((err) => {
-        if (active) {
+        if (active && !isAbortError(err)) {
           setSecError(errorMessage(err, "Failed to load secondary totals"));
           setSecStatus("error");
         }
       });
     return () => {
       active = false;
+      controller.abort();
     };
     // refCurrency is currencySettings.reference_currency: switching it
     // refetches both kinds without a manual reload.
@@ -128,7 +141,7 @@ function CategoriesPage() {
       {secError && <ErrorBanner message={`Could not load secondary totals: ${secError}`} />}
       {unavailableCurrencies.length > 0 && (
         <ErrorBanner
-          message={`Could not resolve exchange rates for ${unavailableCurrencies.join(", ")}. All-time totals below are a lower bound, and deleting a category is disabled until rates are available.`}
+          message={`Some transactions in ${unavailableCurrencies.join(", ")} have a date with no published exchange rate, so those amounts are excluded. All-time totals below are a lower bound, and deleting a category is disabled until those rows can be converted.`}
         />
       )}
 
@@ -278,7 +291,7 @@ function CategoryColumn({
                       ratesUnavailable ? (
                         <span
                           className="text-muted-foreground"
-                          title={`No exchange rate for ${blockingCurrencies.join(", ")}.`}
+                          title={`Some ${blockingCurrencies.join(", ")} transactions have a date with no published exchange rate.`}
                         >
                           —
                         </span>
@@ -287,7 +300,7 @@ function CategoryColumn({
                       )
                     ) : ratesUnavailable ? (
                       <span
-                        title={`Partial total: no exchange rate for ${blockingCurrencies.join(", ")}.`}
+                        title={`Partial total: some ${blockingCurrencies.join(", ")} transactions have a date with no published exchange rate.`}
                       >
                         {formatRef(t, currency)}
                         <span className="text-destructive"> *</span>
@@ -306,7 +319,7 @@ function CategoryColumn({
                     ) : ratesUnavailable ? (
                       <span
                         className="text-[11px] italic text-muted-foreground"
-                        title={`Cannot delete "${c}" right now: no exchange rate for ${blockingCurrencies.join(", ")}.`}
+                        title={`Cannot delete "${c}" right now: some ${blockingCurrencies.join(", ")} transactions have a date with no published exchange rate.`}
                       >
                         rates unavailable
                       </span>

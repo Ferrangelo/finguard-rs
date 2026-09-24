@@ -1294,14 +1294,10 @@ async fn delete_category_handler(
         .unwrap_or_default();
     if !blocking_currencies.is_empty() {
         return Err(crate::Error::InvalidArgument(format!(
-            "Cannot delete \"{name}\" right now: no exchange rate is available for {}, so its \
-             expenses in {} cannot be counted. Try again once rates can be fetched.",
+            "Cannot delete \"{name}\" right now: some of its expenses in {} have a \
+             transaction date with no published exchange rate, so they cannot be counted. \
+             Try again once rates can be fetched.",
             blocking_currencies.join(", "),
-            if blocking_currencies.len() == 1 {
-                "that currency"
-            } else {
-                "those currencies"
-            }
         ))
         .into());
     }
