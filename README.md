@@ -102,7 +102,7 @@ cd finguard-rs
 #### Prerequisites
 
 - **Rust** 1.70+ (install from [rustup.rs](https://rustup.rs/))
-- **Node.js** 18+ and **npm** (or **Bun**)
+- **Node.js** 18+ and **npm**
 
 ```bash
 # Clone the repository
