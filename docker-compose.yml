@@ -2,13 +2,13 @@ services:
   backend:
     image: ghcr.io/ferrangelo/finguard-rs-backend:latest
     container_name: finguard-rs-backend
-    ports:
-      - "127.0.0.1:${FINGUARD_PORT:-3111}:${FINGUARD_PORT:-3111}"
-      # Sync traffic must remain reachable by phones on the local network.
-      - "${FINGUARD_SYNC_PORT:-3112}:${FINGUARD_SYNC_PORT:-3112}"
+    network_mode: host
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
+      # The image binds 0.0.0.0 by default. On the host network that would expose
+      # the API, which has no login, to the LAN.
+      FINGUARD_HOST: "127.0.0.1"
       FINGUARD_PORT: "${FINGUARD_PORT:-3111}"
       FINGUARD_SYNC_PORT: "${FINGUARD_SYNC_PORT:-3112}"
       # OVERRIDE the Dockerfile XDG defaults here:
@@ -26,13 +26,13 @@ services:
     image: ghcr.io/ferrangelo/finguard-rs-frontend:latest
     restart: unless-stopped
     container_name: finguard-rs-frontend
-    ports:
-      - "127.0.0.1:5173:5173"
+    network_mode: host
+    # The image's default command (`npm run dev -- --host`) listens on every
+    # interface. On the host network that would put the dev server, which has no
+    # login, on the LAN.
+    command: ["npm", "run", "dev", "--", "--host", "127.0.0.1"]
     environment:
-      # Use the service name, not localhost. Docker's internal DNS resolves this
-      - VITE_API_URL=http://backend:${FINGUARD_PORT:-3111}
-      # A published port cannot reach a container's loopback, so the frontend keeps listening on all interfaces inside.
-      - FINGUARD_DEV_HOST=0.0.0.0
+      - VITE_API_URL=http://127.0.0.1:${FINGUARD_PORT:-3111}
     depends_on:
       - backend
 
