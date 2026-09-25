@@ -17,9 +17,9 @@ class MainActivity : TauriActivity() {
   // enableEdgeToEdge() (and, from Android 15 on this targetSdk, the platform itself)
   // lets the WebView draw under the status and navigation bars, so page content
   // renders behind the status bar icons unless something feeds the inset back in.
-  // Shrink the WebView's own bounds by the system bar insets here (see the margin
-  // comment below), and make the WebView background transparent so the dark
-  // android:windowBackground shows through the resulting gap instead of the
+  // Shrink the WebView's own bounds by the system bar insets and the keyboard here
+  // (see the margin comment below), and make the WebView background transparent so
+  // the dark android:windowBackground shows through the resulting gap instead of the
   // WebView's own default white background.
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
@@ -35,6 +35,7 @@ class MainActivity : TauriActivity() {
       val bars = windowInsets.getInsets(
         WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
       )
+      val ime = windowInsets.getInsets(WindowInsetsCompat.Type.ime())
       // View.setPadding() does not work here: WebView lays out and paints its
       // Chromium content at the view's full measured bounds regardless of its own
       // padding, so page content still draws under the status bar even though the
@@ -43,7 +44,11 @@ class MainActivity : TauriActivity() {
       // place, so the Chromium content itself renders into the shrunk area.
       val params = view.layoutParams as? ViewGroup.MarginLayoutParams
       if (params != null) {
-        params.setMargins(bars.left, bars.top, bars.right, bars.bottom)
+        // Under enforced edge-to-edge, the system no longer shrinks the window for the
+        // keyboard, so the bottom margin takes the keyboard height while it is open.
+        // The IME inset already includes the navigation bar, so the larger of the two
+        // is used, not the sum.
+        params.setMargins(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
         view.layoutParams = params
       }
       WindowInsetsCompat.CONSUMED
