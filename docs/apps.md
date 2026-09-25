@@ -36,6 +36,73 @@ The app has five pages, plus a set of sub-tabs on Expenses:
 
 A year selector and a month selector at the top control which period every page shows.
 
+## Entering data
+
+### Expenses
+
+On Expenses > Detailed, the **Add expense** button opens a form with Name, Day, **Amount (math
+ok)**, Currency, Primary category, and Secondary category. Name and a valid Amount are
+required; Day must be a day that exists in the selected month (day 31 in a 30-day month is
+rejected). Amount accepts a math expression, e.g. `10+5.5`, evaluated when you save. Primary
+and Secondary use a combobox of known categories, or you can type a new one. While adding (not
+while editing), typing a name that exactly matches a saved mapping (see Category mappings
+below) fills in Primary and Secondary for you; you can still change them before saving.
+
+### Recurring expenses
+
+On Expenses > Recurring, the **Add recurring template** panel takes the same fields as an
+expense minus Day (Name, Amount, Currency, Primary, Secondary); a template has no day of its
+own. The **Apply to `<month>` `<year>`** button creates one expense row per template in the
+selected month, dated the first day of that month, and lands them in the Detailed tab like any
+other expense: editing or deleting a generated row works the same way. Applying again in a
+month that already has a template's row skips it. If you delete a generated row yourself and
+apply the template to that month again, the app remembers the deletion and leaves it out,
+listing it instead so you can add it back on purpose.
+
+### Category mappings
+
+On Expenses > Mappings, the **Add mapping rule** panel takes a **Match substring
+(case-insensitive)** field plus a Primary and, optionally, a Secondary category. Despite the
+field's name, the match is compared to the whole expense name, not a substring inside it: a
+rule for "lidl" applies to an expense named "Lidl" or " lidl " (matching ignores case and
+surrounding spaces), but not to "Lidl Supermarket". A mapping only affects expenses you add
+afterward; it never changes categories on expenses already saved. Primary and Secondary are
+stored lower-case, so a rule's categories can show in a different case than you typed.
+
+### Investments
+
+On Net Worth > Investments, **Add asset** opens a **New investment asset** panel: Asset name,
+Category (Stocks/ETF, Commodities, or Bonds), Currency (defaults to your reference currency),
+and an optional Link. Once created, the asset gets a row with three views, **Holdings
+(quantity)**, **Prices**, and **Value (quantity × price)**, each with one editable cell per
+month of the selected year; Holdings and Prices cells accept a math expression like the expense
+Amount field. Prices are entered in the asset's own currency, set in the row's Currency column
+in the Prices view; changing that currency only affects prices you enter afterward, it does not
+relabel or convert months already saved. The Value view converts quantity × price into your
+reference currency using that month's own exchange rate, and shows a dash where no rate could
+be resolved. Edit turns the row's Name, Category, Currency, and Link into editable fields;
+deleting the asset removes every month's data for it.
+
+### Liquidity
+
+On Net Worth > Liquidity & Debts, the Liquidity section's **Add** button creates a row with a
+Name, a Category (Bank/Broker account, Cash, or Other), and a Currency. Each row has one
+editable cell per month of the selected year, accepting a math expression like the other
+amount fields. The section's Total row converts every row's own currency into your reference
+currency using that calendar month's own rate, and marks a month with an asterisk when some
+currency's rate could not be resolved. The Credits & Debts section on the same tab has its own
+**Add** button and works the same way, but has no Category, and colors a row's monthly balance
+to show a debt (negative) or a credit (positive).
+
+### Cashflow
+
+The Cashflow page shows one row per income category (Salary, Interests Bank account, Dividendi
+e Cedole, Other) with one editable cell per month, accepting a math expression. Income has no
+currency of its own: whatever you enter is saved directly in your reference currency. Spending,
+Saving, and Saving % are computed automatically underneath: Spending sums that month's expenses
+(already converted to the reference currency), Saving is Income minus Spending, and Saving % is
+Saving divided by Income.
+
 ## Currency conversion
 
 Exchange rates come from Frankfurter, a free, keyless API over European Central Bank
@@ -48,14 +115,6 @@ plausible wrong number is worse than a visible failure.
 A completed month's rate is frozen at that month's last published rate. The month still
 in progress is priced by a setting you choose: either last month's closing rate, or the
 latest rate published so far.
-
-## Recurring expenses
-
-A recurring template is applied to a chosen month, which creates one expense row per
-template in that month, dated the first day of the month. The generated row is then an
-ordinary expense row: editing or deleting it works like any other row. If you delete a
-generated row and apply the template to that month again, the deleted row does not come
-back.
 
 ## Themes
 

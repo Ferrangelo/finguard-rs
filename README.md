@@ -11,12 +11,28 @@ network, with no cloud account involved.
 - Detailed and recurring expense tracking, with automatic categorization rules
 - Cashflow: monthly income against spending, with savings computed automatically
 - Net worth: investments, liquidity, and credits and debts, tracked over time
+- Investment tracking: quantity and price per month, in each asset's own currency, with the computed value shown in your reference currency
 - Currency conversion, using the exchange rate for each item's own date
 - Seven themes, with a saved preference
 - An Android app that syncs with the desktop over the local network
 - All data stored locally as Parquet files, with no cloud dependency
 
 ![Demo Animation](sshots/sshots_animation.gif)
+
+## Using the app
+
+- **Expenses**: add one from Expenses > Detailed. Amount takes a math expression, e.g. `10+5.5`.
+- **Recurring expenses**: set up a template on Expenses > Recurring, then apply it to a month
+  to generate that month's expense rows.
+- **Category mappings**: on Expenses > Mappings, a rule fills in a category automatically
+  when a new expense's name matches it.
+- **Investments**: track quantity and price per month on Net Worth > Investments, one row
+  per asset.
+- **Liquidity**: track a cash or bank balance per month on Net Worth > Liquidity & Debts.
+- **Cashflow**: enter income by category on the Cashflow page; spending and saving are
+  computed from your expenses.
+
+See [`docs/apps.md`](docs/apps.md) for the full steps, fields, and behavior of each one.
 
 ## Quick start
 
