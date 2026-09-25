@@ -61,13 +61,13 @@ listing it instead so you can add it back on purpose.
 
 ### Category mappings
 
-On Expenses > Mappings, the **Add mapping rule** panel takes a **Match substring
-(case-insensitive)** field plus a Primary and, optionally, a Secondary category. Despite the
-field's name, the match is compared to the whole expense name, not a substring inside it: a
-rule for "lidl" applies to an expense named "Lidl" or " lidl " (matching ignores case and
-surrounding spaces), but not to "Lidl Supermarket". A mapping only affects expenses you add
-afterward; it never changes categories on expenses already saved. Primary and Secondary are
-stored lower-case, so a rule's categories can show in a different case than you typed.
+On Expenses > Mappings, the **Add mapping rule** panel takes a **Match name (exact,
+case-insensitive)** field plus a Primary and, optionally, a Secondary category. The match
+compares the whole expense name: a rule for "lidl" applies to an expense named "Lidl" or
+" lidl " (matching ignores case and surrounding spaces), but not to "Lidl Supermarket". A
+mapping only affects expenses you add afterward; it never changes categories on expenses
+already saved. Primary and Secondary are stored lower-case, so a rule's categories can show
+in a different case than you typed.
 
 ### Investments
 

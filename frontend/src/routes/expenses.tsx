@@ -65,7 +65,7 @@ import { useTheme } from "@/context/ThemeContext";
 //   list (`api.getExpenses(year)` with no month filter).
 // - RecurringTab: recurring expense templates and the "apply to this
 //   month" action.
-// - MappingsTab: name-substring-to-category mapping rules.
+// - MappingsTab: exact-name-to-category mapping rules.
 
 /** Extracts a readable message from a caught value. A rejected fetch can throw anything, not only an `Error`. */
 function errorMessage(err: unknown, fallback: string): string {
@@ -1768,7 +1768,7 @@ function MappingsTab() {
 
       <GlassCard title="Add mapping rule">
         <div className="space-y-3">
-          <Field label="Match substring (case-insensitive)">
+          <Field label="Match name (exact, case-insensitive)">
             <input
               value={form.match}
               onChange={(e) => setForm({ ...form, match: e.target.value })}
