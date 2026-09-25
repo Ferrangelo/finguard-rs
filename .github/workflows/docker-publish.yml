@@ -1,9 +1,17 @@
 name: Build and Publish Images
 
+# The images build only from backend/ and frontend/, so pushes that change
+# neither (docs, README, mobile, other workflows) skip the rebuild.
 on:
   push:
     branches:
       - main
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "!**/*.md"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
