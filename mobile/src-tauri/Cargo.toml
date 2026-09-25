@@ -1,6 +1,6 @@
 [package]
 name = "finguard-mobile"
-version = "0.1.0"
+version = "0.1.1"
 description = "finguard Android app, built with Tauri"
 edition = "2021"
 # The `finguard_rs_backend` dependency below is edition 2024, which no
