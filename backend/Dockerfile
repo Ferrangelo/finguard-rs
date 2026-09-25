@@ -46,4 +46,4 @@ ENV XDG_DATA_HOME=/data \
 EXPOSE 3111
 
 ENTRYPOINT ["sh", "/usr/local/bin/entrypoint.sh"]
-CMD ["finguard-rs", "--host", "0.0.0.0", "--port", "3111"]
+CMD ["finguard-rs"]

@@ -120,7 +120,7 @@ main() {
     ensure_dirs_owned "${PUID}" "${PGID}"
 
     if [ "$#" -eq 0 ]; then
-        set -- finguard-rs --host "0.0.0.0" --port "${FINGUARD_PORT:-3111}"
+        set -- finguard-rs
     fi
 
     drop_privileges_and_exec "${USER_NAME}" "$@"
