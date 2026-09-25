@@ -42,6 +42,11 @@ See [`docs/apps.md`](docs/apps.md) for the full steps, fields, and behavior of e
 2. Run `docker compose up -d`.
 3. Open `http://localhost:5173`.
 
+The compose file runs both containers on the host network so a phone can find and sync
+with this desktop; see [Letting the phone reach a Docker
+desktop](docs/install.md#letting-the-phone-reach-a-docker-desktop) if you copied an
+older compose file.
+
 Full steps, other ways to run the desktop app, and the Android app are in
 [`docs/install.md`](docs/install.md).
 

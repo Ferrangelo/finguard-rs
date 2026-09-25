@@ -23,6 +23,37 @@ phone to a desktop.
 To update: run `docker compose pull`, then `docker compose up -d --force-recreate`. To
 stop: run `docker compose down`.
 
+### Letting the phone reach a Docker desktop
+
+The current `docker-compose.yml` runs both containers on the host network
+(`network_mode: host`) instead of Docker's default bridge network. A bridge network
+breaks phone discovery two ways: the phone's UDP broadcast does not reliably reach a
+bridge-networked container, and the backend's discovery reply advertises its own
+address, which on a bridge network is the container's private address, not one the
+phone can reach. Host networking removes both problems: the containers bind directly to
+the desktop's own network interfaces, so port 3112 (TCP and UDP) is reachable at the
+desktop's real address without any `ports:` list.
+
+Because the containers now share the host's addresses directly, `FINGUARD_HOST` pins the
+backend to `127.0.0.1` and the frontend service overrides its command to bind
+`127.0.0.1` too. Without those, both would listen on every interface, and the API and
+the dev proxy have no login.
+
+If you have a compose file from before this change, replace it with the current
+`docker-compose.yml`, or apply the same changes by hand: add `network_mode: host` to
+both services, remove their `ports:` lists, set `FINGUARD_HOST: "127.0.0.1"` on the
+backend, and on the frontend set `VITE_API_URL=http://127.0.0.1:${FINGUARD_PORT:-3111}`
+and add `command: ["npm", "run", "dev", "--", "--host", "127.0.0.1"]`.
+
+After updating the file, run `docker compose pull` and `docker compose up -d`. Host
+networking is a Linux feature of Docker Engine; it is not available the same way on
+Docker Desktop for Mac or Windows.
+
+Port 3112 opens only while the desktop's Sync page is open. If a host firewall also
+blocks it, see the firewall commands under "Ports and network" below; they matter more
+now, because host networking sends the connection through the host's own firewall
+instead of Docker's bridge network rules.
+
 ## Desktop with rootless Podman
 
 `run-podman.sh` runs the same two published images without Docker.
@@ -30,6 +61,11 @@ stop: run `docker compose down`.
 1. Download `run-podman.sh` from the repository root.
 2. Run `./run-podman.sh`.
 3. Open `http://localhost:5173`.
+
+Like `docker-compose.yml`, the script joins the host network (`--network host`) so a
+phone can discover this desktop; see "Letting the phone reach a Docker desktop" above
+for why. Rootless Podman supports joining the host network the same way root Podman
+does.
 
 The script sets `PUID=0` and `PGID=0`. This is the opposite of the Docker Compose case
 on purpose: rootless Podman maps container UID 0 to your host user, so files the
@@ -73,8 +109,10 @@ together. Both bind to `127.0.0.1` by default.
 authentication. 3112 has to be reachable from other devices, because that is the port a
 phone connects to and discovers over during pairing and sync; see `docs/sync.md`.
 
-If your desktop runs `./run.sh` directly (not in Docker or Podman) and a firewall
-blocks inbound connections, allow port 3112 for both TCP and UDP. With ufw, run:
+If a firewall blocks inbound connections, allow port 3112 for both TCP and UDP. This
+applies whether the desktop runs `./run.sh` directly or through Docker Compose or
+`run-podman.sh`: host networking sends the connection through the host's own firewall,
+the same as a process running outside a container. With ufw, run:
 
 ```
 sudo ufw allow 3112/tcp
@@ -88,15 +126,19 @@ Environment variables the backend reads:
 - `FINGUARD_SYNC_HOST`, `FINGUARD_SYNC_PORT`: the sync listener's bind address and port
   (default `0.0.0.0:3112`).
 - `FINGUARD_ALLOWED_HOSTS`: a comma-separated list of extra `Host` header values the API
-  accepts. Without it, the API accepts `localhost`, `127.0.0.1`, `::1`, `backend` (the
-  Docker Compose service name), and the address in `FINGUARD_HOST` when that address is
-  not the unspecified `0.0.0.0`.
+  accepts. Without it, the API accepts `localhost`, `127.0.0.1`, `::1`, `backend`, and
+  the address in `FINGUARD_HOST` when that address is not the unspecified `0.0.0.0`.
+  `backend` is a leftover default for a frontend that reaches the API through Docker's
+  internal DNS on a bridge network. The current compose file and `run-podman.sh` use
+  host networking and reach the API at `127.0.0.1`, so neither needs it.
 - `FINGUARD_FX_OFFLINE`: set to any value to stop every exchange rate network call.
   Currency conversion then works from the cached rates only.
 - `FINGUARD_FX_QUIET`: set to `1` to silence the exchange rate log lines.
 
 The frontend dev server reads `FINGUARD_DEV_HOST` to bind somewhere other than
-`127.0.0.1`.
+`127.0.0.1`, unless a `--host` command-line flag is also given, which overrides it; the
+current compose files and `run-podman.sh` pass `--host 127.0.0.1` on the command line for
+that reason instead of setting the environment variable.
 
 ## Updating the desktop app
 

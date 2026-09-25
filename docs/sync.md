@@ -29,6 +29,9 @@ no cloud service and no third-party server involved.
   desktop's Sync page is open (the listener only runs then) and that both devices are
   on the same local network. If a firewall blocks the desktop, allow TCP and UDP on
   port 3112; with ufw, `sudo ufw allow 3112/tcp` and `sudo ufw allow 3112/udp`.
+- **Desktop runs through Docker Compose or Podman and discovery finds nothing**: see
+  "Letting the phone reach a Docker desktop" in `docs/install.md`. An older compose
+  file or script without host networking is the usual cause.
 - **"another sync is running on this device"**: only one sync round runs at a time per
   device. Wait and try again.
 - **A settings file could not be read**: the hub shows this as a banner. Fix or restore
