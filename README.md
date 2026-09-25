@@ -2,18 +2,17 @@
 
 A local-first personal finance tracker. It follows a scheme similar to
 [Mr Rip's spreadsheets](https://retireinprogress.com/how-i-track-my-finances-using-spreadsheets-part-1-why-and-what/):
-expenses, cashflow, and net worth, with everything stored on your own disk as Parquet
+expenses, investments, cashflow, and net worth, with everything stored on your own disk as Parquet
 files. A desktop app and an Android app share the same data and sync over the local
 network, with no cloud account involved.
 
 ## Features
 
-- Detailed and recurring expense tracking, with automatic categorization rules
-- Cashflow: monthly income against spending, with savings computed automatically
-- Net worth: investments, liquidity, and credits and debts, tracked over time
-- Investment tracking: quantity and price per month, in each asset's own currency, with the computed value shown in your reference currency
-- Currency conversion, using the exchange rate for each item's own date
-- Seven themes, with a saved preference
+- Detailed and recurring **expense tracking**, with automatic categorization rules
+- **Cashflow**: monthly income against spending, with savings computed automatically
+- **Investment** tracking: quantity and price per month, in each asset's own currency, with the computed value shown in your reference currency
+- **Net worth**: investments, liquidity, and credits and debts, tracked over time
+- **Currency conversion**, using the exchange rate for each item's own date
 - An Android app that syncs with the desktop over the local network
 - All data stored locally as Parquet files, with no cloud dependency
 
@@ -21,7 +20,7 @@ network, with no cloud account involved.
 
 ## Using the app
 
-- **Expenses**: add one from Expenses > Detailed. Amount takes a math expression, e.g. `10+5.5`.
+- **Expenses**: add one from Expenses > Detailed. Amount can take a math expression, e.g. `10 + 5.5/2`.
 - **Recurring expenses**: set up a template on Expenses > Recurring, then apply it to a month
   to generate that month's expense rows.
 - **Category mappings**: on Expenses > Mappings, a rule fills in a category automatically
@@ -36,7 +35,7 @@ See [`docs/apps.md`](docs/apps.md) for the full steps, fields, and behavior of e
 
 ## Quick start
 
-Desktop, with Docker Compose:
+**Desktop**, with Docker Compose:
 
 1. Download `docker-compose.yml` and `.env.example`, then copy the second to `.env` and
    edit it.
@@ -46,9 +45,10 @@ Desktop, with Docker Compose:
 Full steps, other ways to run the desktop app, and the Android app are in
 [`docs/install.md`](docs/install.md).
 
-Android: download the latest release from
+**Android**: download the latest release from
 [GitHub Releases](https://github.com/Ferrangelo/finguard-rs/releases), or add the
 repository to [Obtainium](https://github.com/ImranR98/Obtainium) for automatic updates.
+
 See [`docs/install.md`](docs/install.md).
 
 ## Documentation
@@ -67,8 +67,6 @@ See [`docs/install.md`](docs/install.md).
 - No authentication: the API and web UI stay on loopback by default.
 - No CSV or spreadsheet import or export.
 - Sync only runs when a Sync page presses Sync now, never automatically.
-
-See [`docs/apps.md`](docs/apps.md) for the full list.
 
 ## License
 
