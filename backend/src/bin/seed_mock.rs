@@ -8,8 +8,11 @@
 //! `mock_data/` directory without touching real user data.
 //!
 //! The directory is wiped and recreated on every run so the result is always
-//! deterministic. After seeding, use `./run_mock.sh` to start the app against
-//! this dataset.
+//! deterministic. After seeding, start the backend against this dataset (from
+//! `backend/`) with `XDG_DATA_HOME` and `XDG_CONFIG_HOME` pointed at
+//! `mock_data/`:
+//!   XDG_DATA_HOME=mock_data XDG_CONFIG_HOME=mock_data \
+//!     cargo run --bin finguard_rs_backend
 
 use std::path::PathBuf;
 
@@ -605,8 +608,11 @@ fn main() -> Result<()> {
     println!("  XDG_DATA_HOME   → {}", mock_abs.display());
     println!("  XDG_CONFIG_HOME → {}", mock_abs.display());
     println!();
-    println!("Run the app with mock data:");
-    println!("  ./run_mock.sh");
+    println!("Run the app with mock data (from backend/):");
+    println!(
+        "  XDG_DATA_HOME={0} XDG_CONFIG_HOME={0} cargo run --bin finguard_rs_backend",
+        mock_abs.display()
+    );
 
     Ok(())
 }
