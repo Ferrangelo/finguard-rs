@@ -1721,7 +1721,7 @@ function TotalTab({ currencySettings }: { currencySettings: CurrencySettings }) 
                     <CartesianGrid strokeDasharray="3 3" stroke="oklch(1 0 0 / 6%)" />
                     <XAxis dataKey="month" tick={{ fontSize: 18, fill: tickColor }} />
                     <YAxis tick={{ fontSize: 18, fill: tickColor }} />
-                    <Tooltip content={<DarkTooltip total currency={shownCurrency} />} />
+                    <Tooltip content={<DarkTooltip currency={shownCurrency} />} />
                     <Legend wrapperStyle={LEGEND_STYLE} />
                     <Area
                       type="monotone"
