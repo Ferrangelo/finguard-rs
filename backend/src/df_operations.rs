@@ -34,6 +34,24 @@ use crate::paths::{
 };
 use crate::sync::{self, ChangeOp, ChangeOrigin, ChangeTable, IncompleteReason};
 
+fn register_expense_categories(primary: &str, secondary: &str) -> Result<()> {
+    for (kind, name) in [("primary", primary), ("secondary", secondary)] {
+        if name.trim().is_empty() {
+            continue;
+        }
+        match config::add_known_category(name, kind) {
+            Ok(()) => crate::api::record_setting_change(
+                ChangeTable::KnownCategories,
+                format!("{kind}:{name}"),
+                ChangeOp::Upsert { row: Map::new() },
+            ),
+            Err(Error::AlreadyExists(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 // ======================================================================
 // Constants
 // ======================================================================
@@ -785,23 +803,21 @@ impl DetailedExpenses {
                 ))
             })?;
 
+        let primary = normalize_category_value(&primary);
+        let secondary = normalize_category_value(&secondary);
         let new_row = DataFrame::new_infer_height(vec![
             Column::new("expense_name".into(), &[expense_name]),
             date_series("expense_date", &[date]).into(),
             Column::new("expense_amount".into(), &[expense_amount]),
             Column::new("currency".into(), &[currency]),
-            Column::new(
-                "primary_category".into(),
-                &[normalize_category_value(&primary)],
-            ),
-            Column::new(
-                "secondary_category".into(),
-                &[normalize_category_value(&secondary)],
-            ),
+            Column::new("primary_category".into(), &[primary.as_str()]),
+            Column::new("secondary_category".into(), &[secondary.as_str()]),
             Column::new(ROW_ID_COLUMN.into(), &[row_id]),
         ])?;
 
-        self.expense_df = concat_df_diagonal(&[self.expense_df.clone(), new_row])?;
+        let updated = concat_df_diagonal(&[self.expense_df.clone(), new_row])?;
+        register_expense_categories(&primary, &secondary)?;
+        self.expense_df = updated;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
         record_with_origin(
             self.change_table(),
@@ -979,7 +995,24 @@ impl DetailedExpenses {
             );
         }
 
-        self.expense_df = df.collect()?;
+        let updated = df.collect()?;
+        let ids = updated.column(ROW_ID_COLUMN)?.str()?;
+        let index = ids
+            .iter()
+            .position(|id| id == Some(row_id))
+            .ok_or_else(|| Error::NotFound(format!("expense '{row_id}' not found")))?;
+        let primary = updated
+            .column("primary_category")?
+            .str()?
+            .get(index)
+            .unwrap_or("");
+        let secondary = updated
+            .column("secondary_category")?
+            .str()?
+            .get(index)
+            .unwrap_or("");
+        register_expense_categories(primary, secondary)?;
+        self.expense_df = updated;
         write_parquet(&self.expense_df, &self.expense_df_path)?;
         record(
             self.change_table(),
@@ -2561,22 +2594,20 @@ impl RecurringExpenses {
             )));
         }
         let row_id = new_row_id();
+        let primary = normalize_category_value(primary_category);
+        let secondary = normalize_category_value(secondary_category);
         let new_row = DataFrame::new_infer_height(vec![
             Column::new("expense_name".into(), &[expense_name]),
             Column::new("expense_day".into(), &[GENERATED_RECURRING_DAY as i64]),
             Column::new("expense_amount".into(), &[expense_amount]),
             Column::new("currency".into(), &[currency]),
-            Column::new(
-                "primary_category".into(),
-                &[normalize_category_value(primary_category)],
-            ),
-            Column::new(
-                "secondary_category".into(),
-                &[normalize_category_value(secondary_category)],
-            ),
+            Column::new("primary_category".into(), &[primary.as_str()]),
+            Column::new("secondary_category".into(), &[secondary.as_str()]),
             Column::new(ROW_ID_COLUMN.into(), &[row_id.as_str()]),
         ])?;
-        self.df = concat_df_diagonal(&[self.df.clone(), new_row])?;
+        let updated = concat_df_diagonal(&[self.df.clone(), new_row])?;
+        register_expense_categories(&primary, &secondary)?;
+        self.df = updated;
         self.save()?;
         record(self.change_table(), &row_id, upsert_row(&self.df, &row_id));
         Ok(row_id)
@@ -4404,7 +4435,10 @@ mod tests {
         .expect("edit the row");
         de.delete_row(&row_id).expect("delete the row");
 
-        let entries = log_entries();
+        let entries: Vec<_> = log_entries()
+            .into_iter()
+            .filter(|entry| matches!(entry.table, ChangeTable::Expenses { .. }))
+            .collect();
         assert_eq!(entries.len(), 3, "one entry per change");
         for entry in &entries {
             assert_eq!(entry.row_id, row_id);
@@ -4462,7 +4496,10 @@ mod tests {
         de.add_row("Tea", 2, 3.0, Some("Out"), "EUR", Some("Cafe"))
             .expect("add a typed row");
 
-        let entries = log_entries();
+        let entries: Vec<_> = log_entries()
+            .into_iter()
+            .filter(|entry| !matches!(entry.table, ChangeTable::KnownCategories))
+            .collect();
         assert_eq!(entries.len(), 3);
 
         assert_eq!(entries[0].table, ChangeTable::Recurring { year: 2026 });
@@ -4498,7 +4535,10 @@ mod tests {
             .expect("add the template");
         recurring.remove(&template_id).expect("remove the template");
 
-        let entries = log_entries();
+        let entries: Vec<_> = log_entries()
+            .into_iter()
+            .filter(|entry| matches!(entry.table, ChangeTable::Recurring { .. }))
+            .collect();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].table, ChangeTable::Recurring { year: 2026 });
         assert_eq!(entries[1].row_id, template_id);

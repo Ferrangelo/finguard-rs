@@ -592,7 +592,7 @@ async fn list_years_handler() -> Json<Vec<i32>> {
     Json(discover_years())
 }
 
-fn record_setting_change(table: ChangeTable, row_id: String, op: ChangeOp) {
+pub(crate) fn record_setting_change(table: ChangeTable, row_id: String, op: ChangeOp) {
     let result = sync::shared_log().and_then(|log| log.append(table, row_id, op));
     if let Err(err) = result {
         let marked = match sync::mark_log_incomplete(sync::IncompleteReason::AppendFailed) {
@@ -4273,6 +4273,229 @@ mod tests {
 
     fn row_ids_of(df: &polars::prelude::DataFrame) -> Vec<String> {
         str_col_to_vec(df, df_operations::ROW_ID_COLUMN).expect("read row_id column")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn expense_saves_register_stored_categories_once() {
+        let _temp = with_temp_env_offline();
+        let mut payload = expense_payload("", "Synthetic", 1, 1.0);
+        payload.primary = "tv".into();
+        payload.secondary = "books".into();
+        let created = upsert_expense_handler(Json(payload))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"))
+            .0;
+        let categories = get_categories_handler()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"))
+            .0;
+        assert_eq!(categories.primary, vec!["TV"]);
+        assert_eq!(categories.secondary, vec!["Books"]);
+
+        config::add_known_category("MixedCase", "primary").unwrap();
+        let mut edited = expense_payload(&created.id, "Synthetic", 2, 1.0);
+        edited.primary = "mixedcase".into();
+        edited.secondary = "new name".into();
+        let saved = upsert_expense_handler(Json(edited))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"))
+            .0;
+        assert_eq!(saved.id, created.id);
+        let row = list_september().await.remove(0);
+        assert_eq!(row.primary, "MixedCase");
+        let mut again = expense_payload(&created.id, "Synthetic", 2, 1.0);
+        again.primary = "mixedcase".into();
+        again.secondary = "new name".into();
+        let _ = upsert_expense_handler(Json(again))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"));
+        let mut new_names = expense_payload(&created.id, "Synthetic", 2, 1.0);
+        new_names.primary = "unseen primary".into();
+        new_names.secondary = "unseen secondary".into();
+        let saved = upsert_expense_handler(Json(new_names))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"))
+            .0;
+        assert_eq!(saved.id, created.id);
+        let entries = crate::sync::read_log().unwrap().entries;
+        let ids: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                matches!(e.table, ChangeTable::KnownCategories)
+                    && matches!(e.op, ChangeOp::Upsert { .. })
+            })
+            .map(|e| e.row_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "primary:TV",
+                "secondary:Books",
+                "secondary:New name",
+                "primary:Unseen primary",
+                "secondary:Unseen secondary",
+            ]
+        );
+        let categories = get_categories_handler()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"))
+            .0;
+        assert_eq!(
+            categories.primary,
+            vec!["MixedCase", "TV", "Unseen primary"]
+        );
+        assert_eq!(
+            categories.secondary,
+            vec!["Books", "New name", "Unseen secondary"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn invalid_expenses_and_registry_failure_do_not_save() {
+        let temp = with_temp_env_offline();
+        let mut bad = expense_payload("", "Synthetic", 31, 1.0);
+        bad.primary = "unseen".into();
+        assert!(upsert_expense_handler(Json(bad)).await.is_err());
+        let mut missing = expense_payload("missing", "Synthetic", 1, 1.0);
+        missing.primary = "unseen".into();
+        assert!(upsert_expense_handler(Json(missing)).await.is_err());
+        let known = config::get_known_categories().unwrap();
+        assert!(known.primary.is_empty() && known.secondary.is_empty());
+        let mut blank = expense_payload("", "Synthetic", 1, 1.0);
+        blank.primary = "  ".into();
+        blank.secondary = "".into();
+        let _ = upsert_expense_handler(Json(blank))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"));
+        let known = config::get_known_categories().unwrap();
+        assert!(known.primary.is_empty() && known.secondary.is_empty());
+        let config_path = temp.path().join("finguard").join("known_categories.json");
+        std::fs::create_dir_all(&config_path).unwrap();
+        assert!(
+            upsert_expense_handler(Json(expense_payload("", "Failed", 2, 1.0)))
+                .await
+                .is_err()
+        );
+        assert_eq!(list_september().await.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn registry_write_failure_aborts_expense_save() {
+        let temp = with_temp_env_offline();
+        let config_dir = temp.path().join("finguard");
+        std::fs::create_dir_all(config_dir.join(".known_categories.json.tmp")).unwrap();
+        assert!(config::get_known_categories().unwrap().primary.is_empty());
+        assert!(
+            upsert_expense_handler(Json(expense_payload("", "Synthetic", 1, 1.0)))
+                .await
+                .is_err()
+        );
+        assert!(list_september().await.is_empty());
+        assert!(config::get_known_categories().unwrap().primary.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn synced_expense_does_not_register_categories() {
+        let _source = with_temp_env_offline();
+        let _ = upsert_expense_handler(Json(expense_payload("", "Synthetic", 1, 1.0)))
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"));
+        let changes: Vec<_> = crate::sync::read_log()
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| matches!(entry.table, ChangeTable::Expenses { .. }))
+            .collect();
+        assert_eq!(changes.len(), 1);
+        let _destination = with_temp_env_offline();
+        tokio::task::spawn_blocking(move || crate::merge_apply::apply_remote_batch(&changes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(list_september().await.len(), 1);
+        let known = config::get_known_categories().unwrap();
+        assert!(known.primary.is_empty() && known.secondary.is_empty());
+        let entries = crate::sync::read_log().unwrap().entries;
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].table, ChangeTable::Expenses { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn recurring_add_and_apply_register_categories() {
+        let _temp = with_temp_env_offline();
+        let _ = add_recurring_handler(Json(AddRecurringPayload {
+            year: 2026,
+            name: "Synthetic".into(),
+            day: 1,
+            amount: 1.0,
+            currency: "EUR".into(),
+            primary: "tv".into(),
+            secondary: "books".into(),
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("{err}"));
+        let known = config::get_known_categories().unwrap();
+        assert_eq!(known.primary, vec!["TV"]);
+        assert_eq!(known.secondary, vec!["Books"]);
+        config::remove_known_category("TV", "primary").unwrap();
+        config::remove_known_category("Books", "secondary").unwrap();
+        let _ = apply_recurring_handler(Json(ApplyRecurringPayload {
+            year: 2026,
+            month: 9,
+        }))
+        .await
+        .unwrap_or_else(|AppError(err)| panic!("{err}"));
+        let known = config::get_known_categories().unwrap();
+        assert_eq!(known.primary, vec!["TV"]);
+        assert_eq!(known.secondary, vec!["Books"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn explicit_categories_remain_sorted_and_reject_duplicates() {
+        let _temp = with_temp_env_offline();
+        for name in ["Zulu", "Alpha"] {
+            let _ = add_category_handler(
+                Path("primary".into()),
+                Json(AddCategoryPayload {
+                    kind: "primary".into(),
+                    name: name.into(),
+                }),
+            )
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"));
+        }
+        let result = add_category_handler(
+            Path("primary".into()),
+            Json(AddCategoryPayload {
+                kind: "primary".into(),
+                name: "Alpha".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError(crate::Error::AlreadyExists(_)))
+        ));
+        let known = get_categories_handler()
+            .await
+            .unwrap_or_else(|AppError(err)| panic!("{err}"))
+            .0;
+        assert_eq!(known.primary, vec!["Alpha", "Zulu"]);
+        assert_eq!(
+            crate::sync::read_log()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|e| matches!(e.table, ChangeTable::KnownCategories))
+                .count(),
+            2
+        );
     }
 
     /// Expenses are created, listed, edited, and deleted by `row_id`. An

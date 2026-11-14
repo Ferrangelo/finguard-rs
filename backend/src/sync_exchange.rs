@@ -1954,7 +1954,7 @@ mod tests {
         assert_eq!(preview.year_folders, 1);
         assert_eq!(preview.unreadable_files, 0);
         assert_eq!(preview.unsent_entries, phone_entries);
-        assert_eq!(preview.settings_entries, 1);
+        assert_eq!(preview.settings_entries, 3);
         let log_path = sync::changelog_path().unwrap();
 
         use_device(&hub);
@@ -2075,9 +2075,12 @@ mod tests {
                 .contains("broken line"),
             "the damaged line is gone from the file"
         );
+        let known = crate::config::get_known_categories().unwrap();
+        let known_count = known.primary.len() + known.secondary.len();
+        assert_eq!(known_count, 6);
         assert_eq!(
             repair.lines_kept + repair.rows_recorded + repair.income_cells_recorded,
-            read.entries.len() - 2
+            read.entries.len() - 2 - known_count
         );
         let march_table = ChangeTable::Expenses {
             year: 2026,
