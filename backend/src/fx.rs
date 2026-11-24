@@ -498,14 +498,23 @@ fn cached_rate_for(
     cache: &RateCache,
     date: NaiveDate,
 ) -> Result<Option<(BTreeMap<String, f64>, NaiveDate)>> {
+    Ok(cached_rate_ref(cache, date)?.map(|(table, published)| (table.clone(), published)))
+}
+
+/// Same lookup and published date as [`cached_rate_for`], but borrows the day
+/// table instead of cloning it. Use it on hot paths that only read the table.
+fn cached_rate_ref(
+    cache: &RateCache,
+    date: NaiveDate,
+) -> Result<Option<(&BTreeMap<String, f64>, NaiveDate)>> {
     let date_str = format_date(date);
     if let Some(rates) = cache.rates.get(&date_str) {
-        return Ok(Some((rates.clone(), date)));
+        return Ok(Some((rates, date)));
     }
     if let Some(published_str) = cache.aliases.get(&date_str)
         && let Some(rates) = cache.rates.get(published_str)
     {
-        return Ok(Some((rates.clone(), parse_date(published_str)?)));
+        return Ok(Some((rates, parse_date(published_str)?)));
     }
     Ok(None)
 }
@@ -1099,10 +1108,11 @@ pub async fn monthly_rates_lenient(
     // One snapshot for the whole call instead of one file read per month
     // per currency. An unreadable cache degrades every currency, exactly as
     // the per-currency loop does when each lookup fails to load it. The
-    // snapshot is memoized on file identity, so a warm revisit clones it
-    // instead of re-parsing.
+    // snapshot is memoized on file identity, so a warm revisit shares it
+    // instead of re-parsing, and the batch copies it only if it merges new
+    // data.
     let mut batch = match load_snapshot() {
-        Ok(snapshot) => SnapBatch::new((*snapshot).clone(), op),
+        Ok(snapshot) => SnapBatch::from_snapshot(snapshot, op),
         Err(_) => {
             crate::diag::event(
                 op,
@@ -1340,7 +1350,7 @@ async fn ensure_range_cached(batch: &mut SnapBatch, key_dates: &[NaiveDate]) -> 
     }
     let mut unresolved = Vec::new();
     for date in key_dates {
-        match cached_rate_for(&batch.cache, *date) {
+        match cached_rate_ref(&batch.cache, *date) {
             Ok(None) => unresolved.push(*date),
             Ok(Some(_)) => {}
             Err(_) => return key_dates.to_vec(),
@@ -1405,7 +1415,7 @@ async fn ensure_range_cached(batch: &mut SnapBatch, key_dates: &[NaiveDate]) -> 
     }
     let today = Local::now().date_naive();
     let (tables, aliases) =
-        merge_range_into_cache(&mut batch.cache, &days, &in_range, range_min, today);
+        merge_range_into_cache(batch.cache_mut(), &days, &in_range, range_min, today);
     persist_range(&days, &in_range, range_min, today).await;
     crate::diag::event(
         op,
@@ -1416,7 +1426,7 @@ async fn ensure_range_cached(batch: &mut SnapBatch, key_dates: &[NaiveDate]) -> 
     // single-fetch phase, which rechecks the snapshot per date.
     let mut still_missing = older;
     for date in in_range {
-        if !matches!(cached_rate_for(&batch.cache, date), Ok(Some(_))) {
+        if !matches!(cached_rate_ref(&batch.cache, date), Ok(Some(_))) {
             still_missing.push(date);
         }
     }
@@ -1545,7 +1555,9 @@ const BATCH_NETWORK_BUDGET: Duration = Duration::from_secs(15);
 /// re-reading the file. Writes still go through the existing locked
 /// load-modify-save path per fetched date, unchanged.
 struct SnapBatch {
-    cache: RateCache,
+    /// Shared with the snapshot memo until the first write. Write only
+    /// through [`SnapBatch::cache_mut`].
+    cache: Arc<RateCache>,
     op: u64,
     deadline: std::time::Instant,
     /// Single-date fetches attempted (range fetches excluded).
@@ -1559,6 +1571,11 @@ struct SnapBatch {
 
 impl SnapBatch {
     fn new(cache: RateCache, op: u64) -> Self {
+        Self::from_snapshot(Arc::new(cache), op)
+    }
+
+    /// Build a batch over a shared snapshot without copying it.
+    fn from_snapshot(cache: Arc<RateCache>, op: u64) -> Self {
         Self {
             cache,
             op,
@@ -1566,6 +1583,36 @@ impl SnapBatch {
             single_fetches: 0,
             stale_fallbacks: 0,
             budget_logged: false,
+        }
+    }
+
+    /// Mutable access to the batch's cache, for merging fetched data.
+    ///
+    /// `Arc::make_mut` copies the cache only while another holder shares it.
+    /// A batch built from `load_snapshot` shares it with `FX_SNAPSHOT_MEMO`
+    /// (and with any earlier `Arc` clone, such as the one Phase C of
+    /// `rates_for_keys_lenient` takes), so the first call copies and later
+    /// calls reuse that copy. Those holders never see the merge. If the batch
+    /// is the only holder, for example after a file save replaced the memo's
+    /// snapshot, the write happens in place. Do not mutate `cache` by any
+    /// other route.
+    fn cache_mut(&mut self) -> &mut RateCache {
+        Arc::make_mut(&mut self.cache)
+    }
+
+    /// Mirror a day table fetched and stored on disk into this batch, with
+    /// an optional alias from the requested date to the published one.
+    fn absorb_fetched(
+        &mut self,
+        returned: NaiveDate,
+        table: &BTreeMap<String, f64>,
+        alias_for: Option<NaiveDate>,
+    ) {
+        let returned_str = format_date(returned);
+        let cache = self.cache_mut();
+        cache.rates.insert(returned_str.clone(), table.clone());
+        if let Some(requested) = alias_for {
+            cache.aliases.insert(format_date(requested), returned_str);
         }
     }
 
@@ -1617,13 +1664,7 @@ impl SnapBatch {
                 // that key's own failure.
                 match store_historical_rates(returned, &table, alias_for).await {
                     Ok(()) => {
-                        let returned_str = format_date(returned);
-                        self.cache.rates.insert(returned_str.clone(), table.clone());
-                        if let Some(requested) = alias_for {
-                            self.cache
-                                .aliases
-                                .insert(format_date(requested), returned_str);
-                        }
+                        self.absorb_fetched(returned, &table, alias_for);
                         return cross_to_reference(
                             &table,
                             &currency,
@@ -1718,9 +1759,10 @@ pub async fn rates_for_keys_lenient(
     // An unreadable cache fails every key lookup, exactly as the per-key
     // path does: every non-reference currency is reported once, and nothing
     // resolves. The snapshot is memoized on file identity, so a warm revisit
-    // clones it instead of re-parsing.
+    // shares it instead of re-parsing, and the batch copies it only if it
+    // merges new data.
     let mut batch = match load_snapshot() {
-        Ok(snapshot) => SnapBatch::new((*snapshot).clone(), op),
+        Ok(snapshot) => SnapBatch::from_snapshot(snapshot, op),
         Err(_) => {
             let mut unavailable: Vec<String> = keys
                 .iter()
@@ -1793,9 +1835,9 @@ pub async fn rates_for_keys_lenient(
         if currency == reference_currency {
             continue;
         }
-        match cached_rate_for(&batch.cache, *date) {
+        match cached_rate_ref(&batch.cache, *date) {
             Ok(Some((table, actual))) => {
-                match cross_to_reference(&table, &currency, &reference_currency, actual) {
+                match cross_to_reference(table, &currency, &reference_currency, actual) {
                     Some(resolved) => {
                         rates.insert((*date, currency), resolved);
                     }
@@ -1816,7 +1858,7 @@ pub async fn rates_for_keys_lenient(
     if !by_date.is_empty() {
         let mut dates: Vec<NaiveDate> = by_date.keys().copied().collect();
         dates.sort();
-        let snap = std::sync::Arc::new(batch.cache.clone());
+        let snap = batch.cache.clone();
         for (date, outcome) in fetch_missing_dates(snap, dates, batch.deadline, op).await {
             let Some(currencies) = by_date.remove(&date) else {
                 continue;
@@ -3253,6 +3295,53 @@ mod tests {
 
         let snapshot = load_snapshot().expect("seeded file loads");
         assert_eq!(snapshot.rates["2026-09-04"]["USD"], 1.1622);
+    }
+
+    /// Batch writes copy the shared snapshot once and never reach the memo or
+    /// an earlier `Arc` clone: `absorb_fetched` and the range merge are the
+    /// production writers that run only after a network fetch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snap_batch_copy_on_write_keeps_earlier_snapshots() {
+        let _temp = with_temp_env_offline();
+        seed_cache(&[("2026-09-01", &[("USD", 1.10)])]);
+        let d = |day| NaiveDate::from_ymd_opt(2026, 9, day).unwrap();
+        let (d1, d2, weekend, d3) = ("2026-09-01", d(3), d(5), d(7));
+        let table = |rate| BTreeMap::from([("USD".to_string(), rate)]);
+
+        let memo_before = load_snapshot().expect("seeded snapshot");
+        let mut batch = SnapBatch::from_snapshot(load_snapshot().expect("snapshot"), 0);
+        assert!(Arc::ptr_eq(&batch.cache, &memo_before));
+        let earlier = batch.cache.clone();
+
+        batch.absorb_fetched(d2, &table(1.20), Some(weekend));
+        assert!(!Arc::ptr_eq(&batch.cache, &memo_before));
+        let copy_ptr = Arc::as_ptr(&batch.cache);
+
+        let days = BTreeMap::from([(d3, table(1.30))]);
+        merge_range_into_cache(batch.cache_mut(), &days, &[], d(1), d(30));
+        assert_eq!(
+            Arc::as_ptr(&batch.cache),
+            copy_ptr,
+            "second write copies again"
+        );
+
+        // Later readers see all three new entries with their published dates.
+        for (date, published, rate) in [(d2, d2, 1.20), (weekend, d2, 1.20), (d3, d3, 1.30)] {
+            let (found, actual) = cached_rate_ref(&batch.cache, date)
+                .expect("lookup")
+                .expect("hit");
+            assert_eq!(found["USD"], rate);
+            assert_eq!(actual, published);
+        }
+
+        // Earlier readers and the memo still hold only the original day.
+        for old in [&earlier, &memo_before] {
+            assert!(old.rates.contains_key(d1));
+            assert_eq!(old.rates.len(), 1);
+            assert!(old.aliases.is_empty());
+        }
+        assert!(Arc::ptr_eq(&load_snapshot().expect("memo"), &memo_before));
     }
 
     /// Overwriting the file with different data loads the new data: any save
